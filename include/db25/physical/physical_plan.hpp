@@ -33,7 +33,9 @@ enum class PhysicalOp : std::uint8_t {
     SeqScan,        // base-table sequential scan (an access path)
     Filter,         // predicate filter
     Project,        // projection to named output columns
-    HashJoin,       // hash join (the one join algorithm of Increment 0)
+    HashJoin,       // hash join: builds a hash table, indifferent to input order
+    MergeJoin,      // merge join: needs both inputs sorted on the join keys, and
+                    // keeps that order on its output
     Sort,           // enforcer: establishes a required sort order
     FormatConvert,  // enforcer: converts the storage format (row <-> column)
 };
@@ -48,9 +50,10 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 6> kAllPhysicalOps = {
-    PhysicalOp::SeqScan, PhysicalOp::Filter,        PhysicalOp::Project,
-    PhysicalOp::HashJoin, PhysicalOp::Sort,         PhysicalOp::FormatConvert};
+inline constexpr std::array<PhysicalOp, 7> kAllPhysicalOps = {
+    PhysicalOp::SeqScan,   PhysicalOp::Filter, PhysicalOp::Project,
+    PhysicalOp::HashJoin,  PhysicalOp::MergeJoin, PhysicalOp::Sort,
+    PhysicalOp::FormatConvert};
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
@@ -96,7 +99,7 @@ struct PhysicalNode {
     std::string table_name;                // SeqScan: the base table
     const Expr* predicate = nullptr;       // Filter: predicate; HashJoin: optional residual
     std::vector<const Expr*> projections;  // Project: one borrowed expr per output column
-    std::vector<HashKey> hash_keys;        // HashJoin: equi-join key pairs
+    std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin: equi-join key pairs
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
     StorageFormat target_format = StorageFormat::Any;    // FormatConvert: the format it produces
@@ -112,6 +115,9 @@ struct PhysicalNode {
 [[nodiscard]] PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                              std::vector<HashKey> keys, Schema output,
                                              const Expr* residual = nullptr);
+[[nodiscard]] PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
+                                              std::vector<HashKey> keys, Schema output,
+                                              const Expr* residual = nullptr);
 // Enforcers.
 [[nodiscard]] PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys);
 [[nodiscard]] PhysicalNodePtr make_format_convert(PhysicalNodePtr input, StorageFormat target);

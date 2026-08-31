@@ -2,6 +2,7 @@
 
 #include "db25/physical/cost.hpp"
 #include "db25/physical/memo.hpp"
+#include "db25/physical/properties.hpp"
 
 #include "db25/ast/node_types.hpp"
 #include "db25/plan/expr_ir.hpp"
@@ -146,11 +147,28 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     for (const PhysicalOp cand : cands) {
         GroupExpr ge = base;
         ge.op = cand;
-        ge.cost = inputs_cost + operator_cost(cand, input_rows, out_rows, cal);
+        // A candidate pays for the enforcers it will cause. Without this a
+        // MergeJoin over unsorted inputs would look cheaper than it is, get
+        // chosen, and then have Sorts inserted at extraction that nobody costed.
+        double enforce_cost = 0.0;
+        const std::vector<PhysicalProperties> reqs =
+            required_input_properties(cand, ge.hash_keys);
+        for (std::size_t i = 0; i < inputs.size() && i < reqs.size(); ++i) {
+            enforce_cost += enforcement_cost(memo.group(inputs[i]).provided, reqs[i],
+                                             input_rows[i], cal);
+        }
+        ge.cost = inputs_cost + enforce_cost + operator_cost(cand, input_rows, out_rows, cal);
         memo.add_expr(g, std::move(ge));
         ++candidates;
     }
     memo.select_cheapest(g);  // the cost-based choice
+
+    // Settle what this group now provides, so its parent can ask.
+    std::vector<PhysicalProperties> input_props;
+    input_props.reserve(inputs.size());
+    for (const GroupId in : inputs) input_props.push_back(memo.group(in).provided);
+    const GroupExpr& won = memo.group(g).exprs[*memo.group(g).winner];
+    memo.set_provided(g, derive_op(won.op, won.hash_keys, won.scan_format, input_props));
     return g;
 }
 

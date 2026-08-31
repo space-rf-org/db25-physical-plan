@@ -12,6 +12,7 @@
 // (or the deterministic lowering of Unit 0.6) populates groups directly and sets
 // winners, and extract_winner materializes the chosen physical plan.
 #include "db25/physical/physical_plan.hpp"
+#include "db25/physical/properties.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -31,9 +32,10 @@ struct GroupExpr {
     std::vector<GroupId> inputs;  // child groups, in operand order
 
     std::string table_name;                // SeqScan
-    const Expr* predicate = nullptr;       // Filter / HashJoin residual
+    StorageFormat scan_format = StorageFormat::Row;  // SeqScan: the format read
+    const Expr* predicate = nullptr;       // Filter / join residual
     std::vector<const Expr*> projections;  // Project
-    std::vector<HashKey> hash_keys;        // HashJoin
+    std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin
 
     double cost = std::numeric_limits<double>::infinity();
 };
@@ -50,6 +52,10 @@ struct Group {
     double rows = 0.0;
     std::vector<GroupExpr> exprs;
     std::optional<std::uint32_t> winner;  // index into `exprs`, set by costing
+    // What the WINNING subplan provides. Settled once the group is chosen, so a
+    // parent can ask what its inputs already give it (and therefore what it would
+    // have to enforce) without walking back down the tree.
+    PhysicalProperties provided;
 
     [[nodiscard]] double best_cost() const noexcept {
         return winner ? exprs[*winner].cost : std::numeric_limits<double>::infinity();
@@ -71,6 +77,9 @@ public:
     // Record a group's estimated output cardinality.
     void set_rows(GroupId group, double rows);
 
+    // Record what the group's winning subplan provides.
+    void set_provided(GroupId group, PhysicalProperties provided);
+
     // Choose the lowest-cost group-expression as the winner. Returns false if the
     // group has no expressions. This is the cost-based choice the memo exists to
     // make; with a single candidate it degenerates to that candidate.
@@ -84,8 +93,12 @@ public:
     [[nodiscard]] GroupId root() const noexcept { return root_; }
 
     // Materialize the winning physical subtree rooted at `id` (defaults to the
-    // memo root). Returns nullptr if `id` is invalid or any reachable group has
-    // no winner set.
+    // memo root). Where the winning operator REQUIRES a property its input does
+    // not provide (a MergeJoin over an unsorted input, say), the matching enforcer
+    // is inserted here - and the cost of doing so was already charged to that
+    // candidate when it was chosen, so the plan that is built is the plan that was
+    // costed. Returns nullptr if `id` is invalid or any reachable group has no
+    // winner set.
     [[nodiscard]] PhysicalNodePtr extract_winner(GroupId id = kInvalidGroup) const;
 
 private:

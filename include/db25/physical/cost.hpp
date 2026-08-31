@@ -7,6 +7,7 @@
 // into the code: goldens pin a lab profile and stay deterministic, while
 // production resolves a live- or cache-sourced profile through the same seam.
 #include "db25/physical/physical_plan.hpp"
+#include "db25/physical/properties.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -26,6 +27,7 @@ struct CalibrationProfile {
     double project_row = 0.3;     // evaluate the projection list on one input row
     double hash_build_row = 1.2;  // insert one build-side row into the hash table
     double hash_probe_row = 0.8;  // probe the hash table with one probe-side row
+    double merge_join_row = 0.4;  // merge one row from an already-sorted input
     double sort_row = 1.0;        // per-row coefficient of an n*log2(n) sort
     double convert_row = 0.6;     // convert one row between storage formats
     // Hardware facts (informational today; richer costing consumes them later).
@@ -81,6 +83,15 @@ struct CardinalityModel {
                                    const std::string& table_name, const CardinalityModel& card);
 [[nodiscard]] double operator_cost(PhysicalOp op, const std::vector<double>& input_rows,
                                    double out_rows, const CalibrationProfile& cal);
+
+// What it would cost to make `rows` rows satisfying `provided` also satisfy
+// `required` - i.e. the enforcers that would have to be inserted. Zero when the
+// requirement is already met. Charging this to a candidate is what keeps the
+// choice honest: a MergeJoin that needs its inputs sorted must pay for the Sorts
+// it will cause, or it would look cheap and then cost more than the plan chosen.
+[[nodiscard]] double enforcement_cost(const PhysicalProperties& provided,
+                                      const PhysicalProperties& required, double rows,
+                                      const CalibrationProfile& cal);
 
 // Estimated cost of the plan rooted at `node`, computed bottom-up from the
 // calibration coefficients and the cardinality model. Deterministic given its

@@ -1,5 +1,7 @@
 #include "db25/physical/memo.hpp"
 
+#include "db25/physical/properties.hpp"
+
 #include <utility>
 
 namespace db25::physical {
@@ -26,6 +28,10 @@ void Memo::set_winner(GroupId group, std::uint32_t expr_index) {
 
 void Memo::set_rows(GroupId group, double rows) {
     groups_[group].rows = rows;
+}
+
+void Memo::set_provided(GroupId group, PhysicalProperties provided) {
+    groups_[group].provided = std::move(provided);
 }
 
 bool Memo::select_cheapest(GroupId group) {
@@ -55,15 +61,20 @@ PhysicalNodePtr Memo::extract_winner(GroupId id) const {
     auto node = std::make_unique<PhysicalNode>(ge.op);
     node->output = g.output;
     node->table_name = ge.table_name;
+    node->scan_format = ge.scan_format;
     node->predicate = ge.predicate;
     node->projections = ge.projections;
     node->hash_keys = ge.hash_keys;
 
-    for (const GroupId input : ge.inputs) {
-        auto child = extract_winner(input);
+    const std::vector<PhysicalProperties> reqs =
+        required_input_properties(ge.op, ge.hash_keys);
+    for (std::size_t i = 0; i < ge.inputs.size(); ++i) {
+        auto child = extract_winner(ge.inputs[i]);
         if (!child) {
             return nullptr;  // an input group had no winner: extraction fails
         }
+        // Establish anything this operator requires but the input does not give.
+        if (i < reqs.size()) child = enforce(std::move(child), reqs[i]);
         node->children.push_back(std::move(child));
     }
     return node;

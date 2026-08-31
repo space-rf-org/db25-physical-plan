@@ -59,6 +59,7 @@ std::optional<CalibrationProfile> load_lab_calibration(const std::string& path,
     cal.project_row = atom_double(root, "project-row", cal.project_row);
     cal.hash_build_row = atom_double(root, "hash-build-row", cal.hash_build_row);
     cal.hash_probe_row = atom_double(root, "hash-probe-row", cal.hash_probe_row);
+    cal.merge_join_row = atom_double(root, "merge-join-row", cal.merge_join_row);
     cal.sort_row = atom_double(root, "sort-row", cal.sort_row);
     cal.convert_row = atom_double(root, "convert-row", cal.convert_row);
     cal.simd_width = atom_uint(root, "simd-width", cal.simd_width);
@@ -102,6 +103,8 @@ double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
         case PhysicalOp::Project:
             return in(0);
         case PhysicalOp::HashJoin:
+        case PhysicalOp::MergeJoin:
+            // The join ALGORITHM does not change how many rows come out.
             return in(0) * in(1) * card.join_selectivity;
         case PhysicalOp::Sort:
         case PhysicalOp::FormatConvert:
@@ -123,12 +126,32 @@ double operator_cost(PhysicalOp op, const std::vector<double>& input_rows, doubl
         case PhysicalOp::HashJoin:
             // input 0 probes, input 1 builds.
             return in(1) * cal.hash_build_row + in(0) * cal.hash_probe_row;
+        case PhysicalOp::MergeJoin:
+            // One linear pass over each already-sorted input - cheaper per row
+            // than hashing, which is why it wins when the order comes for free
+            // and loses when a Sort has to be enforced to get it.
+            return (in(0) + in(1)) * cal.merge_join_row;
         case PhysicalOp::Sort:
             return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)
         case PhysicalOp::FormatConvert:
             return in(0) * cal.convert_row;
     }
     return 0.0;
+}
+
+double enforcement_cost(const PhysicalProperties& provided, const PhysicalProperties& required,
+                        double rows, const CalibrationProfile& cal) {
+    if (satisfies(provided, required)) return 0.0;
+    double c = 0.0;
+    PhysicalProperties after = provided;
+    if (required.format != StorageFormat::Any && required.format != provided.format) {
+        c += operator_cost(PhysicalOp::FormatConvert, {rows}, rows, cal);
+        after.format = required.format;
+    }
+    if (!satisfies(after, required)) {  // order still unmet
+        c += operator_cost(PhysicalOp::Sort, {rows}, rows, cal);
+    }
+    return c;
 }
 
 // ---- tree form ------------------------------------------------------------

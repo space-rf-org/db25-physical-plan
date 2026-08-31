@@ -26,6 +26,21 @@ struct PhysicalProperties {
 [[nodiscard]] bool satisfies(const PhysicalProperties& provided,
                              const PhysicalProperties& required);
 
+// The physical properties an operator's output has, given what its inputs
+// provide. Representation-independent (as the cost formulas are), so the tree
+// form below and the memo form - where inputs are GROUPS - derive identically.
+[[nodiscard]] PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
+                                           StorageFormat scan_format,
+                                           const std::vector<PhysicalProperties>& input_props);
+
+// What each input of an operator must PROVIDE for that operator to be usable.
+// A MergeJoin needs both inputs sorted on its join keys - the requirement that
+// makes it cheaper than a HashJoin when the order is already there and dearer
+// when it must be enforced. Every other operator is indifferent. The returned
+// vector is one entry per input, in operand order.
+[[nodiscard]] std::vector<PhysicalProperties> required_input_properties(
+    PhysicalOp op, const std::vector<HashKey>& keys);
+
 // The physical properties of the output of `node`, derived bottom-up.
 [[nodiscard]] PhysicalProperties derive(const PhysicalNode& node);
 

@@ -21,6 +21,10 @@
     (operator (name Filter)        (arity 1) (kind pipeline))
     (operator (name Project)       (arity 1) (kind pipeline))
     (operator (name HashJoin)      (arity 2) (kind pipeline-breaker))
+    ; MergeJoin requires both inputs sorted on the join keys and preserves that
+    ; order on its output - so it is cheaper per row than HashJoin when the order
+    ; is already there, and dearer once a Sort must be enforced to get it.
+    (operator (name MergeJoin)     (arity 2) (kind pipeline-breaker))
     ; Enforcers: inserted to establish a required physical property.
     (operator (name Sort)          (arity 1) (kind pipeline-breaker))
     (operator (name FormatConvert) (arity 1) (kind pipeline)))
@@ -33,7 +37,10 @@
     (rule (logical Scan)    (physical SeqScan))
     (rule (logical Filter)  (physical Filter))
     (rule (logical Project) (physical Project))
-    (rule (logical Join)    (physical HashJoin)))
+    ; Two candidates for a join: the planner costs both - including any enforcers
+    ; each would cause - and keeps the cheaper.
+    (rule (logical Join)    (physical HashJoin))
+    (rule (logical Join)    (physical MergeJoin)))
 
   ; The reference ExecutionCapabilityProfile: what a competent hardware-native
   ; engine is assumed able to execute. It ships now so the planner is usable and
@@ -41,4 +48,4 @@
   ; its own profile in this same shape.
   (capability-profile
     (name reference)
-    (executes SeqScan Filter Project HashJoin Sort FormatConvert)))
+    (executes SeqScan Filter Project HashJoin MergeJoin Sort FormatConvert)))
