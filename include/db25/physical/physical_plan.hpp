@@ -13,6 +13,7 @@
 #include "db25/plan/expr_ir.hpp"       // complete db25::plan::Expr (borrowed payloads)
 #include "db25/plan/logical_plan.hpp"  // Schema, ColumnSchema
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,6 +34,17 @@ enum class PhysicalOp : std::uint8_t {
 };
 
 [[nodiscard]] const char* physical_op_to_string(PhysicalOp op) noexcept;
+
+// Every physical operator, for exhaustive iteration (the conformance check walks
+// this against the spec so a newly-added op that the spec has not declared is
+// caught, not silently emittable). Keep in sync with PhysicalOp.
+inline constexpr std::array<PhysicalOp, 4> kAllPhysicalOps = {
+    PhysicalOp::SeqScan, PhysicalOp::Filter, PhysicalOp::Project, PhysicalOp::HashJoin};
+
+// The input arity the IR expects of each operator (a SeqScan is a leaf; a Filter
+// / Project has one input; a HashJoin has two). The spec declares its own arity;
+// conformance asserts the two agree.
+[[nodiscard]] std::size_t expected_arity(PhysicalOp op) noexcept;
 
 struct PhysicalNode;
 using PhysicalNodePtr = std::unique_ptr<PhysicalNode>;

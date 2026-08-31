@@ -49,7 +49,8 @@ endif()
 add_library(db25physicalplan STATIC
     src/physical_plan.cpp
     src/memo.cpp
-    src/sexpr.cpp)
+    src/sexpr.cpp
+    src/spec.cpp)
 target_include_directories(db25physicalplan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(db25physicalplan PUBLIC db25logicalplan)
@@ -66,4 +67,12 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_link_libraries(physical_ir_tests PRIVATE db25physicalplan)
     target_compile_options(physical_ir_tests PRIVATE -fno-exceptions -Wall -Wextra)
     add_test(NAME physical_ir_tests COMMAND physical_ir_tests)
+
+    add_executable(spec_tests tests/test_spec.cpp)
+    target_link_libraries(spec_tests PRIVATE db25physicalplan)
+    target_compile_options(spec_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    # The conformance test loads the shipped spec from the source tree.
+    target_compile_definitions(spec_tests PRIVATE
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME spec_tests COMMAND spec_tests)
 endif()

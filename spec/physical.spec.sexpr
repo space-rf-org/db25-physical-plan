@@ -1,0 +1,31 @@
+; DB25 physical planner spec - the versioned IDL (design D1/D7).
+;
+; The single source of truth for the physical operator catalog and the reference
+; execution-capability profile. The planner interprets this spec rather than
+; embedding operator knowledge in code; the conformance check (src/spec.cpp)
+; asserts the spec and the code agree - every operator the planner can emit is
+; declared here, with the arity the IR expects, and marked executable by the
+; reference profile. Adding an operator starts by editing this file.
+;
+; Format: s-expressions (zero-dependency, diffable, the same discipline the rest
+; of DB25 already uses). `;` begins a line comment.
+
+(physical-spec
+  (version 0)
+
+  ; The physical operator catalog. `arity` is the number of child inputs; `kind`
+  ; is a coarse pipeline classification (informational today; the cost model and
+  ; property framework consume richer per-operator data in later units).
+  (operators
+    (operator (name SeqScan)  (arity 0) (kind access-path))
+    (operator (name Filter)   (arity 1) (kind pipeline))
+    (operator (name Project)  (arity 1) (kind pipeline))
+    (operator (name HashJoin) (arity 2) (kind pipeline-breaker)))
+
+  ; The reference ExecutionCapabilityProfile: what a competent hardware-native
+  ; engine is assumed able to execute. It ships now so the planner is usable and
+  ; testable before any execution engine exists; a real engine later publishes
+  ; its own profile in this same shape.
+  (capability-profile
+    (name reference)
+    (executes SeqScan Filter Project HashJoin)))

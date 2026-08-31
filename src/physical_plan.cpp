@@ -14,6 +14,16 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
     return "?";
 }
 
+std::size_t expected_arity(PhysicalOp op) noexcept {
+    switch (op) {
+        case PhysicalOp::SeqScan:  return 0;
+        case PhysicalOp::Filter:   return 1;
+        case PhysicalOp::Project:  return 1;
+        case PhysicalOp::HashJoin: return 2;
+    }
+    return 0;
+}
+
 PhysicalNodePtr make_seq_scan(std::string table, Schema output) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::SeqScan);
     n->table_name = std::move(table);
