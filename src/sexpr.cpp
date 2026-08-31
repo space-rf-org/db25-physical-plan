@@ -82,6 +82,8 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
         case PhysicalOp::SeqScan:
             out += " table=" + n.table_name;
             out += std::string(" fmt=") + storage_format_to_string(n.scan_format);
+            // Only the interesting case is rendered: a fresh scan is the norm.
+            if (n.scan_freshness == Freshness::Stale) out += " stale";
             break;
         case PhysicalOp::Filter:
             out += " pred=" + render_expr(n.predicate);

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -146,6 +147,12 @@ double operator_cost(PhysicalOp op, const std::vector<double>& input_rows, doubl
 double enforcement_cost(const PhysicalProperties& provided, const PhysicalProperties& required,
                         double rows, const CalibrationProfile& cal) {
     if (satisfies(provided, required)) return 0.0;
+    // Freshness is not enforceable: there is no operator that turns stale rows
+    // into fresh ones. Price it as impossible so such a candidate can never win -
+    // the lowering also discards these outright, this is the belt to that braces.
+    if (required.freshness == Freshness::Fresh && provided.freshness != Freshness::Fresh) {
+        return std::numeric_limits<double>::infinity();
+    }
     double c = 0.0;
     PhysicalProperties after = provided;
     if (required.format != StorageFormat::Any && required.format != provided.format) {

@@ -149,16 +149,32 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot. This is what turns the
     // HTAP substrate into an ordinary costed choice rather than a special case.
-    std::vector<StorageFormat> scan_formats{StorageFormat::Row};
+    std::vector<FormatAvailability> scan_formats{FormatAvailability{StorageFormat::Row}};
     if (n.op == plan::LogicalOp::Scan) {
         scan_formats = storage.formats_for(base.table_name);
+        // A correctness constraint, not a cost one: drop the copies that cannot
+        // answer this query at all. No enforcer could rescue them, so they must
+        // not reach the cost comparison in the first place.
+        if (ctx.required_freshness == Freshness::Fresh) {
+            std::vector<FormatAvailability> eligible;
+            for (const FormatAvailability& fa : scan_formats) {
+                if (fa.freshness == Freshness::Fresh) eligible.push_back(fa);
+            }
+            if (eligible.empty()) {
+                error = "table '" + base.table_name +
+                        "' has no copy fresh enough for this query";
+                return kInvalidGroup;
+            }
+            scan_formats = std::move(eligible);
+        }
     }
 
     for (const PhysicalOp cand : cands) {
-      for (const StorageFormat fmt : scan_formats) {
+      for (const FormatAvailability& fa : scan_formats) {
         GroupExpr ge = base;
         ge.op = cand;
-        ge.scan_format = fmt;
+        ge.scan_format = fa.format;
+        ge.scan_freshness = fa.freshness;
         // A candidate pays for the enforcers it will cause. Without this a
         // MergeJoin over unsorted inputs would look cheaper than it is, get
         // chosen, and then have Sorts inserted at extraction that nobody costed.
@@ -170,7 +186,7 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
                                              input_rows[i], cal);
         }
         ge.cost = inputs_cost + enforce_cost +
-                  operator_cost(cand, input_rows, out_rows, cal, fmt);
+                  operator_cost(cand, input_rows, out_rows, cal, fa.format);
         memo.add_expr(g, std::move(ge));
         ++candidates;
       }
@@ -182,7 +198,8 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     input_props.reserve(inputs.size());
     for (const GroupId in : inputs) input_props.push_back(memo.group(in).provided);
     const GroupExpr& won = memo.group(g).exprs[*memo.group(g).winner];
-    memo.set_provided(g, derive_op(won.op, won.hash_keys, won.scan_format, input_props));
+    memo.set_provided(g, derive_op(won.op, won.hash_keys, won.scan_format, input_props,
+                                   won.scan_freshness));
     return g;
 }
 

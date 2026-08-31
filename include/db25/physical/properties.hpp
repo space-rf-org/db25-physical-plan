@@ -17,10 +17,16 @@ namespace db25::physical {
 struct PhysicalProperties {
     std::vector<SortKey> sort;                  // the order the rows are in
     StorageFormat format = StorageFormat::Any;  // the storage format they are in
+    // Whether the rows reflect all committed writes. As a REQUIREMENT this is a
+    // correctness constraint - no enforcer can establish it, so a subplan that
+    // cannot provide it is discarded rather than fixed up.
+    Freshness freshness = Freshness::Any;
 };
 
-// Does `provided` satisfy `required`? Format: `required` is Any, or the two are
-// equal. Sort: `required` is a prefix of `provided` (the rows are sorted at least
+// Does `provided` satisfy `required`? Freshness: a Fresh requirement admits only
+// Fresh data - and unlike the others it can never be enforced into existence.
+// Format: `required` is Any, or the two are equal. Sort: `required` is a prefix
+// of `provided` (the rows are sorted at least
 // as specifically as required - a superset order still satisfies a prefix
 // requirement). An empty required sort is always satisfied.
 [[nodiscard]] bool satisfies(const PhysicalProperties& provided,
@@ -31,7 +37,8 @@ struct PhysicalProperties {
 // form below and the memo form - where inputs are GROUPS - derive identically.
 [[nodiscard]] PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
                                            StorageFormat scan_format,
-                                           const std::vector<PhysicalProperties>& input_props);
+                                           const std::vector<PhysicalProperties>& input_props,
+                                           Freshness scan_freshness = Freshness::Fresh);
 
 // What each input of an operator must PROVIDE for that operator to be usable.
 // A MergeJoin needs both inputs sorted on its join keys - the requirement that

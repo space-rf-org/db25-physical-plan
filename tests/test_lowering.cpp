@@ -377,8 +377,88 @@ static void test_join_requires_rows_and_conversion_is_priced() {
     CHECK(reqs[1].format == db25::physical::StorageFormat::Row);
 }
 
+// Freshness is where the property model stops being about cost. In Unit 1.3 the
+// cheaper columnar copy simply won. Here the cheaper columnar copy LAGS, and a
+// query that must see the latest writes cannot use it at any price - so the
+// planner must pick the dearer fresh copy, and when no fresh copy exists it must
+// fail honestly rather than answer from stale data.
+static void test_freshness_overrides_cost() {
+    std::printf("test_freshness_overrides_cost\n");
+
+    const auto make_pipeline = []() {
+        auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+        scan->table_name = "a";
+        scan->output = a_schema();
+        auto filt = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Filter);
+        filt->output = a_schema();
+        filt->predicate = binop(BinaryOp::GreaterThan, col(1, DataType::Integer), int_lit(10));
+        filt->add_child(std::move(scan));
+        return filt;
+    };
+
+    // The row copy is fresh; the columnar replica is cheaper but lags.
+    db25::physical::StorageCatalog cat;
+    cat.formats["a"] = {
+        db25::physical::FormatAvailability{db25::physical::StorageFormat::Row,
+                                           db25::physical::Freshness::Fresh},
+        db25::physical::FormatAvailability{db25::physical::StorageFormat::Column,
+                                           db25::physical::Freshness::Stale}};
+
+    // No freshness demand: cost decides, and the cheap stale replica wins.
+    LoweringContext relaxed;
+    relaxed.storage = &cat;
+    const auto p1 = make_pipeline();
+    const LoweringResult cheap = lower(*p1, relaxed);
+    CHECK(cheap.ok);
+    if (cheap.plan) {
+        const std::string s2 = physical_to_sexpr(*cheap.plan);
+        CHECK(contains(s2, "fmt=column"));
+        CHECK(contains(s2, "stale"));
+    }
+
+    // Demand fresh data: the cheaper copy is now INELIGIBLE, not merely dearer.
+    LoweringContext strict;
+    strict.storage = &cat;
+    strict.required_freshness = db25::physical::Freshness::Fresh;
+    const auto p2 = make_pipeline();
+    const LoweringResult correct = lower(*p2, strict);
+    CHECK(correct.ok);
+    if (correct.plan) {
+        const std::string s2 = physical_to_sexpr(*correct.plan);
+        CHECK(contains(s2, "fmt=row"));     // the dearer copy, chosen for correctness
+        CHECK(!contains(s2, "fmt=column"));
+        CHECK(!contains(s2, "stale"));
+    }
+    // Only one scan candidate survived the constraint (plus the filter).
+    CHECK(correct.candidates_considered < cheap.candidates_considered);
+}
+
+// When nothing can answer the query correctly, say so - do not quietly serve
+// stale rows.
+static void test_no_fresh_copy_is_an_honest_failure() {
+    std::printf("test_no_fresh_copy_is_an_honest_failure\n");
+    db25::physical::StorageCatalog stale_only;
+    stale_only.formats["a"] = {
+        db25::physical::FormatAvailability{db25::physical::StorageFormat::Column,
+                                           db25::physical::Freshness::Stale}};
+
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+
+    LoweringContext ctx;
+    ctx.storage = &stale_only;
+    ctx.required_freshness = db25::physical::Freshness::Fresh;
+    const LoweringResult r = lower(*scan, ctx);
+    CHECK(!r.ok);
+    CHECK(r.plan == nullptr);
+    CHECK(r.error.find("fresh") != std::string::npos);
+}
+
 int main() {
     test_lowers_the_increment0_query();
+    test_freshness_overrides_cost();
+    test_no_fresh_copy_is_an_honest_failure();
     test_storage_substrate_is_chosen_by_cost();
     test_join_requires_rows_and_conversion_is_priced();
     test_join_algorithm_is_chosen_by_cost();

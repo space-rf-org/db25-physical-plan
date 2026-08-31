@@ -14,14 +14,28 @@
 
 namespace db25::physical {
 
-struct StorageCatalog {
-    std::unordered_map<std::string, std::vector<StorageFormat>> formats;
+// One way a table can be read: a storage format, and whether that copy reflects
+// all committed writes. A columnar replica typically lags; the primary row store
+// typically does not. Implicitly constructible from a bare StorageFormat, which
+// then means "fresh".
+struct FormatAvailability {
+    StorageFormat format = StorageFormat::Row;
+    Freshness freshness = Freshness::Fresh;
 
-    // The formats `table` can be read in. Never empty: an unknown table falls
-    // back to row-only.
-    [[nodiscard]] std::vector<StorageFormat> formats_for(const std::string& table) const {
+    FormatAvailability(StorageFormat f, Freshness fr = Freshness::Fresh)
+        : format(f), freshness(fr) {}
+};
+
+struct StorageCatalog {
+    std::unordered_map<std::string, std::vector<FormatAvailability>> formats;
+
+    // The ways `table` can be read. Never empty: an unknown table falls back to a
+    // fresh row-format copy.
+    [[nodiscard]] std::vector<FormatAvailability> formats_for(const std::string& table) const {
         const auto it = formats.find(table);
-        if (it == formats.end() || it->second.empty()) return {StorageFormat::Row};
+        if (it == formats.end() || it->second.empty()) {
+            return {FormatAvailability{StorageFormat::Row}};
+        }
         return it->second;
     }
 };

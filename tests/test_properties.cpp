@@ -12,6 +12,8 @@
 #include "db25/physical/properties.hpp"
 #include "db25/physical/sexpr.hpp"
 
+#include <limits>
+
 #include <cstdio>
 #include <string>
 
@@ -179,8 +181,58 @@ static void test_mergejoin_requires_and_derives_order() {
     CHECK(derive(*hj).sort.empty());
 }
 
+// The structural difference between freshness and every other property: a Sort
+// can establish an order and a FormatConvert a layout, but NOTHING makes stale
+// rows fresh. So an unmet freshness requirement is priced as impossible, which is
+// what stops such a candidate from ever being chosen.
+static void test_freshness_is_unenforceable() {
+    std::printf("test_freshness_is_unenforceable\n");
+    PhysicalProperties stale;
+    stale.format = StorageFormat::Row;
+    stale.freshness = Freshness::Stale;
+
+    PhysicalProperties needs_fresh;
+    needs_fresh.freshness = Freshness::Fresh;
+
+    CHECK(!satisfies(stale, needs_fresh));
+
+    // An order or a format CAN be enforced, so those cost something finite.
+    PhysicalProperties unsorted_fresh;
+    unsorted_fresh.format = StorageFormat::Row;
+    unsorted_fresh.freshness = Freshness::Fresh;
+    PhysicalProperties needs_order;
+    needs_order.sort = {{0, false}};
+    const double order_cost =
+        enforcement_cost(unsorted_fresh, needs_order, 1000.0, default_calibration());
+    CHECK(order_cost > 0.0);
+    CHECK(order_cost < std::numeric_limits<double>::infinity());
+
+    // Freshness cannot: priced as impossible.
+    const double fresh_cost =
+        enforcement_cost(stale, needs_fresh, 1000.0, default_calibration());
+    CHECK(fresh_cost == std::numeric_limits<double>::infinity());
+}
+
+// Staleness propagates upward and never washes out.
+static void test_staleness_propagates() {
+    std::printf("test_staleness_propagates\n");
+    auto scan = make_seq_scan("a", {});
+    scan->scan_freshness = Freshness::Stale;
+    CHECK(derive(*scan).freshness == Freshness::Stale);
+
+    auto filtered = make_filter(std::move(scan), nullptr);
+    CHECK(derive(*filtered).freshness == Freshness::Stale);
+
+    // A join with one lagging side is itself lagging.
+    auto fresh_scan = make_seq_scan("b", {});
+    auto joined = make_hash_join(std::move(filtered), std::move(fresh_scan), {{0, 0}}, {});
+    CHECK(derive(*joined).freshness == Freshness::Stale);
+}
+
 int main() {
     test_derive();
+    test_freshness_is_unenforceable();
+    test_staleness_propagates();
     test_mergejoin_requires_and_derives_order();
     test_satisfies();
     test_enforce_inserts_minimal_enforcers();

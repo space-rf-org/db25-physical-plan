@@ -40,6 +40,12 @@ struct LoweringContext {
     // per available format, so the substrate is chosen by cost like any other
     // physical decision. Defaults to row-only when not supplied.
     const StorageCatalog* storage = nullptr;
+    // What the QUERY demands of the data it reads. Fresh means it must reflect
+    // all committed writes, so a lagging copy is not merely dearer - it is
+    // ineligible, and a scan that can only be served from one is discarded.
+    // Freshness originates at scans and only ever propagates upward, so forbidding
+    // stale scans is exactly equivalent to requiring a fresh result.
+    Freshness required_freshness = Freshness::Any;
     const RuntimeProfile* runtime = nullptr;
 };
 

@@ -26,6 +26,11 @@ const PhysicalNode* child0(const PhysicalNode& n) {
 }  // namespace
 
 bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& required) {
+    // Correctness first: stale data cannot answer a query that must see the
+    // latest writes, and no enforcer exists that would change that.
+    if (required.freshness == Freshness::Fresh && provided.freshness != Freshness::Fresh) {
+        return false;
+    }
     if (required.format != StorageFormat::Any && required.format != provided.format) {
         return false;
     }
@@ -34,14 +39,25 @@ bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& req
 
 PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
                              StorageFormat scan_format,
-                             const std::vector<PhysicalProperties>& input_props) {
+                             const std::vector<PhysicalProperties>& input_props,
+                             Freshness scan_freshness) {
     const auto in = [&](std::size_t i) {
         return i < input_props.size() ? input_props[i] : PhysicalProperties{};
     };
+    // Staleness propagates upward and never washes out: anything derived from a
+    // lagging copy is itself lagging.
+    const auto combined_freshness = [&]() {
+        Freshness f = Freshness::Fresh;
+        for (const PhysicalProperties& p : input_props) {
+            if (p.freshness == Freshness::Stale) f = Freshness::Stale;
+        }
+        return f;
+    };
     switch (op) {
         case PhysicalOp::SeqScan:
-            // A base scan produces the table's stored format, in no guaranteed order.
-            return PhysicalProperties{{}, scan_format};
+            // A base scan produces the table's stored format, in no guaranteed
+            // order, as fresh as the copy it reads.
+            return PhysicalProperties{{}, scan_format, scan_freshness};
         case PhysicalOp::Filter:
         case PhysicalOp::Project:
             // Both drop or reshape columns but preserve order and format. (Project
@@ -50,7 +66,7 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             return in(0);
         case PhysicalOp::HashJoin:
             // Builds a hash table: output order is not guaranteed.
-            return PhysicalProperties{{}, StorageFormat::Row};
+            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
         case PhysicalOp::MergeJoin: {
             // Consumes both inputs in key order and emits in that same order, so
             // the join keys' order survives - the property that can save a later
@@ -59,15 +75,16 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             p.sort.reserve(keys.size());
             for (const HashKey& k : keys) p.sort.push_back(SortKey{k.left_index, false});
             p.format = StorageFormat::Row;
+            p.freshness = combined_freshness();
             return p;
         }
         case PhysicalOp::Sort:
             // Establishes its order (filled in by the caller from sort_keys);
             // preserves the child's format.
-            return PhysicalProperties{{}, in(0).format};
+            return PhysicalProperties{{}, in(0).format, in(0).freshness};
         case PhysicalOp::FormatConvert:
             // Changes the format to its target (filled in by the caller); preserves order.
-            return PhysicalProperties{in(0).sort, StorageFormat::Any};
+            return PhysicalProperties{in(0).sort, StorageFormat::Any, in(0).freshness};
     }
     return PhysicalProperties{};
 }
@@ -106,7 +123,8 @@ PhysicalProperties derive(const PhysicalNode& node) {
     input_props.reserve(node.children.size());
     for (const auto& c : node.children) input_props.push_back(derive(*c));
 
-    PhysicalProperties p = derive_op(node.op, node.hash_keys, node.scan_format, input_props);
+    PhysicalProperties p =
+        derive_op(node.op, node.hash_keys, node.scan_format, input_props, node.scan_freshness);
     // The two enforcers carry their established property in their own payload.
     if (node.op == PhysicalOp::Sort) p.sort = node.sort_keys;
     if (node.op == PhysicalOp::FormatConvert) p.format = node.target_format;
