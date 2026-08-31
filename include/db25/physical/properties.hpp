@@ -23,6 +23,12 @@ struct PhysicalProperties {
     Freshness freshness = Freshness::Any;
 };
 
+// Value equality. Requirements are the KEY a group's winners are memoized under
+// (memo.hpp), so two requirements that ask for the same thing must compare equal
+// or the same work would be redone under a second key.
+[[nodiscard]] bool operator==(const SortKey& a, const SortKey& b) noexcept;
+[[nodiscard]] bool operator==(const PhysicalProperties& a, const PhysicalProperties& b) noexcept;
+
 // Does `provided` satisfy `required`? Freshness: a Fresh requirement admits only
 // Fresh data - and unlike the others it can never be enforced into existence.
 // Format: `required` is Any, or the two are equal. Sort: `required` is a prefix

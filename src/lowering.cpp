@@ -153,6 +153,13 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     double inputs_cost = 0.0;
     for (const GroupId in : inputs) inputs_cost += memo.group(in).best_cost();
 
+    // What each input group's chosen subplan provides - needed both to charge a
+    // candidate for the enforcement it causes and to derive what the candidate
+    // itself will provide.
+    std::vector<PhysicalProperties> input_props;
+    input_props.reserve(inputs.size());
+    for (const GroupId in : inputs) input_props.push_back(memo.group(in).provided());
+
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot. This is what turns the
     // HTAP substrate into an ordinary costed choice rather than a special case.
@@ -192,11 +199,13 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
         const std::vector<PhysicalProperties> reqs =
             required_input_properties(cand, ge.hash_keys);
         for (std::size_t i = 0; i < inputs.size() && i < reqs.size(); ++i) {
-            enforce_cost += enforcement_cost(memo.group(inputs[i]).provided, reqs[i],
-                                             input_rows[i], cal);
+            enforce_cost += enforcement_cost(input_props[i], reqs[i], input_rows[i], cal);
         }
         ge.cost = inputs_cost + enforce_cost +
                   operator_cost(cand, input_rows, out_rows, cal, fa.format);
+        // Derived per CANDIDATE, not just for the winner: choosing a winner for a
+        // REQUIREMENT means comparing what each candidate already provides.
+        ge.provided = derive_op(cand, ge.hash_keys, fa.format, input_props, fa.freshness);
         memo.add_expr(g, std::move(ge));
         ++candidates;
       }
@@ -207,15 +216,16 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
                 (ln ? ln : "?") + "'";
         return kInvalidGroup;
     }
-    memo.select_cheapest(g);  // the cost-based choice
-
-    // Settle what this group now provides, so its parent can ask.
-    std::vector<PhysicalProperties> input_props;
-    input_props.reserve(inputs.size());
-    for (const GroupId in : inputs) input_props.push_back(memo.group(in).provided);
-    const GroupExpr& won = memo.group(g).exprs[*memo.group(g).winner];
-    memo.set_provided(g, derive_op(won.op, won.hash_keys, won.scan_format, input_props,
-                                   won.scan_freshness));
+    // The cost-based choice, for the unconstrained requirement: bottom-up lowering
+    // asks each group for its cheapest plan, because no consumer has yet stated
+    // what it needs. Optimizing a group FOR a requirement is what unit 2.2 adds;
+    // the memo can already answer it (see Memo::select_cheapest with a
+    // requirement), which is what this unit delivers.
+    if (!memo.select_cheapest(g, cal)) {
+        const char* ln = logical_op_name(n.op);
+        error = std::string("no candidate could be chosen for logical '") + (ln ? ln : "?") + "'";
+        return kInvalidGroup;
+    }
     return g;
 }
 
