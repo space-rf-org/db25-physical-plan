@@ -242,7 +242,9 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
 
     result.plan = memo.extract_winner();
     if (!result.plan) {
-        result.error = "winner extraction failed (a group had no winner)";
+        result.error =
+            "winner extraction failed (a group had no winner, or a required "
+            "property could not be enforced)";
         return result;
     }
     result.ok = true;

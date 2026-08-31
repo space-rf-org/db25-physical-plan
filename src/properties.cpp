@@ -166,6 +166,16 @@ PhysicalNodePtr enforce(PhysicalNodePtr input, const PhysicalProperties& require
     if (!sort_prefix(derive(*node).sort, required.sort)) {
         node = make_sort(std::move(node), required.sort);
     }
+    // Verify rather than assume. The enforcers establish order and format; NO
+    // enforcer establishes freshness, so a Fresh requirement over stale input
+    // reaches here unsatisfied. Returning the input anyway - as this used to -
+    // hands back a plan that reads lagging data for a query that must not, which
+    // is precisely the correctness hole the Freshness property exists to close.
+    // Checking the postcondition rather than special-casing freshness also means
+    // any future unenforceable property is caught the day it is added.
+    if (!satisfies(derive(*node), required)) {
+        return nullptr;
+    }
     return node;
 }
 

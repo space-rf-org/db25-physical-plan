@@ -61,6 +61,13 @@ struct PhysicalProperties {
 // minimal enforcers needed (a FormatConvert to the required format, then a Sort
 // to the required order). If `input` already satisfies `required`, it is returned
 // unchanged - no enforcer inserted.
+//
+// Returns NULLPTR when the requirement cannot be enforced at all - today that
+// means an unmet Fresh requirement, since no operator turns stale rows into fresh
+// ones. The postcondition is checked, not assumed: whatever this returns
+// non-null satisfies `required`. A caller must treat nullptr as "this subplan
+// cannot serve this requirement" and fail, rather than emitting the input
+// unchanged - which is what it used to do silently.
 [[nodiscard]] PhysicalNodePtr enforce(PhysicalNodePtr input,
                                       const PhysicalProperties& required);
 

@@ -143,6 +143,41 @@ static void test_enforcement_adds_cost() {
     CHECK(cost_of(*enforced, cal, card) > base);  // the Sort adds cost
 }
 
+// enforce() used to promise "a plan whose output satisfies `required`" and then
+// break that promise silently: for an unmet Fresh requirement neither enforcer
+// applies, so it returned the STALE input unchanged and the caller emitted a plan
+// reading lagging data for a query that must not see it.
+//
+// Unreachable at the time - nothing set a freshness REQUIREMENT on an input - but
+// property-directed search (Increment 2) is exactly what makes consumer
+// requirements flow down into enforce(). Pinned now, while it is cheap.
+static void test_enforce_reports_an_unenforceable_requirement() {
+    std::printf("test_enforce_reports_an_unenforceable_requirement\n");
+    PhysicalProperties fresh_required;
+    fresh_required.freshness = Freshness::Fresh;
+
+    auto stale = make_seq_scan("t", {});
+    stale->scan_freshness = Freshness::Stale;
+    CHECK(enforce(std::move(stale), fresh_required) == nullptr);  // no silent pass-through
+
+    // A fresh input needs no enforcer and comes back unchanged.
+    auto fresh = make_seq_scan("t", {});
+    fresh->scan_freshness = Freshness::Fresh;
+    auto ok = enforce(std::move(fresh), fresh_required);
+    CHECK(ok != nullptr);
+    if (ok) CHECK(satisfies(derive(*ok), fresh_required));
+
+    // The enforceable properties still work over a stale input: staleness is not
+    // a requirement here, so it is simply carried through.
+    PhysicalProperties order_required;
+    order_required.sort = {{0, false}};
+    auto stale2 = make_seq_scan("t", {});
+    stale2->scan_freshness = Freshness::Stale;
+    auto sorted = enforce(std::move(stale2), order_required);
+    CHECK(sorted != nullptr);
+    if (sorted) CHECK(satisfies(derive(*sorted), order_required));
+}
+
 static void test_enforcers_render() {
     std::printf("test_enforcers_render\n");
     auto conv = make_format_convert(make_sort(make_seq_scan("t", {}), {{0, true}}),
@@ -238,6 +273,7 @@ int main() {
     test_enforce_inserts_minimal_enforcers();
     test_enforce_is_noop_when_satisfied();
     test_enforcement_adds_cost();
+    test_enforce_reports_an_unenforceable_requirement();
     test_enforcers_render();
 
     if (g_failures == 0) {

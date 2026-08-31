@@ -76,7 +76,12 @@ PhysicalNodePtr Memo::extract_winner(GroupId id) const {
             return nullptr;  // an input group had no winner: extraction fails
         }
         // Establish anything this operator requires but the input does not give.
-        if (i < reqs.size()) child = enforce(std::move(child), reqs[i]);
+        // enforce() returns null when the requirement is not enforceable at all;
+        // that must fail extraction, not silently emit the unenforced input.
+        if (i < reqs.size()) {
+            child = enforce(std::move(child), reqs[i]);
+            if (!child) return nullptr;
+        }
         node->children.push_back(std::move(child));
     }
     return node;
