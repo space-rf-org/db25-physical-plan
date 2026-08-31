@@ -42,11 +42,14 @@ if(NOT TARGET db25logicalplan)
 endif()
 
 # ---------------------------------------------------------------------------
-# The physical planner library. Real sources (physical IR, Cascades memo, cost
-# model, lowering) land in the Increment 0 units that follow; for now a single
-# placeholder TU keeps the target and the db25logicalplan link exercised by CI.
+# The physical planner library. The physical IR + Cascades memo + s-expr
+# rendering land here (Unit 0.2); the cost model, spec IDL, and lowering follow
+# in later units.
 # ---------------------------------------------------------------------------
-add_library(db25physicalplan STATIC src/placeholder.cpp)
+add_library(db25physicalplan STATIC
+    src/physical_plan.cpp
+    src/memo.cpp
+    src/sexpr.cpp)
 target_include_directories(db25physicalplan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(db25physicalplan PUBLIC db25logicalplan)
@@ -58,4 +61,9 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_link_libraries(physical_tests PRIVATE db25physicalplan)
     target_compile_options(physical_tests PRIVATE -fno-exceptions -Wall -Wextra)
     add_test(NAME physical_tests COMMAND physical_tests)
+
+    add_executable(physical_ir_tests tests/test_physical_ir.cpp)
+    target_link_libraries(physical_ir_tests PRIVATE db25physicalplan)
+    target_compile_options(physical_ir_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    add_test(NAME physical_ir_tests COMMAND physical_ir_tests)
 endif()
