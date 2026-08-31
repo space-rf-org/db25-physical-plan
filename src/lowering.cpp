@@ -8,6 +8,7 @@
 #include "db25/plan/expr_ir.hpp"
 
 #include <cstdint>
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <optional>
@@ -215,28 +216,44 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 struct Optimizer {
     Memo& memo;
     const CalibrationProfile& cal;
+    bool prune = true;
     std::size_t goals = 0;
+    std::size_t pruned = 0;
+
+    static constexpr double kNoBound = std::numeric_limits<double>::infinity();
 
     // Optimize each input under `reqs`, accumulating cost and what they provide.
-    // Returns false when any input cannot meet its requirement at any price.
+    // Returns false when an input cannot meet its requirement at any price, OR
+    // when the running total has already exceeded `budget` - at which point the
+    // candidate that asked for these inputs cannot win and the remaining inputs
+    // need not be optimized at all.
     bool optimize_inputs(const std::vector<GroupId>& inputs,
-                         const std::vector<PhysicalProperties>& reqs,
+                         const std::vector<PhysicalProperties>& reqs, double budget,
                          double& cost_out, std::vector<PhysicalProperties>& provided_out) {
         cost_out = 0.0;
         provided_out.clear();
         for (std::size_t i = 0; i < inputs.size(); ++i) {
             const PhysicalProperties& r =
                 i < reqs.size() ? reqs[i] : Group::unconstrained();
-            const std::optional<std::uint32_t> w = optimize(inputs[i], r);
+            const std::optional<std::uint32_t> w =
+                optimize(inputs[i], r, prune ? budget - cost_out : kNoBound);
             if (!w) return false;
             const WinnerEntry& e = memo.group(inputs[i]).winners[*w];
             cost_out += e.cost;
+            if (prune && cost_out >= budget) return false;  // cannot win; stop here
             provided_out.push_back(e.provided);
         }
         return true;
     }
 
-    std::optional<std::uint32_t> optimize(GroupId g, const PhysicalProperties& required) {
+    // `budget` is a strict upper bound: any plan costing at least this much is of
+    // no use to the caller, so the search may abandon it unfinished. The bound is
+    // ADMISSIBLE - it only ever discards candidates whose cost is already at least
+    // the budget, and every term in a plan's cost is non-negative, so a partial
+    // cost is a lower bound on the total. That is what lets pruning be a pure
+    // speedup: it can never discard the optimum.
+    std::optional<std::uint32_t> optimize(GroupId g, const PhysicalProperties& required,
+                                          double budget = kNoBound) {
         if (const auto memoized = memo.group(g).winner_index_for(required)) {
             return memoized;  // this goal is already settled
         }
@@ -251,6 +268,10 @@ struct Optimizer {
         std::vector<PhysicalProperties> best_input_required;
 
         for (std::uint32_t i = 0; i < n_exprs; ++i) {
+            // The tightest bound available for this candidate: the caller's, or
+            // the best this group has already found, whichever is smaller.
+            const double bound = prune ? std::min(budget, best_cost) : kNoBound;
+
             // A reference is safe here because of a phase invariant: EXPLORATION
             // IS COMPLETE before optimization begins, so no group's candidate list
             // grows while the search runs. (Groups are a deque and winners are
@@ -265,10 +286,15 @@ struct Optimizer {
             const double own_cost =
                 operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format);
 
+            // The operator's own work alone already costs at least the bound, so
+            // no arrangement of its inputs can rescue it.
+            if (own_cost >= bound) { ++pruned; continue; }
+
             // --- route 1: satisfy the operator's own needs, enforce on top ---
             double child_cost = 0.0;
             std::vector<PhysicalProperties> child_props;
-            if (optimize_inputs(ge.inputs, op_reqs, child_cost, child_props)) {
+            if (optimize_inputs(ge.inputs, op_reqs, bound - own_cost, child_cost,
+                                child_props)) {
                 const PhysicalProperties provided = derive_op(
                     ge.op, ge.hash_keys, ge.scan_format, child_props, ge.scan_freshness);
                 const double top = enforcement_cost(provided, required, out_rows, cal);
@@ -302,7 +328,8 @@ struct Optimizer {
 
                     double pd_cost = 0.0;
                     std::vector<PhysicalProperties> pd_props;
-                    if (optimize_inputs(ge.inputs, pushed, pd_cost, pd_props)) {
+                    if (optimize_inputs(ge.inputs, pushed, bound - own_cost, pd_cost,
+                                        pd_props)) {
                         const PhysicalProperties provided =
                             derive_op(ge.op, ge.hash_keys, ge.scan_format, pd_props,
                                       ge.scan_freshness);
@@ -321,7 +348,22 @@ struct Optimizer {
         }
 
         if (best == n_exprs || best_cost == std::numeric_limits<double>::infinity()) {
-            return std::nullopt;  // nothing here can serve this goal at any price
+            // Nothing here can serve this goal - either at any price, or within
+            // the caller's budget.
+            //
+            // Note what is NOT needed here: a guard against memoizing a
+            // budget-cutoff as though it were this group's true optimum. A
+            // candidate abandoned on the bound never becomes `best`, so a cutoff
+            // reaches this line with nothing to record. (Checked, not assumed:
+            // making this line memoize `best` when one exists is a no-op, because
+            // `best` being set implies a finite cost and this line is only reached
+            // when there is none.)
+            //
+            // The failure itself is deliberately not memoized either. A goal that
+            // could not be met under a tight budget may well be met under a looser
+            // one, and recording "impossible" would make a bound from one caller
+            // silently answer a different caller's question.
+            return std::nullopt;
         }
         memo.set_winner(g, required, best, best_cost, best_provided,
                         std::move(best_input_required));
@@ -350,12 +392,13 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     memo.set_root(root_group);
     result.memo_groups = memo.size();
 
-    Optimizer opt{memo, cal, 0};
+    Optimizer opt{memo, cal, ctx.prune, 0, 0};
     if (!opt.optimize(root_group, ctx.required_output)) {
         result.error = "no plan satisfies the required output properties";
         return result;
     }
     result.optimization_goals = opt.goals;
+    result.candidates_pruned = opt.pruned;
 
     result.plan = memo.extract_winner_for(root_group, ctx.required_output);
     if (!result.plan) {

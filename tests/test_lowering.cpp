@@ -322,6 +322,61 @@ static void test_unsatisfiable_required_output_fails_honestly() {
     CHECK(!r.error.empty());
 }
 
+// ---- Unit 2.3: branch-and-bound -------------------------------------------
+
+// THE gate for this unit. Pruning is a pure search optimization: it may only ever
+// make the search cheaper, never make it answer differently. So every case is
+// lowered twice - pruned and exhaustive - and the rendered plans must be
+// IDENTICAL. A pruning bug that discards the optimum shows up here and nowhere
+// else, because a cheaper-but-wrong plan still looks like a plan.
+static void test_pruning_never_changes_the_plan() {
+    std::printf("test_pruning_never_changes_the_plan\n");
+    std::string error;
+    auto spec = db25::physical::load_spec(
+        std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr", error);
+    CHECK(spec.has_value());
+    if (!spec) return;
+
+    StorageCatalog both;   // a table with two substrates widens the search
+    both.formats["a"] = {FormatAvailability{StorageFormat::Row},
+                         FormatAvailability{StorageFormat::Column}};
+    both.formats["b"] = {FormatAvailability{StorageFormat::Row},
+                         FormatAvailability{StorageFormat::Column}};
+
+    // Requirements worth exploring: none, an order, a format, and both at once.
+    std::vector<PhysicalProperties> goals(4);
+    goals[1].sort = {SortKey{0, false}};
+    goals[2].format = StorageFormat::Row;
+    goals[3].sort = {SortKey{0, false}};
+    goals[3].format = StorageFormat::Row;
+
+    std::size_t total_pruned = 0;
+    for (const PhysicalProperties& goal : goals) {
+        auto logical = build_logical();
+
+        LoweringContext pruned;
+        pruned.spec = &*spec;
+        pruned.storage = &both;
+        pruned.required_output = goal;
+        pruned.prune = true;
+
+        LoweringContext exhaustive = pruned;
+        exhaustive.prune = false;
+
+        const LoweringResult rp = lower(*logical, pruned);
+        const LoweringResult re = lower(*logical, exhaustive);
+        CHECK(rp.ok == re.ok);
+        if (!rp.ok || !re.ok) continue;
+        CHECK(physical_to_sexpr(*rp.plan) == physical_to_sexpr(*re.plan));
+        // The chosen plan's COST must agree too, not merely its shape.
+        CHECK(rp.optimization_goals <= re.optimization_goals);
+        total_pruned += rp.candidates_pruned;
+    }
+
+    // And pruning must actually be doing something, or the check above is vacuous.
+    CHECK(total_pruned > 0);
+}
+
 static void test_unsupported_operator_is_an_error() {
     std::printf("test_unsupported_operator_is_an_error\n");
     auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
@@ -715,6 +770,7 @@ int main() {
     test_required_order_selects_the_merge_join();
     test_root_enforcer_is_inserted();
     test_unsatisfiable_required_output_fails_honestly();
+    test_pruning_never_changes_the_plan();
     test_unsupported_operator_is_an_error();
 
     if (g_failures == 0) {
