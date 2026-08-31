@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -182,6 +183,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             ge.op = cand;
             ge.scan_format = fa.format;
             ge.scan_freshness = fa.freshness;
+            ge.input_reqs = required_input_properties(cand, ge.hash_keys);
             memo.add_expr(g, std::move(ge));
             ++candidates;
         }
@@ -215,33 +217,27 @@ struct Optimizer {
     const CalibrationProfile& cal;
     std::size_t goals = 0;
 
-    // Rows each input group produces - a property of the group, requirement-free.
-    std::vector<double> input_rows_of(const GroupExpr& ge) const {
-        std::vector<double> r;
-        r.reserve(ge.inputs.size());
-        for (const GroupId in : ge.inputs) r.push_back(memo.group(in).rows);
-        return r;
-    }
-
     // Optimize each input under `reqs`, accumulating cost and what they provide.
     // Returns false when any input cannot meet its requirement at any price.
-    bool optimize_inputs(const GroupExpr& ge, const std::vector<PhysicalProperties>& reqs,
+    bool optimize_inputs(const std::vector<GroupId>& inputs,
+                         const std::vector<PhysicalProperties>& reqs,
                          double& cost_out, std::vector<PhysicalProperties>& provided_out) {
         cost_out = 0.0;
         provided_out.clear();
-        for (std::size_t i = 0; i < ge.inputs.size(); ++i) {
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
             const PhysicalProperties& r =
                 i < reqs.size() ? reqs[i] : Group::unconstrained();
-            const WinnerEntry* w = optimize(ge.inputs[i], r);
-            if (w == nullptr) return false;
-            cost_out += w->cost;
-            provided_out.push_back(w->provided);
+            const std::optional<std::uint32_t> w = optimize(inputs[i], r);
+            if (!w) return false;
+            const WinnerEntry& e = memo.group(inputs[i]).winners[*w];
+            cost_out += e.cost;
+            provided_out.push_back(e.provided);
         }
         return true;
     }
 
-    const WinnerEntry* optimize(GroupId g, const PhysicalProperties& required) {
-        if (const WinnerEntry* memoized = memo.group(g).winner_for(required)) {
+    std::optional<std::uint32_t> optimize(GroupId g, const PhysicalProperties& required) {
+        if (const auto memoized = memo.group(g).winner_index_for(required)) {
             return memoized;  // this goal is already settled
         }
         ++goals;
@@ -255,19 +251,24 @@ struct Optimizer {
         std::vector<PhysicalProperties> best_input_required;
 
         for (std::uint32_t i = 0; i < n_exprs; ++i) {
-            // Copied deliberately: optimizing children can append group-expressions
-            // and winners, and a reference into the memo must not outlive that.
-            const GroupExpr ge = memo.group(g).exprs[i];
-            const std::vector<double> in_rows = input_rows_of(ge);
-            const std::vector<PhysicalProperties> op_reqs =
-                required_input_properties(ge.op, ge.hash_keys);
+            // A reference is safe here because of a phase invariant: EXPLORATION
+            // IS COMPLETE before optimization begins, so no group's candidate list
+            // grows while the search runs. (Groups are a deque and winners are
+            // addressed by index, so neither of those moves either.) If a later
+            // unit ever applies rules DURING search, this is the line that has to
+            // change - copying it back cost five allocations per candidate.
+            const GroupExpr& ge = memo.group(g).exprs[i];
+            std::vector<double> in_rows;
+            in_rows.reserve(ge.inputs.size());
+            for (const GroupId in : ge.inputs) in_rows.push_back(memo.group(in).rows);
+            const std::vector<PhysicalProperties>& op_reqs = ge.input_reqs;
             const double own_cost =
                 operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format);
 
             // --- route 1: satisfy the operator's own needs, enforce on top ---
             double child_cost = 0.0;
             std::vector<PhysicalProperties> child_props;
-            if (optimize_inputs(ge, op_reqs, child_cost, child_props)) {
+            if (optimize_inputs(ge.inputs, op_reqs, child_cost, child_props)) {
                 const PhysicalProperties provided = derive_op(
                     ge.op, ge.hash_keys, ge.scan_format, child_props, ge.scan_freshness);
                 const double top = enforcement_cost(provided, required, out_rows, cal);
@@ -301,7 +302,7 @@ struct Optimizer {
 
                     double pd_cost = 0.0;
                     std::vector<PhysicalProperties> pd_props;
-                    if (optimize_inputs(ge, pushed, pd_cost, pd_props)) {
+                    if (optimize_inputs(ge.inputs, pushed, pd_cost, pd_props)) {
                         const PhysicalProperties provided =
                             derive_op(ge.op, ge.hash_keys, ge.scan_format, pd_props,
                                       ge.scan_freshness);
@@ -320,11 +321,11 @@ struct Optimizer {
         }
 
         if (best == n_exprs || best_cost == std::numeric_limits<double>::infinity()) {
-            return nullptr;  // nothing here can serve this goal at any price
+            return std::nullopt;  // nothing here can serve this goal at any price
         }
         memo.set_winner(g, required, best, best_cost, best_provided,
                         std::move(best_input_required));
-        return memo.group(g).winner_for(required);
+        return memo.group(g).winner_index_for(required);
     }
 };
 
@@ -350,7 +351,7 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     result.memo_groups = memo.size();
 
     Optimizer opt{memo, cal, 0};
-    if (opt.optimize(root_group, ctx.required_output) == nullptr) {
+    if (!opt.optimize(root_group, ctx.required_output)) {
         result.error = "no plan satisfies the required output properties";
         return result;
     }

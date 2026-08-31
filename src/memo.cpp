@@ -82,7 +82,7 @@ bool Memo::select_cheapest(GroupId group, const PhysicalProperties& required,
     // Single-level chooser: it does not optimize inputs, so the child goals it
     // records are the operator's own input requirements.
     set_winner(group, required, best, best_cost, std::move(provided),
-               required_input_properties(g.exprs[best].op, g.exprs[best].hash_keys));
+               g.exprs[best].input_reqs);
     return true;
 }
 
