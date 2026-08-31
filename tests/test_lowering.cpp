@@ -28,6 +28,14 @@ using db25::physical::LoweringContext;
 using db25::physical::LoweringResult;
 using db25::physical::physical_to_sexpr;
 using db25::physical::PhysicalOp;
+using db25::physical::SortKey;
+using db25::physical::StorageFormat;
+using db25::physical::Freshness;
+using db25::physical::StorageCatalog;
+using db25::physical::FormatAvailability;
+using db25::physical::PhysicalProperties;
+using db25::physical::satisfies;
+using db25::physical::derive;
 namespace plan = db25::plan;
 
 static int g_failures = 0;
@@ -210,6 +218,108 @@ static void test_multiple_keys_and_same_side_equality() {
     const std::string s = physical_to_sexpr(*r.plan);
     CHECK(contains(s, "keys=[(L#0 R#0) (L#1 R#1)]"));        // both cross-side equalities
     CHECK(contains(s, "residual=[(= (col #0) (col #1))]"));  // the same-side one only
+}
+
+// ---- Unit 2.2: property-directed (top-down) optimization -------------------
+
+// The motivating case from the design doc. Unconstrained, the join group takes
+// the cheapest candidate - a HashJoin. Asked for its output IN KEY ORDER, the
+// same group answers with a MergeJoin instead: the merge join's output order
+// satisfies the requirement natively, so the alternative is a HashJoin plus a
+// Sort of the (much larger) JOIN OUTPUT. Bottom-up single-winner search could
+// not even ask this question - it settled the join before the ORDER BY was
+// considered, and then sorted whatever came out.
+static void test_required_order_selects_the_merge_join() {
+    std::printf("test_required_order_selects_the_merge_join\n");
+    std::string error;
+    auto spec = db25::physical::load_spec(
+        std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr", error);
+    CHECK(spec.has_value());
+    if (!spec) return;
+
+    auto logical = build_logical();  // a.id = b.id, with a Filter and Project above
+
+    LoweringContext any;
+    any.spec = &*spec;
+    const LoweringResult ra = lower(*logical, any);
+    CHECK(ra.ok);
+    if (!ra.plan) return;
+    const std::string sa = physical_to_sexpr(*ra.plan);
+    CHECK(contains(sa, "HashJoin"));
+    CHECK(!contains(sa, "MergeJoin"));
+
+    LoweringContext ordered;
+    ordered.spec = &*spec;
+    ordered.required_output.sort = {SortKey{0, false}};
+    const LoweringResult rb = lower(*logical, ordered);
+    CHECK(rb.ok);
+    if (!rb.plan) return;
+    const std::string sb = physical_to_sexpr(*rb.plan);
+    CHECK(contains(sb, "MergeJoin"));   // a DIFFERENT plan for the same query
+    CHECK(!contains(sb, "HashJoin"));
+
+    // And the plan really does satisfy what was asked of it.
+    CHECK(satisfies(derive(*rb.plan), ordered.required_output));
+
+    // A group optimized for more than one requirement is the whole point; goals
+    // exceeding groups is the direct evidence of it.
+    CHECK(rb.optimization_goals > rb.memo_groups);
+}
+
+// The root has no parent, and every enforcer is placed by a parent onto its
+// child - so a plan whose top operator does not itself provide the required
+// output would be returned UNENFORCED, reported ok while not satisfying the
+// requirement it was optimized for. (The same shape of defect the audit found in
+// enforce(): a function reporting success on a result that does not meet its own
+// contract.) lower() enforces at the root and then CHECKS the postcondition.
+static void test_root_enforcer_is_inserted() {
+    std::printf("test_root_enforcer_is_inserted\n");
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+    auto filter = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Filter);
+    filter->output = a_schema();
+    filter->predicate = binop(BinaryOp::GreaterThan, col(1, DataType::Integer), int_lit(10));
+    filter->add_child(std::move(scan));
+
+    LoweringContext ctx;
+    ctx.required_output.sort = {SortKey{0, false}};
+    const LoweringResult r = lower(*filter, ctx);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    CHECK(satisfies(derive(*r.plan), ctx.required_output));
+
+    // Nothing below provides order, so a Sort must appear - ABOVE the Filter, not
+    // below it. That placement is the enforce-vs-push-down comparison coming out
+    // the right way: sorting below would sort the rows the Filter is about to
+    // discard (1000 of them, against 100 surviving it), so pushing down loses on
+    // cost here even though it is available. The search compares; it does not
+    // assume earlier is better.
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(s.rfind("(Sort", 0) == 0);            // the Sort is the ROOT
+    CHECK(contains(s, "(Sort by=[#0 asc]"));
+    CHECK(s.find("(Sort") < s.find("(Filter"));  // above, not below
+}
+
+// An output requirement nothing can satisfy is an honest failure, not a plan
+// that quietly ignores it. Freshness is the one property no enforcer can
+// establish, so it is the case that must fail rather than be patched up.
+static void test_unsatisfiable_required_output_fails_honestly() {
+    std::printf("test_unsatisfiable_required_output_fails_honestly\n");
+    StorageCatalog cat;
+    cat.formats["a"] = {FormatAvailability{StorageFormat::Row, Freshness::Stale}};
+
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+
+    LoweringContext ctx;
+    ctx.storage = &cat;
+    ctx.required_output.freshness = Freshness::Fresh;
+    const LoweringResult r = lower(*scan, ctx);
+    CHECK(!r.ok);
+    CHECK(r.plan == nullptr);
+    CHECK(!r.error.empty());
 }
 
 static void test_unsupported_operator_is_an_error() {
@@ -602,6 +712,9 @@ int main() {
     test_non_equi_join_keeps_residual();
     test_equi_key_survives_an_extra_conjunct();
     test_multiple_keys_and_same_side_equality();
+    test_required_order_selects_the_merge_join();
+    test_root_enforcer_is_inserted();
+    test_unsatisfiable_required_output_fails_honestly();
     test_unsupported_operator_is_an_error();
 
     if (g_failures == 0) {

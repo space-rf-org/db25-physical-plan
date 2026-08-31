@@ -59,6 +59,13 @@ struct WinnerEntry {
     std::uint32_t expr_index = 0;         // index into Group::exprs
     double cost = std::numeric_limits<double>::infinity();
     PhysicalProperties provided;          // what the chosen candidate provides
+    // The requirement each INPUT was optimized under to reach this cost, in
+    // operand order. Without it the winner is not reproducible: extraction would
+    // have to guess which goal each child was solved for, and a child optimized
+    // for "sorted on k" is a different plan from the same child optimized for
+    // nothing. Cascades calls these the child goals; they are part of the winner,
+    // not a detail of how it was found.
+    std::vector<PhysicalProperties> input_required;
 };
 
 // A memo group: a set of equivalent group-expressions, the output schema they
@@ -132,7 +139,8 @@ public:
 
     // Record the winner for a requirement, replacing any entry under that key.
     void set_winner(GroupId group, const PhysicalProperties& required,
-                    std::uint32_t expr_index, double cost, PhysicalProperties provided);
+                    std::uint32_t expr_index, double cost, PhysicalProperties provided,
+                    std::vector<PhysicalProperties> input_required = {});
 
     // Record a group's estimated output cardinality.
     void set_rows(GroupId group, double rows);

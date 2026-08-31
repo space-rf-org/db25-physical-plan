@@ -122,6 +122,29 @@ bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys) {
     return true;
 }
 
+std::optional<PhysicalProperties> pushdown_requirement(PhysicalOp op,
+                                                      const PhysicalProperties& required) {
+    // Which operators can satisfy a consumer's requirement by REQUIRING IT OF
+    // THEIR INPUT rather than having an enforcer stacked on top of them. Only the
+    // order- and format-preserving single-input operators can: derive_op says a
+    // Filter and a Project pass their input's properties through unchanged, so an
+    // input that arrives sorted leaves sorted.
+    //
+    // This is one half of the enforce-vs-push-down choice; it is not automatically
+    // the better half. Pushing a Sort BELOW a Filter sorts rows the Filter is
+    // about to discard, so the search costs both routes and takes the cheaper -
+    // it does not assume that earlier is better.
+    switch (op) {
+        case PhysicalOp::Filter:
+        case PhysicalOp::Project:
+            return required;
+        default:
+            // A hash join and a nested loop destroy order; a merge join produces
+            // its own; a scan is a leaf. None can pass a requirement downward.
+            return std::nullopt;
+    }
+}
+
 std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
                                                           const std::vector<HashKey>& keys) {
     std::vector<PhysicalProperties> reqs(expected_arity(op));

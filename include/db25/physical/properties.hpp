@@ -10,6 +10,7 @@
 // machinery as sort order, not a special case.
 #include "db25/physical/physical_plan.hpp"
 
+#include <optional>
 #include <vector>
 
 namespace db25::physical {
@@ -51,6 +52,15 @@ struct PhysicalProperties {
 // merge on and it is not a valid way to compute the (cross) product - regardless
 // of what it would cost. Every other operator is unconditionally applicable.
 [[nodiscard]] bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys);
+
+// The part of a consumer's requirement an operator can discharge by REQUIRING IT
+// OF ITS INPUT instead of having an enforcer placed above it - nullopt when it
+// cannot (a hash join destroys order, a scan is a leaf). One half of the
+// enforce-vs-push-down choice; the search costs both routes rather than assuming
+// pushing down is better, because a Sort below a Filter sorts rows the Filter is
+// about to discard.
+[[nodiscard]] std::optional<PhysicalProperties> pushdown_requirement(
+    PhysicalOp op, const PhysicalProperties& required);
 
 // What each input of an operator must PROVIDE for that operator to be usable.
 // A MergeJoin needs both inputs sorted on its join keys - the requirement that

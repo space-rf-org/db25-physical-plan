@@ -14,6 +14,7 @@
 // currently an empty, optional input the lowering accepts and ignores.
 #include "db25/physical/cost.hpp"
 #include "db25/physical/physical_plan.hpp"
+#include "db25/physical/properties.hpp"
 #include "db25/physical/spec.hpp"
 #include "db25/physical/storage_catalog.hpp"
 
@@ -46,6 +47,12 @@ struct LoweringContext {
     // Freshness originates at scans and only ever propagates upward, so forbidding
     // stale scans is exactly equivalent to requiring a fresh result.
     Freshness required_freshness = Freshness::Any;
+    // What the CONSUMER demands of the plan's output - an ORDER BY's sort order,
+    // say, or a format the caller needs. This is the requirement the top-down
+    // search starts from: groups are optimized FOR it rather than merely costed
+    // and then patched up with enforcers afterwards. Empty means "no requirement",
+    // which is what every caller before property-directed search implied.
+    PhysicalProperties required_output;
     const RuntimeProfile* runtime = nullptr;
 };
 
@@ -57,6 +64,10 @@ struct LoweringResult {
     // Physical candidates enumerated across all groups. More than one per group
     // means the plan was CHOSEN by cost rather than merely derived.
     std::size_t candidates_considered = 0;
+    // Distinct (group, requirement) pairs the top-down search optimized. Greater
+    // than memo_groups means some group really was optimized for more than one
+    // requirement - the thing Increment 2 exists to make possible.
+    std::size_t optimization_goals = 0;
 };
 
 // Lower a logical plan to a physical plan. The physical plan borrows expression
