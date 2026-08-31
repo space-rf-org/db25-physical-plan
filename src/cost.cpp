@@ -9,6 +9,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace db25::physical {
 namespace {
@@ -29,10 +30,6 @@ std::uint32_t atom_uint(const SNode& root, const char* key, std::uint32_t dflt) 
     unsigned long v = dflt;
     const auto res = std::from_chars(s.data(), s.data() + s.size(), v);
     return res.ec == std::errc{} ? static_cast<std::uint32_t>(v) : dflt;
-}
-
-const PhysicalNode* child_at(const PhysicalNode& n, std::size_t i) {
-    return i < n.children.size() ? n.children[i].get() : nullptr;
 }
 
 }  // namespace
@@ -86,78 +83,73 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
     return default_calibration();
 }
 
-double CardinalityModel::rows(const PhysicalNode& node) const {
-    switch (node.op) {
+// ---- representation-independent per-operator formulas ---------------------
+// Both the tree cost (cost_of, over a PhysicalNode) and the memo cost (over a
+// group-expression, whose inputs are GROUPS not nodes) go through these, so a
+// plan is costed identically however it is currently represented. This is the
+// "one cost model" invariant (design D3) made structural.
+
+double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
+                     const std::string& table_name, const CardinalityModel& card) {
+    const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
+    switch (op) {
         case PhysicalOp::SeqScan: {
-            const auto it = base_rows.find(node.table_name);
-            return it != base_rows.end() ? it->second : default_base;
+            const auto it = card.base_rows.find(table_name);
+            return it != card.base_rows.end() ? it->second : card.default_base;
         }
-        case PhysicalOp::Filter: {
-            const PhysicalNode* c = child_at(node, 0);
-            return c ? rows(*c) * filter_selectivity : 0.0;
-        }
-        case PhysicalOp::Project: {
-            const PhysicalNode* c = child_at(node, 0);
-            return c ? rows(*c) : 0.0;
-        }
-        case PhysicalOp::HashJoin: {
-            const PhysicalNode* l = child_at(node, 0);
-            const PhysicalNode* r = child_at(node, 1);
-            if (!l || !r) return 0.0;
-            return rows(*l) * rows(*r) * join_selectivity;
-        }
+        case PhysicalOp::Filter:
+            return in(0) * card.filter_selectivity;
+        case PhysicalOp::Project:
+            return in(0);
+        case PhysicalOp::HashJoin:
+            return in(0) * in(1) * card.join_selectivity;
         case PhysicalOp::Sort:
-        case PhysicalOp::FormatConvert: {
-            // Enforcers pass every input row through unchanged.
-            const PhysicalNode* c = child_at(node, 0);
-            return c ? rows(*c) : 0.0;
-        }
+        case PhysicalOp::FormatConvert:
+            return in(0);  // enforcers pass every input row through unchanged
     }
     return 0.0;
+}
+
+double operator_cost(PhysicalOp op, const std::vector<double>& input_rows, double out_rows,
+                     const CalibrationProfile& cal) {
+    const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
+    switch (op) {
+        case PhysicalOp::SeqScan:
+            return out_rows * cal.scan_row;
+        case PhysicalOp::Filter:
+            return in(0) * cal.filter_row;  // the predicate runs on every INPUT row
+        case PhysicalOp::Project:
+            return in(0) * cal.project_row;
+        case PhysicalOp::HashJoin:
+            // input 0 probes, input 1 builds.
+            return in(1) * cal.hash_build_row + in(0) * cal.hash_probe_row;
+        case PhysicalOp::Sort:
+            return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)
+        case PhysicalOp::FormatConvert:
+            return in(0) * cal.convert_row;
+    }
+    return 0.0;
+}
+
+// ---- tree form ------------------------------------------------------------
+
+double CardinalityModel::rows(const PhysicalNode& node) const {
+    std::vector<double> input_rows;
+    input_rows.reserve(node.children.size());
+    for (const auto& c : node.children) input_rows.push_back(rows(*c));
+    return operator_rows(node.op, input_rows, node.table_name, *this);
 }
 
 double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
                const CardinalityModel& card) {
     double child_cost = 0.0;
+    std::vector<double> input_rows;
+    input_rows.reserve(node.children.size());
     for (const auto& c : node.children) {
         child_cost += cost_of(*c, cal, card);
+        input_rows.push_back(card.rows(*c));
     }
-
-    double own = 0.0;
-    switch (node.op) {
-        case PhysicalOp::SeqScan:
-            own = card.rows(node) * cal.scan_row;
-            break;
-        case PhysicalOp::Filter: {
-            const PhysicalNode* c = child_at(node, 0);
-            own = (c ? card.rows(*c) : 0.0) * cal.filter_row;  // predicate per input row
-            break;
-        }
-        case PhysicalOp::Project: {
-            const PhysicalNode* c = child_at(node, 0);
-            own = (c ? card.rows(*c) : 0.0) * cal.project_row;
-            break;
-        }
-        case PhysicalOp::HashJoin: {
-            const PhysicalNode* l = child_at(node, 0);  // probe side
-            const PhysicalNode* r = child_at(node, 1);  // build side
-            own = (r ? card.rows(*r) : 0.0) * cal.hash_build_row +
-                  (l ? card.rows(*l) : 0.0) * cal.hash_probe_row;
-            break;
-        }
-        case PhysicalOp::Sort: {
-            const PhysicalNode* c = child_at(node, 0);
-            const double r = c ? card.rows(*c) : 0.0;
-            own = r * std::log2(std::max(r, 2.0)) * cal.sort_row;  // n*log2(n)
-            break;
-        }
-        case PhysicalOp::FormatConvert: {
-            const PhysicalNode* c = child_at(node, 0);
-            own = (c ? card.rows(*c) : 0.0) * cal.convert_row;
-            break;
-        }
-    }
-    return child_cost + own;
+    return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal);
 }
 
 }  // namespace db25::physical

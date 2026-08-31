@@ -12,6 +12,7 @@
 // is the dynamic-feedback seam (design D2/D10): its type and the way it enters
 // the planner exist now; the producer arrives with the execution engine, so it is
 // currently an empty, optional input the lowering accepts and ignores.
+#include "db25/physical/cost.hpp"
 #include "db25/physical/physical_plan.hpp"
 #include "db25/physical/spec.hpp"
 
@@ -28,9 +29,12 @@ struct RuntimeProfile {};
 
 // Inputs to the lowering besides the logical plan. `spec` supplies the
 // implementation rules (if null, a built-in single-candidate mapping is used);
-// `runtime` is the unpopulated feedback seam.
+// `calibration` and `cardinality` drive the cost-based choice between candidates
+// (defaults are used when null); `runtime` is the unpopulated feedback seam.
 struct LoweringContext {
     const PhysicalSpec* spec = nullptr;
+    const CalibrationProfile* calibration = nullptr;
+    const CardinalityModel* cardinality = nullptr;
     const RuntimeProfile* runtime = nullptr;
 };
 
@@ -39,6 +43,9 @@ struct LoweringResult {
     std::string error;
     PhysicalNodePtr plan;
     std::size_t memo_groups = 0;  // groups the memo held (one per logical node)
+    // Physical candidates enumerated across all groups. More than one per group
+    // means the plan was CHOSEN by cost rather than merely derived.
+    std::size_t candidates_considered = 0;
 };
 
 // Lower a logical plan to a physical plan. The physical plan borrows expression

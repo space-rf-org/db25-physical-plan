@@ -25,11 +25,12 @@ const OperatorSpec* PhysicalSpec::find_operator(const std::string& name) const {
     return nullptr;
 }
 
-std::string PhysicalSpec::physical_for_logical(const std::string& logical) const {
+std::vector<std::string> PhysicalSpec::physicals_for_logical(const std::string& logical) const {
+    std::vector<std::string> out;
     for (const ImplRule& r : impl_rules) {
-        if (r.logical == logical) return r.physical;
+        if (r.logical == logical) out.push_back(r.physical);
     }
-    return std::string{};
+    return out;
 }
 
 std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& error) {

@@ -1,5 +1,6 @@
 #include "db25/physical/lowering.hpp"
 
+#include "db25/physical/cost.hpp"
 #include "db25/physical/memo.hpp"
 
 #include "db25/ast/node_types.hpp"
@@ -36,17 +37,21 @@ std::optional<PhysicalOp> builtin_physical(plan::LogicalOp op) {
     }
 }
 
-// Resolve the physical operator for a logical operator: via the spec's
-// implementation rules when a spec is supplied, else the built-in mapping.
-std::optional<PhysicalOp> resolve_physical(plan::LogicalOp op, const LoweringContext& ctx) {
+// Every physical operator a logical operator may lower to: the spec's
+// implementation rules when a spec is supplied, else the built-in mapping. More
+// than one candidate makes the choice cost-based.
+std::vector<PhysicalOp> resolve_candidates(plan::LogicalOp op, const LoweringContext& ctx) {
+    std::vector<PhysicalOp> out;
     const char* ln = logical_op_name(op);
-    if (ln == nullptr) return std::nullopt;
+    if (ln == nullptr) return out;
     if (ctx.spec != nullptr) {
-        const std::string pn = ctx.spec->physical_for_logical(ln);
-        if (pn.empty()) return std::nullopt;
-        return physical_op_from_name(pn);
+        for (const std::string& name : ctx.spec->physicals_for_logical(ln)) {
+            if (const std::optional<PhysicalOp> p = physical_op_from_name(name)) out.push_back(*p);
+        }
+        return out;
     }
-    return builtin_physical(op);
+    if (const std::optional<PhysicalOp> p = builtin_physical(op)) out.push_back(*p);
+    return out;
 }
 
 // Decompose an equi-join predicate into hash keys. Returns true only if the whole
@@ -74,9 +79,10 @@ bool extract_keys(const plan::Expr* e, std::uint32_t left_width, std::vector<Has
 }
 
 GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
-                        std::string& error) {
-    const std::optional<PhysicalOp> pop = resolve_physical(n.op, ctx);
-    if (!pop) {
+                        const CalibrationProfile& cal, const CardinalityModel& card,
+                        std::size_t& candidates, std::string& error) {
+    const std::vector<PhysicalOp> cands = resolve_candidates(n.op, ctx);
+    if (cands.empty()) {
         const char* ln = logical_op_name(n.op);
         error = ln ? ("no implementation rule for logical operator '" + std::string(ln) + "'")
                    : "unsupported logical operator in Increment-0 lowering";
@@ -85,23 +91,24 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
 
     std::vector<GroupId> inputs;
     for (std::size_t i = 0; i < n.child_count(); ++i) {
-        const GroupId g = lower_into_memo(*n.child(i), memo, ctx, error);
+        const GroupId g = lower_into_memo(*n.child(i), memo, ctx, cal, card, candidates, error);
         if (g == kInvalidGroup) return kInvalidGroup;
         inputs.push_back(g);
     }
 
-    GroupExpr ge;
-    ge.op = *pop;
-    ge.inputs = inputs;
+    // The payload is shared by every candidate: they are alternative ALGORITHMS
+    // for the same logical operator, not different operators.
+    GroupExpr base;
+    base.inputs = inputs;
     switch (n.op) {
         case plan::LogicalOp::Scan:
-            ge.table_name = n.table_name;
+            base.table_name = n.table_name;
             break;
         case plan::LogicalOp::Filter:
-            ge.predicate = n.predicate.get();  // borrowed
+            base.predicate = n.predicate.get();  // borrowed
             break;
         case plan::LogicalOp::Project:
-            for (const auto& e : n.exprs) ge.projections.push_back(e.get());
+            for (const auto& e : n.exprs) base.projections.push_back(e.get());
             break;
         case plan::LogicalOp::Join: {
             const std::uint32_t left_width =
@@ -110,9 +117,9 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
             const plan::Expr* pred = n.predicate.get();
             const bool clean = (pred == nullptr) ? true : extract_keys(pred, left_width, keys);
             if (clean) {
-                ge.hash_keys = std::move(keys);  // pure equi-join (or CROSS: no keys)
+                base.hash_keys = std::move(keys);  // pure equi-join (or CROSS: no keys)
             } else {
-                ge.predicate = pred;  // keep the whole predicate as a residual
+                base.predicate = pred;  // keep the whole predicate as a residual
             }
             break;
         }
@@ -121,8 +128,29 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     }
 
     const GroupId g = memo.add_group(n.output);
-    const std::uint32_t idx = memo.add_expr(g, std::move(ge));
-    memo.set_winner(g, idx);
+
+    // Cardinality belongs to the GROUP: the candidates are equivalent, so any of
+    // them yields the same estimate. Costing a parent then reads its inputs' rows
+    // straight off their groups instead of re-deriving them down the tree.
+    std::vector<double> input_rows;
+    input_rows.reserve(inputs.size());
+    for (const GroupId in : inputs) input_rows.push_back(memo.group(in).rows);
+    const double out_rows = operator_rows(cands.front(), input_rows, base.table_name, card);
+    memo.set_rows(g, out_rows);
+
+    // An input group's contribution is the cost of its own winning subplan, which
+    // is already settled: children are lowered (and chosen) before their parent.
+    double inputs_cost = 0.0;
+    for (const GroupId in : inputs) inputs_cost += memo.group(in).best_cost();
+
+    for (const PhysicalOp cand : cands) {
+        GroupExpr ge = base;
+        ge.op = cand;
+        ge.cost = inputs_cost + operator_cost(cand, input_rows, out_rows, cal);
+        memo.add_expr(g, std::move(ge));
+        ++candidates;
+    }
+    memo.select_cheapest(g);  // the cost-based choice
     return g;
 }
 
@@ -130,8 +158,16 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
 
 LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) {
     LoweringResult result;
+    // The planner is a pure function of its declared inputs; where an input was
+    // not supplied, the documented default stands in for it.
+    const CalibrationProfile cal =
+        ctx.calibration != nullptr ? *ctx.calibration : default_calibration();
+    const CardinalityModel card =
+        ctx.cardinality != nullptr ? *ctx.cardinality : CardinalityModel{};
+
     Memo memo;
-    const GroupId root_group = lower_into_memo(root, memo, ctx, result.error);
+    const GroupId root_group = lower_into_memo(root, memo, ctx, cal, card,
+                                               result.candidates_considered, result.error);
     if (root_group == kInvalidGroup) {
         return result;  // ok stays false, error set
     }
