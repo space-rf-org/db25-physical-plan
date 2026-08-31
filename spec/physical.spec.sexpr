@@ -25,6 +25,16 @@
     (operator (name Sort)          (arity 1) (kind pipeline-breaker))
     (operator (name FormatConvert) (arity 1) (kind pipeline)))
 
+  ; Implementation rules: the physical operator each logical operator lowers to.
+  ; Increment 0 is single-candidate (one physical op per logical op); a rule set
+  ; with alternatives is what the Cascades search will explore in a later unit.
+  ; The lowering consults these, so the logical->physical choice is data, not code.
+  (implementation-rules
+    (rule (logical Scan)    (physical SeqScan))
+    (rule (logical Filter)  (physical Filter))
+    (rule (logical Project) (physical Project))
+    (rule (logical Join)    (physical HashJoin)))
+
   ; The reference ExecutionCapabilityProfile: what a competent hardware-native
   ; engine is assumed able to execute. It ships now so the planner is usable and
   ; testable before any execution engine exists; a real engine later publishes

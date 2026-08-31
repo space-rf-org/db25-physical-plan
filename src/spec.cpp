@@ -25,6 +25,13 @@ const OperatorSpec* PhysicalSpec::find_operator(const std::string& name) const {
     return nullptr;
 }
 
+std::string PhysicalSpec::physical_for_logical(const std::string& logical) const {
+    for (const ImplRule& r : impl_rules) {
+        if (r.logical == logical) return r.physical;
+    }
+    return std::string{};
+}
+
 std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& error) {
     SNode root;
     if (!read_sexpr(text, root, error)) return std::nullopt;
@@ -58,6 +65,20 @@ std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& err
             if (const SNode* k = op.child("kind")) os.kind = value_of(*k);
             if (os.name.empty()) { error = "an operator has no name"; return std::nullopt; }
             spec.operators.push_back(std::move(os));
+        }
+    }
+
+    if (const SNode* rules = root.child("implementation-rules")) {
+        for (const SNode& r : rules->list) {
+            if (!r.is_list || r.head() != "rule") continue;  // skip the head atom
+            ImplRule ir;
+            if (const SNode* l = r.child("logical")) ir.logical = value_of(*l);
+            if (const SNode* p = r.child("physical")) ir.physical = value_of(*p);
+            if (ir.logical.empty() || ir.physical.empty()) {
+                error = "an implementation rule is missing its logical or physical operator";
+                return std::nullopt;
+            }
+            spec.impl_rules.push_back(std::move(ir));
         }
     }
 
@@ -125,6 +146,18 @@ std::vector<std::string> check_conformance(const PhysicalSpec& spec) {
     for (const std::string& e : spec.profile.executes) {
         if (spec.find_operator(e) == nullptr) {
             problems.push_back("capability profile executes undeclared operator '" + e + "'");
+        }
+    }
+
+    // Every implementation rule must target a declared, executable operator (its
+    // logical side is validated against the logical IR at lowering time).
+    for (const ImplRule& r : spec.impl_rules) {
+        if (spec.find_operator(r.physical) == nullptr) {
+            problems.push_back("implementation rule for '" + r.logical +
+                               "' targets undeclared physical operator '" + r.physical + "'");
+        } else if (!spec.profile.can_execute(r.physical)) {
+            problems.push_back("implementation rule for '" + r.logical +
+                               "' targets non-executable operator '" + r.physical + "'");
         }
     }
 

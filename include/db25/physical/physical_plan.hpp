@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,11 @@ enum class PhysicalOp : std::uint8_t {
 };
 
 [[nodiscard]] const char* physical_op_to_string(PhysicalOp op) noexcept;
+
+// Inverse of physical_op_to_string: map a name (as it appears in the spec) back
+// to its operator, or nullopt if unknown. Used to resolve spec-declared
+// implementation rules to concrete operators.
+[[nodiscard]] std::optional<PhysicalOp> physical_op_from_name(const std::string& name) noexcept;
 
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is

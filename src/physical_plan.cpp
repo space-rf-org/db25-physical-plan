@@ -16,6 +16,13 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
     return "?";
 }
 
+std::optional<PhysicalOp> physical_op_from_name(const std::string& name) noexcept {
+    for (const PhysicalOp op : kAllPhysicalOps) {
+        if (name == physical_op_to_string(op)) return op;
+    }
+    return std::nullopt;
+}
+
 const char* storage_format_to_string(StorageFormat f) noexcept {
     switch (f) {
         case StorageFormat::Any:    return "any";
