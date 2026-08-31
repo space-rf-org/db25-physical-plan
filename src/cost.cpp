@@ -2,7 +2,9 @@
 
 #include "db25/physical/sexpr_read.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <sstream>
@@ -60,6 +62,8 @@ std::optional<CalibrationProfile> load_lab_calibration(const std::string& path,
     cal.project_row = atom_double(root, "project-row", cal.project_row);
     cal.hash_build_row = atom_double(root, "hash-build-row", cal.hash_build_row);
     cal.hash_probe_row = atom_double(root, "hash-probe-row", cal.hash_probe_row);
+    cal.sort_row = atom_double(root, "sort-row", cal.sort_row);
+    cal.convert_row = atom_double(root, "convert-row", cal.convert_row);
     cal.simd_width = atom_uint(root, "simd-width", cal.simd_width);
     cal.cache_line = atom_uint(root, "cache-line", cal.cache_line);
     return cal;
@@ -102,6 +106,12 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
             if (!l || !r) return 0.0;
             return rows(*l) * rows(*r) * join_selectivity;
         }
+        case PhysicalOp::Sort:
+        case PhysicalOp::FormatConvert: {
+            // Enforcers pass every input row through unchanged.
+            const PhysicalNode* c = child_at(node, 0);
+            return c ? rows(*c) : 0.0;
+        }
     }
     return 0.0;
 }
@@ -133,6 +143,17 @@ double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
             const PhysicalNode* r = child_at(node, 1);  // build side
             own = (r ? card.rows(*r) : 0.0) * cal.hash_build_row +
                   (l ? card.rows(*l) : 0.0) * cal.hash_probe_row;
+            break;
+        }
+        case PhysicalOp::Sort: {
+            const PhysicalNode* c = child_at(node, 0);
+            const double r = c ? card.rows(*c) : 0.0;
+            own = r * std::log2(std::max(r, 2.0)) * cal.sort_row;  // n*log2(n)
+            break;
+        }
+        case PhysicalOp::FormatConvert: {
+            const PhysicalNode* c = child_at(node, 0);
+            own = (c ? card.rows(*c) : 0.0) * cal.convert_row;
             break;
         }
     }

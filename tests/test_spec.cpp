@@ -42,7 +42,7 @@ static void test_shipped_spec_loads_and_conforms() {
         return;
     }
     CHECK(spec->version == 0);
-    CHECK(spec->operators.size() == 4);
+    CHECK(spec->operators.size() == 6);  // SeqScan Filter Project HashJoin Sort FormatConvert
     CHECK(spec->profile.name == "reference");
 
     const auto problems = check_conformance(*spec);

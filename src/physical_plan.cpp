@@ -6,20 +6,33 @@ namespace db25::physical {
 
 const char* physical_op_to_string(PhysicalOp op) noexcept {
     switch (op) {
-        case PhysicalOp::SeqScan:  return "SeqScan";
-        case PhysicalOp::Filter:   return "Filter";
-        case PhysicalOp::Project:  return "Project";
-        case PhysicalOp::HashJoin: return "HashJoin";
+        case PhysicalOp::SeqScan:       return "SeqScan";
+        case PhysicalOp::Filter:        return "Filter";
+        case PhysicalOp::Project:       return "Project";
+        case PhysicalOp::HashJoin:      return "HashJoin";
+        case PhysicalOp::Sort:          return "Sort";
+        case PhysicalOp::FormatConvert: return "FormatConvert";
+    }
+    return "?";
+}
+
+const char* storage_format_to_string(StorageFormat f) noexcept {
+    switch (f) {
+        case StorageFormat::Any:    return "any";
+        case StorageFormat::Row:    return "row";
+        case StorageFormat::Column: return "column";
     }
     return "?";
 }
 
 std::size_t expected_arity(PhysicalOp op) noexcept {
     switch (op) {
-        case PhysicalOp::SeqScan:  return 0;
-        case PhysicalOp::Filter:   return 1;
-        case PhysicalOp::Project:  return 1;
-        case PhysicalOp::HashJoin: return 2;
+        case PhysicalOp::SeqScan:       return 0;
+        case PhysicalOp::Filter:        return 1;
+        case PhysicalOp::Project:       return 1;
+        case PhysicalOp::HashJoin:      return 2;
+        case PhysicalOp::Sort:          return 1;
+        case PhysicalOp::FormatConvert: return 1;
     }
     return 0;
 }
@@ -58,6 +71,22 @@ PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
     n->output = std::move(output);
     n->children.push_back(std::move(left));
     n->children.push_back(std::move(right));
+    return n;
+}
+
+PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys) {
+    auto n = std::make_unique<PhysicalNode>(PhysicalOp::Sort);
+    n->sort_keys = std::move(keys);
+    n->output = input->output;  // a sort reorders rows, it does not reshape them
+    n->children.push_back(std::move(input));
+    return n;
+}
+
+PhysicalNodePtr make_format_convert(PhysicalNodePtr input, StorageFormat target) {
+    auto n = std::make_unique<PhysicalNode>(PhysicalOp::FormatConvert);
+    n->target_format = target;
+    n->output = input->output;  // a format change does not reshape the rows
+    n->children.push_back(std::move(input));
     return n;
 }
 

@@ -81,6 +81,7 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
     switch (n.op) {
         case PhysicalOp::SeqScan:
             out += " table=" + n.table_name;
+            out += std::string(" fmt=") + storage_format_to_string(n.scan_format);
             break;
         case PhysicalOp::Filter:
             out += " pred=" + render_expr(n.predicate);
@@ -105,6 +106,19 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             if (n.predicate != nullptr) out += " residual=" + render_expr(n.predicate);
             break;
         }
+        case PhysicalOp::Sort: {
+            out += " by=[";
+            for (std::size_t i = 0; i < n.sort_keys.size(); ++i) {
+                if (i != 0) out += " ";
+                out += "#" + std::to_string(n.sort_keys[i].column) +
+                       (n.sort_keys[i].descending ? " desc" : " asc");
+            }
+            out += "]";
+            break;
+        }
+        case PhysicalOp::FormatConvert:
+            out += std::string(" to=") + storage_format_to_string(n.target_format);
+            break;
     }
 
     out += " out=" + render_schema(n.output);

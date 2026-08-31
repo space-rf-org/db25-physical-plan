@@ -25,6 +25,8 @@ struct CalibrationProfile {
     double project_row = 0.3;     // evaluate the projection list on one input row
     double hash_build_row = 1.2;  // insert one build-side row into the hash table
     double hash_probe_row = 0.8;  // probe the hash table with one probe-side row
+    double sort_row = 1.0;        // per-row coefficient of an n*log2(n) sort
+    double convert_row = 0.6;     // convert one row between storage formats
     // Hardware facts (informational today; richer costing consumes them later).
     std::uint32_t simd_width = 8;
     std::uint32_t cache_line = 64;

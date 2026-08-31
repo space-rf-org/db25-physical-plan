@@ -17,10 +17,13 @@
   ; is a coarse pipeline classification (informational today; the cost model and
   ; property framework consume richer per-operator data in later units).
   (operators
-    (operator (name SeqScan)  (arity 0) (kind access-path))
-    (operator (name Filter)   (arity 1) (kind pipeline))
-    (operator (name Project)  (arity 1) (kind pipeline))
-    (operator (name HashJoin) (arity 2) (kind pipeline-breaker)))
+    (operator (name SeqScan)       (arity 0) (kind access-path))
+    (operator (name Filter)        (arity 1) (kind pipeline))
+    (operator (name Project)       (arity 1) (kind pipeline))
+    (operator (name HashJoin)      (arity 2) (kind pipeline-breaker))
+    ; Enforcers: inserted to establish a required physical property.
+    (operator (name Sort)          (arity 1) (kind pipeline-breaker))
+    (operator (name FormatConvert) (arity 1) (kind pipeline)))
 
   ; The reference ExecutionCapabilityProfile: what a competent hardware-native
   ; engine is assumed able to execute. It ships now so the planner is usable and
@@ -28,4 +31,4 @@
   ; its own profile in this same shape.
   (capability-profile
     (name reference)
-    (executes SeqScan Filter Project HashJoin)))
+    (executes SeqScan Filter Project HashJoin Sort FormatConvert)))
