@@ -82,10 +82,10 @@ PhysicalNodePtr make_project(PhysicalNodePtr input, Schema output,
 
 PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                std::vector<HashKey> keys, Schema output,
-                               const Expr* residual) {
+                               std::vector<const Expr*> residual) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::HashJoin);
     n->hash_keys = std::move(keys);
-    n->predicate = residual;
+    n->residual = std::move(residual);
     n->output = std::move(output);
     n->children.push_back(std::move(left));
     n->children.push_back(std::move(right));
@@ -94,10 +94,10 @@ PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
 
 PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                 std::vector<HashKey> keys, Schema output,
-                                const Expr* residual) {
+                                std::vector<const Expr*> residual) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::MergeJoin);
     n->hash_keys = std::move(keys);
-    n->predicate = residual;
+    n->residual = std::move(residual);
     n->output = std::move(output);
     n->children.push_back(std::move(left));
     n->children.push_back(std::move(right));

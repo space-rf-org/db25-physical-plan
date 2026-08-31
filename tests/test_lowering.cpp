@@ -161,8 +161,55 @@ static void test_non_equi_join_keeps_residual() {
     CHECK(r.ok);
     if (!r.plan) return;
     const std::string s = physical_to_sexpr(*r.plan);
-    CHECK(contains(s, "keys=[]"));       // no equi key extracted
-    CHECK(contains(s, "residual="));     // the predicate is kept as a residual
+    CHECK(contains(s, "keys=[]"));                       // no equi key extracted
+    CHECK(contains(s, "residual=[(> (col #1) (col #2))]"));  // kept, as a conjunct list
+}
+
+// The defect this pins: key extraction used to be ALL-OR-NOTHING - a conjunction
+// walk in which one non-equi conjunct discarded every key already found. So the
+// ordinary shape `a.id = b.id AND a.x > b.y` lowered to a KEYLESS join carrying
+// the whole predicate as a residual: a cross product with a filter, quadratic
+// where it should be linear, and with MergeJoin made inapplicable (no keys left
+// to merge on), which put the whole Increment-1 merge-join capability out of
+// reach for any join with a compound predicate.
+static void test_equi_key_survives_an_extra_conjunct() {
+    std::printf("test_equi_key_survives_an_extra_conjunct\n");
+    auto pred = binop(BinaryOp::And,
+                      binop(BinaryOp::Equal, col(0, DataType::Integer),
+                            col(2, DataType::Integer)),           // a.id = b.id  -> key
+                      binop(BinaryOp::GreaterThan, col(1, DataType::Integer),
+                            col(3, DataType::VarChar)));          // a.x > b.y    -> residual
+    auto logical = build_logical(std::move(pred));
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "keys=[(L#0 R#0)]"));                  // the key IS extracted
+    CHECK(contains(s, "residual=[(> (col #1) (col #3))]"));  // only the non-key conjunct
+    CHECK(!contains(s, "keys=[]"));                          // not degraded to a cross product
+    CHECK(!contains(s, "(AND "));                            // the conjunction was split, not kept whole
+}
+
+// Two keys and a residual from a three-way conjunction, and - the subtle case -
+// a SAME-side equality is not a join key: it constrains one input rather than
+// relating the two, so it belongs in the residual.
+static void test_multiple_keys_and_same_side_equality() {
+    std::printf("test_multiple_keys_and_same_side_equality\n");
+    auto pred = binop(BinaryOp::And,
+                      binop(BinaryOp::And,
+                            binop(BinaryOp::Equal, col(0, DataType::Integer),
+                                  col(2, DataType::Integer)),     // a.id = b.id   -> key
+                            binop(BinaryOp::Equal, col(1, DataType::Integer),
+                                  col(3, DataType::VarChar))),    // a.x  = b.y    -> key
+                      binop(BinaryOp::Equal, col(0, DataType::Integer),
+                            col(1, DataType::Integer)));          // a.id = a.x    -> residual
+    auto logical = build_logical(std::move(pred));
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "keys=[(L#0 R#0) (L#1 R#1)]"));        // both cross-side equalities
+    CHECK(contains(s, "residual=[(= (col #0) (col #1))]"));  // the same-side one only
 }
 
 static void test_unsupported_operator_is_an_error() {
@@ -516,6 +563,8 @@ int main() {
     test_cost_chooses_between_candidates();
     test_spec_rules_and_builtin_agree();
     test_non_equi_join_keeps_residual();
+    test_equi_key_survives_an_extra_conjunct();
+    test_multiple_keys_and_same_side_equality();
     test_unsupported_operator_is_an_error();
 
     if (g_failures == 0) {

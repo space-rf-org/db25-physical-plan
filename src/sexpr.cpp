@@ -106,7 +106,14 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
                        std::to_string(n.hash_keys[i].right_index) + ")";
             }
             out += "]";
-            if (n.predicate != nullptr) out += " residual=" + render_expr(n.predicate);
+            if (!n.residual.empty()) {
+                out += " residual=[";
+                for (std::size_t i = 0; i < n.residual.size(); ++i) {
+                    if (i != 0) out += " ";
+                    out += render_expr(n.residual[i]);
+                }
+                out += "]";
+            }
             break;
         }
         case PhysicalOp::Sort: {
