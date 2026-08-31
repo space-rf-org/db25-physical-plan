@@ -42,7 +42,7 @@ static void test_shipped_spec_loads_and_conforms() {
         return;
     }
     CHECK(spec->version == 0);
-    CHECK(spec->operators.size() == 7);  // + MergeJoin
+    CHECK(spec->operators.size() == 8);  // + MergeJoin, NestedLoopJoin
     CHECK(spec->profile.name == "reference");
 
     const auto problems = check_conformance(*spec);

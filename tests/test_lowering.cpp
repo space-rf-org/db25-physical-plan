@@ -299,7 +299,7 @@ static void test_join_algorithm_is_chosen_by_cost() {
                                   error);
     CHECK(spec.has_value());
     if (!spec) { std::printf("  spec load error: %s\n", error.c_str()); return; }
-    CHECK(spec->physicals_for_logical("Join").size() == 2);  // HashJoin + MergeJoin
+    CHECK(spec->physicals_for_logical("Join").size() == 3);  // Hash + Merge + NestedLoop
 
     auto logical = build_logical();
     LoweringContext ctx;
@@ -542,19 +542,56 @@ static void test_keyless_join_never_merges() {
     if (!r.plan) return;
     const std::string s2 = physical_to_sexpr(*r.plan);
     CHECK(contains(s2, "keys=[]"));
-    CHECK(contains(s2, "HashJoin"));
-    CHECK(!contains(s2, "MergeJoin"));  // the whole point
+    CHECK(contains(s2, "NestedLoopJoin"));  // the only join that needs no key
+    CHECK(!contains(s2, "MergeJoin"));      // nothing to merge on
+    CHECK(!contains(s2, "HashJoin"));       // nothing to hash on, either
 
-    // And the predicate itself: MergeJoin is inapplicable without keys, applicable
-    // with them; HashJoin is applicable either way.
+    // And the predicate itself. This originally asserted that HashJoin is
+    // "applicable either way", which blessed the very plan it was written to
+    // prevent: a keyless HashJoin has nothing to hash on and is exactly as
+    // unexecutable as the keyless MergeJoin. Guarding one keyed join and not the
+    // other did not close the class, it moved the defect next door.
     CHECK(!db25::physical::is_applicable(db25::physical::PhysicalOp::MergeJoin, {}));
+    CHECK(!db25::physical::is_applicable(db25::physical::PhysicalOp::HashJoin, {}));
     CHECK(db25::physical::is_applicable(db25::physical::PhysicalOp::MergeJoin, {{0, 0}}));
-    CHECK(db25::physical::is_applicable(db25::physical::PhysicalOp::HashJoin, {}));
+    CHECK(db25::physical::is_applicable(db25::physical::PhysicalOp::HashJoin, {{0, 0}}));
+    // The nested loop is applicable with or without keys - that is its role.
+    CHECK(db25::physical::is_applicable(db25::physical::PhysicalOp::NestedLoopJoin, {}));
+}
+
+// A purely non-equi join has no keys either, so it too is a nested loop - and the
+// condition survives as a residual rather than being silently dropped.
+static void test_non_equi_join_is_a_nested_loop() {
+    std::printf("test_non_equi_join_is_a_nested_loop\n");
+    auto pred = binop(BinaryOp::GreaterThan, col(1, DataType::Integer), col(2, DataType::Integer));
+    auto logical = build_logical(std::move(pred));
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "NestedLoopJoin keys=[]"));
+    CHECK(contains(s, "residual=[(> (col #1) (col #2))]"));
+}
+
+// The keyed joins must still win where they apply: a nested loop is quadratic, so
+// it is only ever selected because it is the sole APPLICABLE candidate, never
+// because it is cheap. This is what keeps adding it from degrading equi-joins.
+static void test_nested_loop_never_wins_an_equi_join() {
+    std::printf("test_nested_loop_never_wins_an_equi_join\n");
+    auto logical = build_logical();  // a.id = b.id
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(!contains(s, "NestedLoopJoin"));  // considered, and correctly rejected
+    CHECK(contains(s, "HashJoin keys=[(L#0 R#0)]"));
 }
 
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
+    test_non_equi_join_is_a_nested_loop();
+    test_nested_loop_never_wins_an_equi_join();
     test_freshness_overrides_cost();
     test_no_fresh_copy_is_an_honest_failure();
     test_storage_substrate_is_chosen_by_cost();

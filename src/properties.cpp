@@ -67,6 +67,11 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
         case PhysicalOp::HashJoin:
             // Builds a hash table: output order is not guaranteed.
             return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
+        case PhysicalOp::NestedLoopJoin:
+            // Emits pairs in left-outer-loop order. That IS the left input's
+            // order, but claiming it would be claiming a property of a specific
+            // execution strategy; until the engine guarantees it, derive nothing.
+            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
         case PhysicalOp::MergeJoin: {
             // Consumes both inputs in key order and emits in that same order, so
             // the join keys' order survives - the property that can save a later
@@ -90,11 +95,17 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
 }
 
 bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys) {
-    // A merge join has nothing to merge on without keys. Note this cannot be left
-    // to costing: with no keys it also requires no sort, so it would incur no
-    // enforcement and its cheaper per-row cost would WIN - producing a merge join
-    // over a cross product. Applicability has to be decided before cost.
-    if (op == PhysicalOp::MergeJoin) return !keys.empty();
+    // Both keyed joins need at least one equi-key: a merge join has nothing to
+    // merge on without one, and a hash join has nothing to hash on. Note this
+    // cannot be left to costing - with no keys a merge join also requires no
+    // sort, so it would incur no enforcement and its cheaper per-row cost would
+    // WIN, producing a merge join over a cross product. Applicability has to be
+    // decided before cost.
+    //
+    // A keyless join is not unplannable: it is a NestedLoopJoin, the one join
+    // that needs no key. Guarding only MergeJoin (as this did originally) did not
+    // close the class - it moved the same unexecutable plan onto HashJoin.
+    if (op == PhysicalOp::MergeJoin || op == PhysicalOp::HashJoin) return !keys.empty();
     return true;
 }
 
@@ -108,7 +119,8 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
     // which is what makes the substrate choice a real trade rather than "columnar
     // is always cheaper". A vectorized columnar join is a later operator; when it
     // arrives it simply declares a different requirement here.
-    if (op == PhysicalOp::HashJoin || op == PhysicalOp::MergeJoin) {
+    if (op == PhysicalOp::HashJoin || op == PhysicalOp::MergeJoin ||
+        op == PhysicalOp::NestedLoopJoin) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
     }
 

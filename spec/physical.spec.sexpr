@@ -25,6 +25,10 @@
     ; order on its output - so it is cheaper per row than HashJoin when the order
     ; is already there, and dearer once a Sort must be enforced to get it.
     (operator (name MergeJoin)     (arity 2) (kind pipeline-breaker))
+    ; NestedLoopJoin needs no equi-key, which makes it the ONLY legal
+    ; implementation of a cross product or a purely non-equi join - and its cost
+    ; is quadratic in the inputs, so it never wins where a keyed join applies.
+    (operator (name NestedLoopJoin) (arity 2) (kind pipeline-breaker))
     ; Enforcers: inserted to establish a required physical property.
     (operator (name Sort)          (arity 1) (kind pipeline-breaker))
     (operator (name FormatConvert) (arity 1) (kind pipeline)))
@@ -40,7 +44,10 @@
     ; Two candidates for a join: the planner costs both - including any enforcers
     ; each would cause - and keeps the cheaper.
     (rule (logical Join)    (physical HashJoin))
-    (rule (logical Join)    (physical MergeJoin)))
+    (rule (logical Join)    (physical MergeJoin))
+    ; The keyless fallback. Applicability (not cost) is what selects it: the two
+    ; keyed joins are not applicable without an equi-key.
+    (rule (logical Join)    (physical NestedLoopJoin)))
 
   ; The reference ExecutionCapabilityProfile: what a competent hardware-native
   ; engine is assumed able to execute. It ships now so the planner is usable and
@@ -48,4 +55,5 @@
   ; its own profile in this same shape.
   (capability-profile
     (name reference)
-    (executes SeqScan Filter Project HashJoin MergeJoin Sort FormatConvert)))
+    (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
+              Sort FormatConvert)))

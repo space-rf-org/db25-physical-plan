@@ -31,6 +31,11 @@ struct CalibrationProfile {
     double hash_build_row = 1.2;  // insert one build-side row into the hash table
     double hash_probe_row = 0.8;  // probe the hash table with one probe-side row
     double merge_join_row = 0.4;  // merge one row from an already-sorted input
+    // Not a per-ROW coefficient like its neighbours: a nested loop evaluates the
+    // join condition once per PAIR, so this is multiplied by the PRODUCT of the
+    // input cardinalities. The name records that difference deliberately - the
+    // quadratic term is the cost model telling the truth about the algorithm.
+    double nested_loop_pair = 0.05;
     double sort_row = 1.0;        // per-row coefficient of an n*log2(n) sort
     double convert_row = 0.6;     // convert one row between storage formats
     // Hardware facts (informational today; richer costing consumes them later).

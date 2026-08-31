@@ -62,6 +62,7 @@ std::optional<CalibrationProfile> load_lab_calibration(const std::string& path,
     cal.hash_build_row = atom_double(root, "hash-build-row", cal.hash_build_row);
     cal.hash_probe_row = atom_double(root, "hash-probe-row", cal.hash_probe_row);
     cal.merge_join_row = atom_double(root, "merge-join-row", cal.merge_join_row);
+    cal.nested_loop_pair = atom_double(root, "nested-loop-pair", cal.nested_loop_pair);
     cal.sort_row = atom_double(root, "sort-row", cal.sort_row);
     cal.convert_row = atom_double(root, "convert-row", cal.convert_row);
     cal.simd_width = atom_uint(root, "simd-width", cal.simd_width);
@@ -106,6 +107,7 @@ double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
             return in(0);
         case PhysicalOp::HashJoin:
         case PhysicalOp::MergeJoin:
+        case PhysicalOp::NestedLoopJoin:
             // The join ALGORITHM does not change how many rows come out.
             return in(0) * in(1) * card.join_selectivity;
         case PhysicalOp::Sort:
@@ -136,6 +138,11 @@ double operator_cost(PhysicalOp op, const std::vector<double>& input_rows, doubl
             // than hashing, which is why it wins when the order comes for free
             // and loses when a Sort has to be enforced to get it.
             return (in(0) + in(1)) * cal.merge_join_row;
+        case PhysicalOp::NestedLoopJoin:
+            // Every left row against every right row: the condition is evaluated
+            // once per PAIR. Quadratic, and the cost model says so - which is why
+            // a nested loop only ever wins where it is the only legal option.
+            return in(0) * in(1) * cal.nested_loop_pair;
         case PhysicalOp::Sort:
             return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)
         case PhysicalOp::FormatConvert:
