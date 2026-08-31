@@ -15,6 +15,7 @@
 #include "db25/plan/expr_ir.hpp"
 
 #include <cstdio>
+#include <optional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -252,6 +253,8 @@ static void test_group_answers_per_requirement() {
     // before this unit, and it is why a scan could never be optimized for an order
     // its parent was about to require.
     CHECK(m.select_cheapest(g, cal));
+    const std::optional<std::uint32_t> any_index =
+        m.group(g).winner_index_for(Group::unconstrained());
     const WinnerEntry* any = m.group(g).winner();
     CHECK(any != nullptr);
     if (any) CHECK(any->expr_index == 0);
@@ -268,14 +271,21 @@ static void test_group_answers_per_requirement() {
         CHECK(sorted->cost == 1200.0);        // and no enforcement charged
         CHECK(sorted->provided.sort.size() == 1);
     }
-    if (any && sorted) CHECK(any->expr_index != sorted->expr_index);
+    if (any_index && sorted) {
+        CHECK(m.group(g).winners[*any_index].expr_index != sorted->expr_index);
+    }
 
-    // The pointer taken before the second select is STILL VALID and still reads
-    // the unconstrained answer. winner_for() hands out pointers into the winners
-    // container and property-directed search holds one while recursing into
-    // children - which adds winners. This pins the container guarantee that makes
-    // that safe; ASan fails this immediately if `winners` becomes a vector.
-    if (any) CHECK(any->expr_index == 0);
+    // An INDEX taken before the second select still reads the unconstrained
+    // answer. Indices, not pointers, are what survives a group gaining winners
+    // while a recursive search holds a result.
+    //
+    // This originally pinned the opposite: the winners container was a deque so
+    // that POINTERS stayed valid. That was safe and expensive - an empty
+    // libstdc++ deque allocates immediately, so every group paid for one whether
+    // or not it ever held a winner, and profiling put ~37% of the optimizer's
+    // instructions in malloc/free. Indices give the same guarantee for nothing.
+    CHECK(any_index.has_value());
+    if (any_index) CHECK(m.group(g).winners[*any_index].expr_index == 0);
 
     // Both answers are retained: asking a new question does not overwrite the
     // answer to an old one. That memoization is the point of the unit.

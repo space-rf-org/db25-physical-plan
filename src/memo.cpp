@@ -25,17 +25,20 @@ std::uint32_t Memo::add_expr(GroupId group, GroupExpr expr) {
 }
 
 void Memo::set_winner(GroupId group, const PhysicalProperties& required,
-                      std::uint32_t expr_index, double cost, PhysicalProperties provided) {
+                      std::uint32_t expr_index, double cost, PhysicalProperties provided,
+                      std::vector<PhysicalProperties> input_required) {
     Group& g = groups_[group];
     for (WinnerEntry& w : g.winners) {
         if (w.required == required) {  // replace in place: one winner per key
             w.expr_index = expr_index;
             w.cost = cost;
             w.provided = std::move(provided);
+            w.input_required = std::move(input_required);
             return;
         }
     }
-    g.winners.push_back(WinnerEntry{required, expr_index, cost, std::move(provided)});
+    g.winners.push_back(WinnerEntry{required, expr_index, cost, std::move(provided),
+                                    std::move(input_required)});
 }
 
 void Memo::set_rows(GroupId group, double rows) {
@@ -76,7 +79,10 @@ bool Memo::select_cheapest(GroupId group, const PhysicalProperties& required,
     if (!required.sort.empty() && !satisfies(g.exprs[best].provided, required)) {
         provided.sort = required.sort;
     }
-    set_winner(group, required, best, best_cost, std::move(provided));
+    // Single-level chooser: it does not optimize inputs, so the child goals it
+    // records are the operator's own input requirements.
+    set_winner(group, required, best, best_cost, std::move(provided),
+               g.exprs[best].input_reqs);
     return true;
 }
 
@@ -108,20 +114,23 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     node->projections = ge.projections;
     node->hash_keys = ge.hash_keys;
 
-    const std::vector<PhysicalProperties> reqs =
-        required_input_properties(ge.op, ge.hash_keys);
+    // Recurse on the SAME goals the winner was costed against, not on each
+    // child's unconstrained winner: a child optimized for "sorted on k" is a
+    // different plan from the same child optimized for nothing, and extracting
+    // the wrong one would build a plan nobody costed.
+    const std::vector<PhysicalProperties>& reqs = won->input_required;
     for (std::size_t i = 0; i < ge.inputs.size(); ++i) {
-        auto child = extract_winner(ge.inputs[i]);
+        const PhysicalProperties& child_req =
+            i < reqs.size() ? reqs[i] : Group::unconstrained();
+        auto child = extract_winner_for(ge.inputs[i], child_req);
         if (!child) {
             return nullptr;  // an input group had no winner: extraction fails
         }
         // Establish anything this operator requires but the input does not give.
         // enforce() returns null when the requirement is not enforceable at all;
         // that must fail extraction, not silently emit the unenforced input.
-        if (i < reqs.size()) {
-            child = enforce(std::move(child), reqs[i]);
-            if (!child) return nullptr;
-        }
+        child = enforce(std::move(child), child_req);
+        if (!child) return nullptr;
         node->children.push_back(std::move(child));
     }
     return node;

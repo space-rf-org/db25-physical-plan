@@ -8,6 +8,8 @@
 #include "db25/plan/expr_ir.hpp"
 
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -91,22 +93,26 @@ void split_join_predicate(const plan::Expr* e, std::uint32_t left_width,
     residual.push_back(e);
 }
 
-GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
-                        const CalibrationProfile& cal, const CardinalityModel& card,
-                        const StorageCatalog& storage, std::size_t& candidates,
-                        std::string& error) {
+// ---- phase 1: exploration -------------------------------------------------
+// Build the memo's groups and their candidate group-expressions. NO costing and
+// NO winner here: what a candidate costs, and therefore which one wins, depends
+// on the requirement it is being optimized for - which exploration does not know.
+// Separating the two phases is what makes the search property-directed rather
+// than a bottom-up sweep that happens to consult properties.
+GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
+                const CardinalityModel& card, const StorageCatalog& storage,
+                std::size_t& candidates, std::string& error) {
     const std::vector<PhysicalOp> cands = resolve_candidates(n.op, ctx);
     if (cands.empty()) {
         const char* ln = logical_op_name(n.op);
         error = ln ? ("no implementation rule for logical operator '" + std::string(ln) + "'")
-                   : "unsupported logical operator in Increment-0 lowering";
+                   : "unsupported logical operator in lowering";
         return kInvalidGroup;
     }
 
     std::vector<GroupId> inputs;
     for (std::size_t i = 0; i < n.child_count(); ++i) {
-        const GroupId g =
-            lower_into_memo(*n.child(i), memo, ctx, cal, card, storage, candidates, error);
+        const GroupId g = explore(*n.child(i), memo, ctx, card, storage, candidates, error);
         if (g == kInvalidGroup) return kInvalidGroup;
         inputs.push_back(g);
     }
@@ -140,29 +146,14 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     const GroupId g = memo.add_group(n.output);
 
     // Cardinality belongs to the GROUP: the candidates are equivalent, so any of
-    // them yields the same estimate. Costing a parent then reads its inputs' rows
-    // straight off their groups instead of re-deriving them down the tree.
+    // them yields the same estimate, and it does not depend on any requirement.
     std::vector<double> input_rows;
     input_rows.reserve(inputs.size());
     for (const GroupId in : inputs) input_rows.push_back(memo.group(in).rows);
-    const double out_rows = operator_rows(cands.front(), input_rows, base.table_name, card);
-    memo.set_rows(g, out_rows);
-
-    // An input group's contribution is the cost of its own winning subplan, which
-    // is already settled: children are lowered (and chosen) before their parent.
-    double inputs_cost = 0.0;
-    for (const GroupId in : inputs) inputs_cost += memo.group(in).best_cost();
-
-    // What each input group's chosen subplan provides - needed both to charge a
-    // candidate for the enforcement it causes and to derive what the candidate
-    // itself will provide.
-    std::vector<PhysicalProperties> input_props;
-    input_props.reserve(inputs.size());
-    for (const GroupId in : inputs) input_props.push_back(memo.group(in).provided());
+    memo.set_rows(g, operator_rows(cands.front(), input_rows, base.table_name, card));
 
     // A scan is available once per storage format the table actually has; every
-    // other operator has a single (irrelevant) format slot. This is what turns the
-    // HTAP substrate into an ordinary costed choice rather than a special case.
+    // other operator has a single (irrelevant) format slot.
     std::vector<FormatAvailability> scan_formats{FormatAvailability{StorageFormat::Row}};
     if (n.op == plan::LogicalOp::Scan) {
         scan_formats = storage.formats_for(base.table_name);
@@ -184,31 +175,18 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     }
 
     for (const PhysicalOp cand : cands) {
-      // A candidate whose precondition does not hold is not a cheaper option, it
-      // is not an option at all.
-      if (!is_applicable(cand, base.hash_keys)) continue;
-      for (const FormatAvailability& fa : scan_formats) {
-        GroupExpr ge = base;
-        ge.op = cand;
-        ge.scan_format = fa.format;
-        ge.scan_freshness = fa.freshness;
-        // A candidate pays for the enforcers it will cause. Without this a
-        // MergeJoin over unsorted inputs would look cheaper than it is, get
-        // chosen, and then have Sorts inserted at extraction that nobody costed.
-        double enforce_cost = 0.0;
-        const std::vector<PhysicalProperties> reqs =
-            required_input_properties(cand, ge.hash_keys);
-        for (std::size_t i = 0; i < inputs.size() && i < reqs.size(); ++i) {
-            enforce_cost += enforcement_cost(input_props[i], reqs[i], input_rows[i], cal);
+        // A candidate whose precondition does not hold is not a cheaper option, it
+        // is not an option at all.
+        if (!is_applicable(cand, base.hash_keys)) continue;
+        for (const FormatAvailability& fa : scan_formats) {
+            GroupExpr ge = base;
+            ge.op = cand;
+            ge.scan_format = fa.format;
+            ge.scan_freshness = fa.freshness;
+            ge.input_reqs = required_input_properties(cand, ge.hash_keys);
+            memo.add_expr(g, std::move(ge));
+            ++candidates;
         }
-        ge.cost = inputs_cost + enforce_cost +
-                  operator_cost(cand, input_rows, out_rows, cal, fa.format);
-        // Derived per CANDIDATE, not just for the winner: choosing a winner for a
-        // REQUIREMENT means comparing what each candidate already provides.
-        ge.provided = derive_op(cand, ge.hash_keys, fa.format, input_props, fa.freshness);
-        memo.add_expr(g, std::move(ge));
-        ++candidates;
-      }
     }
     if (memo.group(g).exprs.empty()) {
         const char* ln = logical_op_name(n.op);
@@ -216,18 +194,140 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
                 (ln ? ln : "?") + "'";
         return kInvalidGroup;
     }
-    // The cost-based choice, for the unconstrained requirement: bottom-up lowering
-    // asks each group for its cheapest plan, because no consumer has yet stated
-    // what it needs. Optimizing a group FOR a requirement is what unit 2.2 adds;
-    // the memo can already answer it (see Memo::select_cheapest with a
-    // requirement), which is what this unit delivers.
-    if (!memo.select_cheapest(g, cal)) {
-        const char* ln = logical_op_name(n.op);
-        error = std::string("no candidate could be chosen for logical '") + (ln ? ln : "?") + "'";
-        return kInvalidGroup;
-    }
     return g;
 }
+
+// ---- phase 2: property-directed optimization ------------------------------
+// The search proper: "the best plan for group `g` that satisfies `required`",
+// memoized under that requirement so the same goal is never re-derived.
+//
+// For each candidate the search costs TWO routes and keeps the cheaper:
+//
+//   enforce   - optimize the children for what the OPERATOR needs, then pay for
+//               the enforcers that make this operator's own output satisfy the
+//               consumer (a Sort above a hash join, say);
+//   push down - where the operator preserves the property, require it of the
+//               INPUT instead, so nothing is enforced above.
+//
+// Neither is universally better, which is exactly why it is a cost comparison
+// rather than a rule. Sorting below a Filter sorts rows the Filter discards;
+// sorting above a join sorts the (larger) join output.
+struct Optimizer {
+    Memo& memo;
+    const CalibrationProfile& cal;
+    std::size_t goals = 0;
+
+    // Optimize each input under `reqs`, accumulating cost and what they provide.
+    // Returns false when any input cannot meet its requirement at any price.
+    bool optimize_inputs(const std::vector<GroupId>& inputs,
+                         const std::vector<PhysicalProperties>& reqs,
+                         double& cost_out, std::vector<PhysicalProperties>& provided_out) {
+        cost_out = 0.0;
+        provided_out.clear();
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const PhysicalProperties& r =
+                i < reqs.size() ? reqs[i] : Group::unconstrained();
+            const std::optional<std::uint32_t> w = optimize(inputs[i], r);
+            if (!w) return false;
+            const WinnerEntry& e = memo.group(inputs[i]).winners[*w];
+            cost_out += e.cost;
+            provided_out.push_back(e.provided);
+        }
+        return true;
+    }
+
+    std::optional<std::uint32_t> optimize(GroupId g, const PhysicalProperties& required) {
+        if (const auto memoized = memo.group(g).winner_index_for(required)) {
+            return memoized;  // this goal is already settled
+        }
+        ++goals;
+
+        const double out_rows = memo.group(g).rows;
+        const std::size_t n_exprs = memo.group(g).exprs.size();
+
+        std::uint32_t best = static_cast<std::uint32_t>(n_exprs);
+        double best_cost = std::numeric_limits<double>::infinity();
+        PhysicalProperties best_provided;
+        std::vector<PhysicalProperties> best_input_required;
+
+        for (std::uint32_t i = 0; i < n_exprs; ++i) {
+            // A reference is safe here because of a phase invariant: EXPLORATION
+            // IS COMPLETE before optimization begins, so no group's candidate list
+            // grows while the search runs. (Groups are a deque and winners are
+            // addressed by index, so neither of those moves either.) If a later
+            // unit ever applies rules DURING search, this is the line that has to
+            // change - copying it back cost five allocations per candidate.
+            const GroupExpr& ge = memo.group(g).exprs[i];
+            std::vector<double> in_rows;
+            in_rows.reserve(ge.inputs.size());
+            for (const GroupId in : ge.inputs) in_rows.push_back(memo.group(in).rows);
+            const std::vector<PhysicalProperties>& op_reqs = ge.input_reqs;
+            const double own_cost =
+                operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format);
+
+            // --- route 1: satisfy the operator's own needs, enforce on top ---
+            double child_cost = 0.0;
+            std::vector<PhysicalProperties> child_props;
+            if (optimize_inputs(ge.inputs, op_reqs, child_cost, child_props)) {
+                const PhysicalProperties provided = derive_op(
+                    ge.op, ge.hash_keys, ge.scan_format, child_props, ge.scan_freshness);
+                const double top = enforcement_cost(provided, required, out_rows, cal);
+                const double total = child_cost + own_cost + top;
+                if (total < best_cost) {
+                    best_cost = total;
+                    best = i;
+                    best_provided = provided;
+                    best_input_required = op_reqs;
+                    if (top != 0.0) {  // an enforcer will sit above this operator
+                        if (required.format != StorageFormat::Any) {
+                            best_provided.format = required.format;
+                        }
+                        if (!required.sort.empty()) best_provided.sort = required.sort;
+                    }
+                }
+            }
+
+            // --- route 2: push the requirement into the input instead ---
+            if (const std::optional<PhysicalProperties> down =
+                    pushdown_requirement(ge.op, required)) {
+                std::vector<PhysicalProperties> pushed = op_reqs;
+                if (!pushed.empty()) {
+                    // The operator's own need AND the consumer's, on input 0.
+                    PhysicalProperties combined = *down;
+                    if (pushed[0].format != StorageFormat::Any) {
+                        combined.format = pushed[0].format;
+                    }
+                    if (combined.sort.empty()) combined.sort = pushed[0].sort;
+                    pushed[0] = combined;
+
+                    double pd_cost = 0.0;
+                    std::vector<PhysicalProperties> pd_props;
+                    if (optimize_inputs(ge.inputs, pushed, pd_cost, pd_props)) {
+                        const PhysicalProperties provided =
+                            derive_op(ge.op, ge.hash_keys, ge.scan_format, pd_props,
+                                      ge.scan_freshness);
+                        const double top =
+                            enforcement_cost(provided, required, out_rows, cal);
+                        const double total = pd_cost + own_cost + top;
+                        if (total < best_cost) {
+                            best_cost = total;
+                            best = i;
+                            best_provided = provided;
+                            best_input_required = pushed;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (best == n_exprs || best_cost == std::numeric_limits<double>::infinity()) {
+            return std::nullopt;  // nothing here can serve this goal at any price
+        }
+        memo.set_winner(g, required, best, best_cost, best_provided,
+                        std::move(best_input_required));
+        return memo.group(g).winner_index_for(required);
+    }
+};
 
 }  // namespace
 
@@ -242,19 +342,45 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     const StorageCatalog storage = ctx.storage != nullptr ? *ctx.storage : StorageCatalog{};
 
     Memo memo;
-    const GroupId root_group = lower_into_memo(root, memo, ctx, cal, card, storage,
-                                               result.candidates_considered, result.error);
+    const GroupId root_group =
+        explore(root, memo, ctx, card, storage, result.candidates_considered, result.error);
     if (root_group == kInvalidGroup) {
         return result;  // ok stays false, error set
     }
     memo.set_root(root_group);
     result.memo_groups = memo.size();
 
-    result.plan = memo.extract_winner();
+    Optimizer opt{memo, cal, 0};
+    if (!opt.optimize(root_group, ctx.required_output)) {
+        result.error = "no plan satisfies the required output properties";
+        return result;
+    }
+    result.optimization_goals = opt.goals;
+
+    result.plan = memo.extract_winner_for(root_group, ctx.required_output);
     if (!result.plan) {
-        result.error =
-            "winner extraction failed (a group had no winner, or a required "
-            "property could not be enforced)";
+        result.error = "winner extraction failed (a group had no winner, or a required "
+                       "property could not be enforced)";
+        return result;
+    }
+
+    // The ROOT's enforcer, which nothing else would insert. Every other enforcer
+    // is placed by a parent onto its child; the root has no parent, so a plan
+    // whose top operator does not itself provide the required output would
+    // otherwise be returned unenforced - reported ok while not satisfying the
+    // requirement it was optimized for. (The cost of this enforcer was already
+    // charged: it is the `top` term the root's winner paid.)
+    result.plan = enforce(std::move(result.plan), ctx.required_output);
+    if (!result.plan) {
+        result.error = "the required output properties cannot be enforced";
+        return result;
+    }
+
+    // Postcondition, checked rather than assumed - the planner does not get to
+    // report success on a plan that does not satisfy what it was asked for.
+    if (!satisfies(derive(*result.plan), ctx.required_output)) {
+        result.plan.reset();
+        result.error = "internal: extracted plan does not satisfy the required output";
         return result;
     }
     result.ok = true;

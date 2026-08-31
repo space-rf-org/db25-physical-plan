@@ -47,6 +47,11 @@ struct GroupExpr {
     // "which candidate is cheapest GIVEN a requirement" needs to know what each
     // one already provides and therefore what each would have to enforce.
     PhysicalProperties provided;
+    // What this candidate requires of each input, in operand order. A function of
+    // op and hash_keys alone, both fixed once the candidate exists - so it is
+    // computed once at exploration rather than rebuilt (with its vector) on every
+    // candidate of every goal the search evaluates.
+    std::vector<PhysicalProperties> input_reqs;
 };
 
 // A group's answer to one question: "the best plan for this group that satisfies
@@ -59,6 +64,13 @@ struct WinnerEntry {
     std::uint32_t expr_index = 0;         // index into Group::exprs
     double cost = std::numeric_limits<double>::infinity();
     PhysicalProperties provided;          // what the chosen candidate provides
+    // The requirement each INPUT was optimized under to reach this cost, in
+    // operand order. Without it the winner is not reproducible: extraction would
+    // have to guess which goal each child was solved for, and a child optimized
+    // for "sorted on k" is a different plan from the same child optimized for
+    // nothing. Cascades calls these the child goals; they are part of the winner,
+    // not a detail of how it was found.
+    std::vector<PhysicalProperties> input_required;
 };
 
 // A memo group: a set of equivalent group-expressions, the output schema they
@@ -80,16 +92,18 @@ struct Group {
     // property, only to charge it for lacking one. Linear scan is deliberate;
     // the number of distinct requirements asked of one group is tiny.
     //
-    // A DEQUE, not a vector, and that is load-bearing: winner_for() hands out
-    // pointers into this container, and property-directed search holds one while
-    // recursing into child groups - which optimizes them for new requirements and
-    // so inserts more winners. A vector would reallocate and dangle the caller's
-    // pointer; a deque never invalidates references to existing elements on
-    // push_back. (ASan caught exactly this the first time a test held a winner
-    // across a second select_cheapest call.) Returning by value instead would
-    // also be safe, but copies two property vectors on every lookup, and lookups
-    // are on the search's hot path against a microsecond budget.
-    std::deque<WinnerEntry> winners;
+    // A vector, and the search addresses entries BY INDEX rather than by pointer.
+    //
+    // This container was briefly a deque, to keep pointers valid while the search
+    // recursed and inserted more winners. That was correct and expensive: an
+    // empty libstdc++ deque allocates its map and a node immediately, so every
+    // Group cost two heap allocations at construction whether or not it ever held
+    // a winner - and profiling put 37% of the optimizer's instructions in
+    // malloc/free. Indices are stable under append without costing anything, so
+    // they buy the same safety for free. winner_for() still returns a pointer for
+    // callers that use it immediately; anything holding a result ACROSS a call
+    // that may insert must hold an index (see winner_index_for).
+    std::vector<WinnerEntry> winners;
 
     // The unconstrained requirement: "give me your cheapest plan, I need nothing
     // in particular". This is what bottom-up lowering asks for, and it remains a
@@ -99,11 +113,23 @@ struct Group {
         return kAny;
     }
 
-    [[nodiscard]] const WinnerEntry* winner_for(const PhysicalProperties& required) const noexcept {
-        for (const WinnerEntry& w : winners) {
-            if (w.required == required) return &w;
+    // Index of the winner for `required`, if this group has been optimized for
+    // it. An INDEX, not a pointer: entries are only ever appended or replaced in
+    // place, so an index stays valid across the inserts a recursive search makes.
+    [[nodiscard]] std::optional<std::uint32_t> winner_index_for(
+        const PhysicalProperties& required) const noexcept {
+        for (std::uint32_t i = 0; i < winners.size(); ++i) {
+            if (winners[i].required == required) return i;
         }
-        return nullptr;
+        return std::nullopt;
+    }
+
+    // Convenience for callers that consume the result immediately. INVALIDATED by
+    // any later insert into this group's winners - hold an index instead if the
+    // result must outlive such a call.
+    [[nodiscard]] const WinnerEntry* winner_for(const PhysicalProperties& required) const noexcept {
+        const auto i = winner_index_for(required);
+        return i ? &winners[*i] : nullptr;
     }
 
     // Convenience accessors for the unconstrained winner - what every caller
@@ -132,7 +158,8 @@ public:
 
     // Record the winner for a requirement, replacing any entry under that key.
     void set_winner(GroupId group, const PhysicalProperties& required,
-                    std::uint32_t expr_index, double cost, PhysicalProperties provided);
+                    std::uint32_t expr_index, double cost, PhysicalProperties provided,
+                    std::vector<PhysicalProperties> input_required = {});
 
     // Record a group's estimated output cardinality.
     void set_rows(GroupId group, double rows);
@@ -174,7 +201,11 @@ public:
                                                      const PhysicalProperties& required) const;
 
 private:
-    std::vector<Group> groups_;
+    // A deque so growing the memo never COPIES a Group - a Group owns its
+    // candidate and winner vectors, and vector-of-Group reallocation was copying
+    // all of them. It also makes Group references stable, which the search relies
+    // on while recursing.
+    std::deque<Group> groups_;
     GroupId root_ = kInvalidGroup;
 };
 
