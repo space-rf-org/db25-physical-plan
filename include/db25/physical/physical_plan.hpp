@@ -36,6 +36,9 @@ enum class PhysicalOp : std::uint8_t {
     HashJoin,       // hash join: builds a hash table, indifferent to input order
     MergeJoin,      // merge join: needs both inputs sorted on the join keys, and
                     // keeps that order on its output
+    NestedLoopJoin, // nested-loop join: the only join that needs no equi-key, so
+                    // the only legal implementation of a cross product or a
+                    // purely non-equi join. Quadratic, and priced accordingly.
     Sort,           // enforcer: establishes a required sort order
     FormatConvert,  // enforcer: converts the storage format (row <-> column)
 };
@@ -50,10 +53,10 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 7> kAllPhysicalOps = {
-    PhysicalOp::SeqScan,   PhysicalOp::Filter, PhysicalOp::Project,
-    PhysicalOp::HashJoin,  PhysicalOp::MergeJoin, PhysicalOp::Sort,
-    PhysicalOp::FormatConvert};
+inline constexpr std::array<PhysicalOp, 8> kAllPhysicalOps = {
+    PhysicalOp::SeqScan,       PhysicalOp::Filter,    PhysicalOp::Project,
+    PhysicalOp::HashJoin,      PhysicalOp::MergeJoin, PhysicalOp::NestedLoopJoin,
+    PhysicalOp::Sort,          PhysicalOp::FormatConvert};
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
@@ -138,6 +141,9 @@ struct PhysicalNode {
 [[nodiscard]] PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                               std::vector<HashKey> keys, Schema output,
                                               std::vector<const Expr*> residual = {});
+[[nodiscard]] PhysicalNodePtr make_nested_loop_join(PhysicalNodePtr left, PhysicalNodePtr right,
+                                                    Schema output,
+                                                    std::vector<const Expr*> residual = {});
 // Enforcers.
 [[nodiscard]] PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys);
 [[nodiscard]] PhysicalNodePtr make_format_convert(PhysicalNodePtr input, StorageFormat target);

@@ -11,6 +11,7 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::Project:       return "Project";
         case PhysicalOp::HashJoin:      return "HashJoin";
         case PhysicalOp::MergeJoin:     return "MergeJoin";
+        case PhysicalOp::NestedLoopJoin: return "NestedLoopJoin";
         case PhysicalOp::Sort:          return "Sort";
         case PhysicalOp::FormatConvert: return "FormatConvert";
     }
@@ -49,6 +50,7 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::Project:       return 1;
         case PhysicalOp::HashJoin:      return 2;
         case PhysicalOp::MergeJoin:     return 2;
+        case PhysicalOp::NestedLoopJoin: return 2;
         case PhysicalOp::Sort:          return 1;
         case PhysicalOp::FormatConvert: return 1;
     }
@@ -98,6 +100,16 @@ PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::MergeJoin);
     n->hash_keys = std::move(keys);
     n->residual = std::move(residual);
+    n->output = std::move(output);
+    n->children.push_back(std::move(left));
+    n->children.push_back(std::move(right));
+    return n;
+}
+
+PhysicalNodePtr make_nested_loop_join(PhysicalNodePtr left, PhysicalNodePtr right,
+                                     Schema output, std::vector<const Expr*> residual) {
+    auto n = std::make_unique<PhysicalNode>(PhysicalOp::NestedLoopJoin);
+    n->residual = std::move(residual);   // no hash_keys: that is the whole point
     n->output = std::move(output);
     n->children.push_back(std::move(left));
     n->children.push_back(std::move(right));

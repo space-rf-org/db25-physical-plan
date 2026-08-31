@@ -98,7 +98,8 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             break;
         }
         case PhysicalOp::HashJoin:
-        case PhysicalOp::MergeJoin: {
+        case PhysicalOp::MergeJoin:
+        case PhysicalOp::NestedLoopJoin: {
             out += " keys=[";
             for (std::size_t i = 0; i < n.hash_keys.size(); ++i) {
                 if (i != 0) out += " ";

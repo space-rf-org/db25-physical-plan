@@ -27,14 +27,17 @@ const char* logical_op_name(plan::LogicalOp op) {
     }
 }
 
-// The built-in single-candidate mapping used when no spec is supplied.
-std::optional<PhysicalOp> builtin_physical(plan::LogicalOp op) {
+// The built-in mapping used when no spec is supplied. A join offers BOTH keyed
+// and keyless candidates: with no spec, a cross product still has to have a legal
+// implementation, and only the nested loop is one.
+std::vector<PhysicalOp> builtin_physical(plan::LogicalOp op) {
     switch (op) {
-        case plan::LogicalOp::Scan:    return PhysicalOp::SeqScan;
-        case plan::LogicalOp::Filter:  return PhysicalOp::Filter;
-        case plan::LogicalOp::Project: return PhysicalOp::Project;
-        case plan::LogicalOp::Join:    return PhysicalOp::HashJoin;
-        default:                       return std::nullopt;
+        case plan::LogicalOp::Scan:    return {PhysicalOp::SeqScan};
+        case plan::LogicalOp::Filter:  return {PhysicalOp::Filter};
+        case plan::LogicalOp::Project: return {PhysicalOp::Project};
+        case plan::LogicalOp::Join:    return {PhysicalOp::HashJoin,
+                                               PhysicalOp::NestedLoopJoin};
+        default:                       return {};
     }
 }
 
@@ -51,8 +54,7 @@ std::vector<PhysicalOp> resolve_candidates(plan::LogicalOp op, const LoweringCon
         }
         return out;
     }
-    if (const std::optional<PhysicalOp> p = builtin_physical(op)) out.push_back(*p);
-    return out;
+    return builtin_physical(op);
 }
 
 // Split a join predicate into equi-join keys and the residual conjuncts that are
