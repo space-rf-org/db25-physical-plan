@@ -1,5 +1,7 @@
 #include "db25/physical/spec.hpp"
 
+#include "db25/physical/sexpr_read.hpp"
+
 #include <charconv>
 #include <cstddef>
 #include <fstream>
@@ -8,101 +10,6 @@
 #include <vector>
 
 namespace db25::physical {
-namespace {
-
-// ---- a minimal, zero-dependency s-expression reader ----------------------
-// Nodes are either an atom (a bare token) or a list (parenthesized sequence).
-// `;` begins a line comment. This is all the IDL needs; it is deliberately not a
-// general Lisp reader (no quoting, no strings with spaces).
-struct SNode {
-    bool is_list = false;
-    std::string atom;            // when !is_list
-    std::vector<SNode> list;     // when is_list
-
-    [[nodiscard]] const std::string& head() const {
-        static const std::string empty;
-        return (is_list && !list.empty() && !list[0].is_list) ? list[0].atom : empty;
-    }
-    // First child list whose head atom == name, or nullptr.
-    [[nodiscard]] const SNode* child(const std::string& name) const {
-        if (!is_list) return nullptr;
-        for (const SNode& c : list) {
-            if (c.is_list && c.head() == name) return &c;
-        }
-        return nullptr;
-    }
-};
-
-class Reader {
-public:
-    explicit Reader(const std::string& text) : text_(text) {}
-
-    // Parse a single top-level s-expression. Returns false + error on failure.
-    bool parse(SNode& out, std::string& error) {
-        skip_ws();
-        if (pos_ >= text_.size()) { error = "empty spec"; return false; }
-        if (!read_node(out, error)) return false;
-        skip_ws();
-        if (pos_ < text_.size()) { error = "trailing content after top-level form"; return false; }
-        return true;
-    }
-
-private:
-    const std::string& text_;
-    std::size_t pos_ = 0;
-
-    void skip_ws() {
-        while (pos_ < text_.size()) {
-            const char c = text_[pos_];
-            if (c == ';') {                       // line comment to end of line
-                while (pos_ < text_.size() && text_[pos_] != '\n') ++pos_;
-            } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-                ++pos_;
-            } else {
-                break;
-            }
-        }
-    }
-
-    bool read_node(SNode& out, std::string& error) {
-        skip_ws();
-        if (pos_ >= text_.size()) { error = "unexpected end of input"; return false; }
-        if (text_[pos_] == '(') {
-            ++pos_;  // consume '('
-            out.is_list = true;
-            while (true) {
-                skip_ws();
-                if (pos_ >= text_.size()) { error = "unterminated list"; return false; }
-                if (text_[pos_] == ')') { ++pos_; return true; }
-                SNode child;
-                if (!read_node(child, error)) return false;
-                out.list.push_back(std::move(child));
-            }
-        }
-        if (text_[pos_] == ')') { error = "unexpected ')'"; return false; }
-        // atom: read until whitespace, paren, or comment
-        const std::size_t start = pos_;
-        while (pos_ < text_.size()) {
-            const char c = text_[pos_];
-            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '(' ||
-                c == ')' || c == ';') {
-                break;
-            }
-            ++pos_;
-        }
-        out.is_list = false;
-        out.atom = text_.substr(start, pos_ - start);
-        return true;
-    }
-};
-
-// Second child atom of `(key value)`, or empty.
-std::string value_of(const SNode& kv) {
-    return (kv.is_list && kv.list.size() >= 2 && !kv.list[1].is_list) ? kv.list[1].atom
-                                                                      : std::string{};
-}
-
-}  // namespace
 
 bool CapabilityProfile::can_execute(const std::string& op) const {
     for (const std::string& e : executes) {
@@ -120,7 +27,7 @@ const OperatorSpec* PhysicalSpec::find_operator(const std::string& name) const {
 
 std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& error) {
     SNode root;
-    if (!Reader(text).parse(root, error)) return std::nullopt;
+    if (!read_sexpr(text, root, error)) return std::nullopt;
     if (!root.is_list || root.head() != "physical-spec") {
         error = "top-level form must be (physical-spec ...)";
         return std::nullopt;
