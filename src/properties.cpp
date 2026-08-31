@@ -25,6 +25,19 @@ const PhysicalNode* child0(const PhysicalNode& n) {
 
 }  // namespace
 
+bool operator==(const SortKey& a, const SortKey& b) noexcept {
+    return same_key(a, b);
+}
+
+bool operator==(const PhysicalProperties& a, const PhysicalProperties& b) noexcept {
+    if (a.format != b.format || a.freshness != b.freshness) return false;
+    if (a.sort.size() != b.sort.size()) return false;
+    for (std::size_t i = 0; i < a.sort.size(); ++i) {
+        if (!same_key(a.sort[i], b.sort[i])) return false;
+    }
+    return true;
+}
+
 bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& required) {
     // Correctness first: stale data cannot answer a query that must see the
     // latest writes, and no enforcer exists that would change that.
