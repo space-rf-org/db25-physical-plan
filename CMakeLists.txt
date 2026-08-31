@@ -53,7 +53,8 @@ add_library(db25physicalplan STATIC
     src/sexpr_read.cpp
     src/spec.cpp
     src/cost.cpp
-    src/properties.cpp)
+    src/properties.cpp
+    src/lowering.cpp)
 target_include_directories(db25physicalplan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(db25physicalplan PUBLIC db25logicalplan)
@@ -91,4 +92,11 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_link_libraries(property_tests PRIVATE db25physicalplan)
     target_compile_options(property_tests PRIVATE -fno-exceptions -Wall -Wextra)
     add_test(NAME property_tests COMMAND property_tests)
+
+    add_executable(lowering_tests tests/test_lowering.cpp)
+    target_link_libraries(lowering_tests PRIVATE db25physicalplan)
+    target_compile_options(lowering_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    target_compile_definitions(lowering_tests PRIVATE
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME lowering_tests COMMAND lowering_tests)
 endif()

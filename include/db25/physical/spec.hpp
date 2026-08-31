@@ -34,13 +34,25 @@ struct CapabilityProfile {
     [[nodiscard]] bool can_execute(const std::string& op) const;
 };
 
+// One implementation rule: the physical operator a logical operator lowers to.
+// Increment 0 is single-candidate (one rule per logical op); alternatives are
+// what the Cascades search explores later.
+struct ImplRule {
+    std::string logical;   // logical operator name (as the lowering spells it)
+    std::string physical;  // physical operator name (must be a declared operator)
+};
+
 // A loaded physical spec.
 struct PhysicalSpec {
     int version = -1;
     std::vector<OperatorSpec> operators;
+    std::vector<ImplRule> impl_rules;
     CapabilityProfile profile;
 
     [[nodiscard]] const OperatorSpec* find_operator(const std::string& name) const;
+    // The physical operator name a logical operator lowers to, or empty if the
+    // spec has no rule for it.
+    [[nodiscard]] std::string physical_for_logical(const std::string& logical) const;
 };
 
 // Parse a spec from s-expression text. Returns the spec on success; on a parse
