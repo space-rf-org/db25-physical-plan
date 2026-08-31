@@ -53,6 +53,12 @@ struct LoweringContext {
     // and then patched up with enforcers afterwards. Empty means "no requirement",
     // which is what every caller before property-directed search implied.
     PhysicalProperties required_output;
+    // Branch-and-bound pruning. On by default; it is a pure SEARCH optimization
+    // and must never change the plan chosen, which is what makes turning it off a
+    // usable diagnostic rather than a behaviour switch. A test lowers every case
+    // both ways and asserts the rendered plans are identical - pruning that
+    // changes a plan is a bug, not a speedup.
+    bool prune = true;
     const RuntimeProfile* runtime = nullptr;
 };
 
@@ -68,6 +74,10 @@ struct LoweringResult {
     // than memo_groups means some group really was optimized for more than one
     // requirement - the thing Increment 2 exists to make possible.
     std::size_t optimization_goals = 0;
+    // Candidates abandoned before being fully costed because their cost already
+    // exceeded the best plan found for the same goal. Evidence that pruning is
+    // doing something; zero on a query with nothing to prune.
+    std::size_t candidates_pruned = 0;
 };
 
 // Lower a logical plan to a physical plan. The physical plan borrows expression
