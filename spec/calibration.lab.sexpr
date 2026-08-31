@@ -1,0 +1,15 @@
+; DB25 physical planner - pinned lab CalibrationProfile (design D10).
+;
+; Deterministic cost coefficients: the source of truth for reproducible goldens
+; and lab work. In production the planner resolves a live-measured or cached
+; profile through the SAME seam (CalibrationSource); this file is what the
+; PinnedLab source reads. Costs are abstract units - only their ratios matter.
+(calibration
+  (name lab)
+  (scan-row 1.0)
+  (filter-row 0.5)
+  (project-row 0.3)
+  (hash-build-row 1.2)
+  (hash-probe-row 0.8)
+  (simd-width 8)
+  (cache-line 64))
