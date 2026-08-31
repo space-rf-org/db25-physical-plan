@@ -170,6 +170,9 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     }
 
     for (const PhysicalOp cand : cands) {
+      // A candidate whose precondition does not hold is not a cheaper option, it
+      // is not an option at all.
+      if (!is_applicable(cand, base.hash_keys)) continue;
       for (const FormatAvailability& fa : scan_formats) {
         GroupExpr ge = base;
         ge.op = cand;
@@ -190,6 +193,12 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
         memo.add_expr(g, std::move(ge));
         ++candidates;
       }
+    }
+    if (memo.group(g).exprs.empty()) {
+        const char* ln = logical_op_name(n.op);
+        error = std::string("no applicable physical operator for logical '") +
+                (ln ? ln : "?") + "'";
+        return kInvalidGroup;
     }
     memo.select_cheapest(g);  // the cost-based choice
 

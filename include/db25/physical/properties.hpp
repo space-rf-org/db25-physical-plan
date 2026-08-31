@@ -40,6 +40,12 @@ struct PhysicalProperties {
                                            const std::vector<PhysicalProperties>& input_props,
                                            Freshness scan_freshness = Freshness::Fresh);
 
+// Is `op` a legal implementation for a join with these equi-keys? A MergeJoin
+// merges two sorted streams ON THE JOIN KEYS, so with no keys there is nothing to
+// merge on and it is not a valid way to compute the (cross) product - regardless
+// of what it would cost. Every other operator is unconditionally applicable.
+[[nodiscard]] bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys);
+
 // What each input of an operator must PROVIDE for that operator to be usable.
 // A MergeJoin needs both inputs sorted on its join keys - the requirement that
 // makes it cheaper than a HashJoin when the order is already there and dearer

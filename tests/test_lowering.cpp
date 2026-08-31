@@ -9,6 +9,7 @@
 #include "db25/physical/lowering.hpp"
 #include "db25/physical/sexpr.hpp"
 #include "db25/physical/spec.hpp"
+#include "db25/physical/properties.hpp"
 #include "db25/physical/storage_catalog.hpp"
 
 #include "db25/ast/node_types.hpp"
@@ -455,8 +456,58 @@ static void test_no_fresh_copy_is_an_honest_failure() {
     CHECK(r.error.find("fresh") != std::string::npos);
 }
 
+// A merge join merges two sorted streams ON THE JOIN KEYS. A keyless (CROSS)
+// join has nothing to merge on, so MergeJoin is not a valid implementation of it
+// - at any cost. This is not something costing can be trusted to settle: with no
+// keys a MergeJoin also requires no sort, so it incurs no enforcement and its
+// cheaper per-row cost WINS. Applicability has to be decided before cost.
+//
+// Regression: the umbrella's physical golden stage caught exactly this on the
+// cross-join and LATERAL fixtures, where the planner had started emitting
+// MergeJoin over a cross product.
+static void test_keyless_join_never_merges() {
+    std::printf("test_keyless_join_never_merges\n");
+    std::string error;
+    auto spec =
+        db25::physical::load_spec(std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr",
+                                  error);
+    CHECK(spec.has_value());
+    if (!spec) return;
+
+    // A CROSS join: no ON condition, hence no equi-keys.
+    auto scan_a = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan_a->table_name = "a";
+    scan_a->output = a_schema();
+    auto scan_b = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan_b->table_name = "b";
+    scan_b->output = b_schema();
+    auto cross = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Join);
+    cross->join_type = db25::ast::JoinType::Cross;
+    cross->output = join_schema();
+    cross->predicate = nullptr;  // no keys
+    cross->add_child(std::move(scan_a));
+    cross->add_child(std::move(scan_b));
+
+    LoweringContext ctx;
+    ctx.spec = &*spec;
+    const LoweringResult r = lower(*cross, ctx);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s2 = physical_to_sexpr(*r.plan);
+    CHECK(contains(s2, "keys=[]"));
+    CHECK(contains(s2, "HashJoin"));
+    CHECK(!contains(s2, "MergeJoin"));  // the whole point
+
+    // And the predicate itself: MergeJoin is inapplicable without keys, applicable
+    // with them; HashJoin is applicable either way.
+    CHECK(!db25::physical::is_applicable(db25::physical::PhysicalOp::MergeJoin, {}));
+    CHECK(db25::physical::is_applicable(db25::physical::PhysicalOp::MergeJoin, {{0, 0}}));
+    CHECK(db25::physical::is_applicable(db25::physical::PhysicalOp::HashJoin, {}));
+}
+
 int main() {
     test_lowers_the_increment0_query();
+    test_keyless_join_never_merges();
     test_freshness_overrides_cost();
     test_no_fresh_copy_is_an_honest_failure();
     test_storage_substrate_is_chosen_by_cost();
