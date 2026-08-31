@@ -24,6 +24,15 @@ std::optional<PhysicalOp> physical_op_from_name(const std::string& name) noexcep
     return std::nullopt;
 }
 
+const char* freshness_to_string(Freshness f) noexcept {
+    switch (f) {
+        case Freshness::Any:   return "any";
+        case Freshness::Fresh: return "fresh";
+        case Freshness::Stale: return "stale";
+    }
+    return "?";
+}
+
 const char* storage_format_to_string(StorageFormat f) noexcept {
     switch (f) {
         case StorageFormat::Any:    return "any";

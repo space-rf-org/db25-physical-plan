@@ -61,6 +61,19 @@ inline constexpr std::array<PhysicalOp, 7> kAllPhysicalOps = {
 enum class StorageFormat : std::uint8_t { Any, Row, Column };
 [[nodiscard]] const char* storage_format_to_string(StorageFormat f) noexcept;
 
+// Whether data reflects all committed writes. Unlike a sort order or a storage
+// format, freshness is a CORRECTNESS constraint, not a preference: a columnar
+// replica that lags cannot answer a query that must see the latest writes, at any
+// price. And no operator can manufacture it - a Sort fixes order and a
+// FormatConvert fixes layout, but nothing turns stale rows into fresh ones. So a
+// subplan that cannot provide the required freshness is DISCARDED, never enforced.
+enum class Freshness : std::uint8_t {
+    Any,    // as a requirement: don't care. Never a derived value.
+    Fresh,  // reflects all committed writes
+    Stale,  // may lag (a replica); can never satisfy a Fresh requirement
+};
+[[nodiscard]] const char* freshness_to_string(Freshness f) noexcept;
+
 // One key of a sort order: a positional column index and its direction.
 struct SortKey {
     std::uint32_t column = 0;
@@ -102,6 +115,7 @@ struct PhysicalNode {
     std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin: equi-join key pairs
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
+    Freshness scan_freshness = Freshness::Fresh;         // SeqScan: does this copy lag?
     StorageFormat target_format = StorageFormat::Any;    // FormatConvert: the format it produces
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}

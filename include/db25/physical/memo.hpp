@@ -33,6 +33,7 @@ struct GroupExpr {
 
     std::string table_name;                // SeqScan
     StorageFormat scan_format = StorageFormat::Row;  // SeqScan: the format read
+    Freshness scan_freshness = Freshness::Fresh;     // SeqScan: does that copy lag?
     const Expr* predicate = nullptr;       // Filter / join residual
     std::vector<const Expr*> projections;  // Project
     std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin
