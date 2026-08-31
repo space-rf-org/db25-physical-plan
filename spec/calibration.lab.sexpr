@@ -7,6 +7,7 @@
 (calibration
   (name lab)
   (scan-row 1.0)
+  (column-scan-row 0.35)
   (filter-row 0.5)
   (project-row 0.3)
   (hash-build-row 1.2)

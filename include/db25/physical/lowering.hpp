@@ -15,6 +15,7 @@
 #include "db25/physical/cost.hpp"
 #include "db25/physical/physical_plan.hpp"
 #include "db25/physical/spec.hpp"
+#include "db25/physical/storage_catalog.hpp"
 
 #include "db25/plan/logical_plan.hpp"
 
@@ -35,6 +36,10 @@ struct LoweringContext {
     const PhysicalSpec* spec = nullptr;
     const CalibrationProfile* calibration = nullptr;
     const CardinalityModel* cardinality = nullptr;
+    // Which storage formats each table is available in. A scan gets one candidate
+    // per available format, so the substrate is chosen by cost like any other
+    // physical decision. Defaults to row-only when not supplied.
+    const StorageCatalog* storage = nullptr;
     const RuntimeProfile* runtime = nullptr;
 };
 

@@ -22,7 +22,10 @@ namespace db25::physical {
 struct CalibrationProfile {
     std::string name = "default";
     // Per-row work.
-    double scan_row = 1.0;        // read one row from a base table
+    double scan_row = 1.0;         // read one row from a ROW-format base table
+    double column_scan_row = 0.35; // read one row from a COLUMN-format base table:
+                                   // a scan touches only the columns it needs, which
+                                   // is the whole reason a columnar substrate exists
     double filter_row = 0.5;      // evaluate a predicate on one input row
     double project_row = 0.3;     // evaluate the projection list on one input row
     double hash_build_row = 1.2;  // insert one build-side row into the hash table
@@ -82,7 +85,8 @@ struct CardinalityModel {
 [[nodiscard]] double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
                                    const std::string& table_name, const CardinalityModel& card);
 [[nodiscard]] double operator_cost(PhysicalOp op, const std::vector<double>& input_rows,
-                                   double out_rows, const CalibrationProfile& cal);
+                                   double out_rows, const CalibrationProfile& cal,
+                                   StorageFormat scan_format = StorageFormat::Row);
 
 // What it would cost to make `rows` rows satisfying `provided` also satisfy
 // `required` - i.e. the enforcers that would have to be inserted. Zero when the

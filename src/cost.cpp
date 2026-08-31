@@ -55,6 +55,7 @@ std::optional<CalibrationProfile> load_lab_calibration(const std::string& path,
     CalibrationProfile cal;
     if (const SNode* n = root.child("name")) cal.name = value_of(*n);
     cal.scan_row = atom_double(root, "scan-row", cal.scan_row);
+    cal.column_scan_row = atom_double(root, "column-scan-row", cal.column_scan_row);
     cal.filter_row = atom_double(root, "filter-row", cal.filter_row);
     cal.project_row = atom_double(root, "project-row", cal.project_row);
     cal.hash_build_row = atom_double(root, "hash-build-row", cal.hash_build_row);
@@ -114,11 +115,14 @@ double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
 }
 
 double operator_cost(PhysicalOp op, const std::vector<double>& input_rows, double out_rows,
-                     const CalibrationProfile& cal) {
+                     const CalibrationProfile& cal, StorageFormat scan_format) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan:
-            return out_rows * cal.scan_row;
+            // The substrate is the cost difference: a columnar read touches only
+            // the columns the query needs.
+            return out_rows * (scan_format == StorageFormat::Column ? cal.column_scan_row
+                                                                    : cal.scan_row);
         case PhysicalOp::Filter:
             return in(0) * cal.filter_row;  // the predicate runs on every INPUT row
         case PhysicalOp::Project:
@@ -172,7 +176,7 @@ double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
         child_cost += cost_of(*c, cal, card);
         input_rows.push_back(card.rows(*c));
     }
-    return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal);
+    return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal, node.scan_format);
 }
 
 }  // namespace db25::physical

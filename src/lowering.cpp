@@ -81,7 +81,8 @@ bool extract_keys(const plan::Expr* e, std::uint32_t left_width, std::vector<Has
 
 GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
                         const CalibrationProfile& cal, const CardinalityModel& card,
-                        std::size_t& candidates, std::string& error) {
+                        const StorageCatalog& storage, std::size_t& candidates,
+                        std::string& error) {
     const std::vector<PhysicalOp> cands = resolve_candidates(n.op, ctx);
     if (cands.empty()) {
         const char* ln = logical_op_name(n.op);
@@ -92,7 +93,8 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
 
     std::vector<GroupId> inputs;
     for (std::size_t i = 0; i < n.child_count(); ++i) {
-        const GroupId g = lower_into_memo(*n.child(i), memo, ctx, cal, card, candidates, error);
+        const GroupId g =
+            lower_into_memo(*n.child(i), memo, ctx, cal, card, storage, candidates, error);
         if (g == kInvalidGroup) return kInvalidGroup;
         inputs.push_back(g);
     }
@@ -144,9 +146,19 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
     double inputs_cost = 0.0;
     for (const GroupId in : inputs) inputs_cost += memo.group(in).best_cost();
 
+    // A scan is available once per storage format the table actually has; every
+    // other operator has a single (irrelevant) format slot. This is what turns the
+    // HTAP substrate into an ordinary costed choice rather than a special case.
+    std::vector<StorageFormat> scan_formats{StorageFormat::Row};
+    if (n.op == plan::LogicalOp::Scan) {
+        scan_formats = storage.formats_for(base.table_name);
+    }
+
     for (const PhysicalOp cand : cands) {
+      for (const StorageFormat fmt : scan_formats) {
         GroupExpr ge = base;
         ge.op = cand;
+        ge.scan_format = fmt;
         // A candidate pays for the enforcers it will cause. Without this a
         // MergeJoin over unsorted inputs would look cheaper than it is, get
         // chosen, and then have Sorts inserted at extraction that nobody costed.
@@ -157,9 +169,11 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
             enforce_cost += enforcement_cost(memo.group(inputs[i]).provided, reqs[i],
                                              input_rows[i], cal);
         }
-        ge.cost = inputs_cost + enforce_cost + operator_cost(cand, input_rows, out_rows, cal);
+        ge.cost = inputs_cost + enforce_cost +
+                  operator_cost(cand, input_rows, out_rows, cal, fmt);
         memo.add_expr(g, std::move(ge));
         ++candidates;
+      }
     }
     memo.select_cheapest(g);  // the cost-based choice
 
@@ -182,9 +196,10 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
         ctx.calibration != nullptr ? *ctx.calibration : default_calibration();
     const CardinalityModel card =
         ctx.cardinality != nullptr ? *ctx.cardinality : CardinalityModel{};
+    const StorageCatalog storage = ctx.storage != nullptr ? *ctx.storage : StorageCatalog{};
 
     Memo memo;
-    const GroupId root_group = lower_into_memo(root, memo, ctx, cal, card,
+    const GroupId root_group = lower_into_memo(root, memo, ctx, cal, card, storage,
                                                result.candidates_considered, result.error);
     if (root_group == kInvalidGroup) {
         return result;  // ok stays false, error set
