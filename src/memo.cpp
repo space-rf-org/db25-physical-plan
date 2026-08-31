@@ -64,6 +64,7 @@ PhysicalNodePtr Memo::extract_winner(GroupId id) const {
     node->scan_format = ge.scan_format;
     node->scan_freshness = ge.scan_freshness;
     node->predicate = ge.predicate;
+    node->residual = ge.residual;
     node->projections = ge.projections;
     node->hash_keys = ge.hash_keys;
 

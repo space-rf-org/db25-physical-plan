@@ -110,7 +110,13 @@ struct PhysicalNode {
 
     // --- op-specific payload (union-by-convention on `op`) ---
     std::string table_name;                // SeqScan: the base table
-    const Expr* predicate = nullptr;       // Filter: predicate; HashJoin: optional residual
+    const Expr* predicate = nullptr;       // Filter: the predicate
+    // Join: the conjuncts that are NOT equi-keys and must be re-checked on each
+    // candidate row. A LIST, not one expression, because key extraction is
+    // per-conjunct: `a.k = b.k AND a.d < b.d` yields one key and one residual,
+    // and there is no owning place to synthesize a combined expression (payloads
+    // are borrowed from the logical plan).
+    std::vector<const Expr*> residual;
     std::vector<const Expr*> projections;  // Project: one borrowed expr per output column
     std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin: equi-join key pairs
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
@@ -128,10 +134,10 @@ struct PhysicalNode {
                                            std::vector<const Expr*> projections);
 [[nodiscard]] PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                              std::vector<HashKey> keys, Schema output,
-                                             const Expr* residual = nullptr);
+                                             std::vector<const Expr*> residual = {});
 [[nodiscard]] PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                               std::vector<HashKey> keys, Schema output,
-                                              const Expr* residual = nullptr);
+                                              std::vector<const Expr*> residual = {});
 // Enforcers.
 [[nodiscard]] PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys);
 [[nodiscard]] PhysicalNodePtr make_format_convert(PhysicalNodePtr input, StorageFormat target);

@@ -55,17 +55,27 @@ std::vector<PhysicalOp> resolve_candidates(plan::LogicalOp op, const LoweringCon
     return out;
 }
 
-// Decompose an equi-join predicate into hash keys. Returns true only if the whole
-// predicate is a conjunction of cross-side column equalities (so no residual is
-// needed); on anything else it returns false and leaves `keys` for the caller to
-// discard. `left_width` is the number of columns on the join's left input, so a
-// right-side column index is offset back into the right input's own schema.
-bool extract_keys(const plan::Expr* e, std::uint32_t left_width, std::vector<HashKey>& keys) {
-    if (e == nullptr) return false;
+// Split a join predicate into equi-join keys and the residual conjuncts that are
+// not keys. PER CONJUNCT, deliberately: an all-or-nothing walk (one non-equi
+// conjunct discarding every key already found) turns the ordinary shape
+// `a.k = b.k AND a.d < b.d` into a KEYLESS join - a cross product with a filter,
+// quadratic where it should be linear, and with MergeJoin made inapplicable
+// because it has no keys left to merge on.
+//
+// `left_width` is the number of columns on the join's left input, so a right-side
+// column index is offset back into the right input's own schema. Anything that is
+// not a cross-side column equality - including a same-side equality, which
+// constrains one input rather than relating the two - stays in `residual` and is
+// re-checked per candidate row.
+void split_join_predicate(const plan::Expr* e, std::uint32_t left_width,
+                          std::vector<HashKey>& keys, std::vector<const plan::Expr*>& residual) {
+    if (e == nullptr) return;
     if (e->kind == plan::ExprKind::BinaryOp && e->bin_op == ast::BinaryOp::And) {
         const plan::Expr* l = e->children.size() > 0 ? e->children[0].get() : nullptr;
         const plan::Expr* r = e->children.size() > 1 ? e->children[1].get() : nullptr;
-        return extract_keys(l, left_width, keys) && extract_keys(r, left_width, keys);
+        split_join_predicate(l, left_width, keys, residual);
+        split_join_predicate(r, left_width, keys, residual);
+        return;
     }
     if (e->kind == plan::ExprKind::BinaryOp && e->bin_op == ast::BinaryOp::Equal &&
         e->children.size() == 2 &&
@@ -73,10 +83,10 @@ bool extract_keys(const plan::Expr* e, std::uint32_t left_width, std::vector<Has
         e->children[1]->kind == plan::ExprKind::ColumnRef) {
         const std::uint32_t i = e->children[0]->input_index;
         const std::uint32_t j = e->children[1]->input_index;
-        if (i < left_width && j >= left_width) { keys.push_back({i, j - left_width}); return true; }
-        if (j < left_width && i >= left_width) { keys.push_back({j, i - left_width}); return true; }
+        if (i < left_width && j >= left_width) { keys.push_back({i, j - left_width}); return; }
+        if (j < left_width && i >= left_width) { keys.push_back({j, i - left_width}); return; }
     }
-    return false;
+    residual.push_back(e);
 }
 
 GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
@@ -116,14 +126,9 @@ GroupId lower_into_memo(const plan::LogicalNode& n, Memo& memo, const LoweringCo
         case plan::LogicalOp::Join: {
             const std::uint32_t left_width =
                 n.child(0) != nullptr ? static_cast<std::uint32_t>(n.child(0)->output.size()) : 0;
-            std::vector<HashKey> keys;
-            const plan::Expr* pred = n.predicate.get();
-            const bool clean = (pred == nullptr) ? true : extract_keys(pred, left_width, keys);
-            if (clean) {
-                base.hash_keys = std::move(keys);  // pure equi-join (or CROSS: no keys)
-            } else {
-                base.predicate = pred;  // keep the whole predicate as a residual
-            }
+            // Keys and residual are independent outputs: a join may have both
+            // (an equi-key plus an extra condition), either, or neither (CROSS).
+            split_join_predicate(n.predicate.get(), left_width, base.hash_keys, base.residual);
             break;
         }
         default:
