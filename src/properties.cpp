@@ -75,6 +75,17 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
 std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
                                                           const std::vector<HashKey>& keys) {
     std::vector<PhysicalProperties> reqs(expected_arity(op));
+
+    // The reference engine's join operators consume ROW-format input (they
+    // materialize rows into a hash table or merge row streams), so a columnar
+    // subplan feeding a join must be converted - and that conversion is priced,
+    // which is what makes the substrate choice a real trade rather than "columnar
+    // is always cheaper". A vectorized columnar join is a later operator; when it
+    // arrives it simply declares a different requirement here.
+    if (op == PhysicalOp::HashJoin || op == PhysicalOp::MergeJoin) {
+        for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
+    }
+
     if (op == PhysicalOp::MergeJoin) {
         PhysicalProperties left, right;
         left.sort.reserve(keys.size());
@@ -83,6 +94,8 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
             left.sort.push_back(SortKey{k.left_index, false});
             right.sort.push_back(SortKey{k.right_index, false});
         }
+        left.format = StorageFormat::Row;
+        right.format = StorageFormat::Row;
         if (reqs.size() == 2) { reqs[0] = std::move(left); reqs[1] = std::move(right); }
     }
     return reqs;  // every other operator: no requirement on its inputs

@@ -9,6 +9,7 @@
 #include "db25/physical/lowering.hpp"
 #include "db25/physical/sexpr.hpp"
 #include "db25/physical/spec.hpp"
+#include "db25/physical/storage_catalog.hpp"
 
 #include "db25/ast/node_types.hpp"
 #include "db25/plan/expr_ir.hpp"
@@ -281,8 +282,105 @@ static void test_join_algorithm_is_chosen_by_cost() {
     }
 }
 
+// The HTAP substrate as an ordinary costed choice. A table available in both
+// formats gives the scan one candidate per format; nothing above a scan-and-
+// filter pipeline requires a particular format, so the cheaper columnar read
+// simply wins - and with a row-only catalog (the default) nothing changes.
+static void test_storage_substrate_is_chosen_by_cost() {
+    std::printf("test_storage_substrate_is_chosen_by_cost\n");
+
+    const auto make_pipeline = []() {
+        auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+        scan->table_name = "a";
+        scan->output = a_schema();
+        auto filt = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Filter);
+        filt->output = a_schema();
+        filt->predicate = binop(BinaryOp::GreaterThan, col(1, DataType::Integer), int_lit(10));
+        filt->add_child(std::move(scan));
+        return filt;
+    };
+
+    // NOTE: each logical plan is held in a named local. The physical plan BORROWS
+    // its expression payloads, so the logical plan must outlive it - lowering a
+    // temporary would leave those borrows dangling.
+    const auto p_row = make_pipeline();
+    const LoweringResult row_only = lower(*p_row);
+    CHECK(row_only.ok);
+    if (row_only.plan) {
+        const std::string s = physical_to_sexpr(*row_only.plan);
+        CHECK(contains(s, "fmt=row"));
+        CHECK(!contains(s, "fmt=column"));
+    }
+
+    // Available in both: the columnar read is cheaper and nothing here needs rows.
+    db25::physical::StorageCatalog dual;
+    dual.formats["a"] = {db25::physical::StorageFormat::Row,
+                         db25::physical::StorageFormat::Column};
+    LoweringContext ctx;
+    ctx.storage = &dual;
+    const auto p_both = make_pipeline();
+    const LoweringResult both = lower(*p_both, ctx);
+    CHECK(both.ok);
+    CHECK(both.candidates_considered == 3);  // 2 scan formats + 1 filter
+    if (both.plan) {
+        const std::string s = physical_to_sexpr(*both.plan);
+        CHECK(contains(s, "fmt=column"));
+        CHECK(!contains(s, "FormatConvert"));  // nothing required a conversion
+    }
+
+    // Make the columnar read the expensive one: the choice must follow the cost.
+    db25::physical::CalibrationProfile dear_column = db25::physical::default_calibration();
+    dear_column.column_scan_row = 10.0;
+    ctx.calibration = &dear_column;
+    const auto p_flip = make_pipeline();
+    const LoweringResult flipped = lower(*p_flip, ctx);
+    CHECK(flipped.ok);
+    if (flipped.plan) CHECK(contains(physical_to_sexpr(*flipped.plan), "fmt=row"));
+}
+
+// A join consumes row-format input, so a columnar scan feeding one must be
+// converted - and that conversion is PRICED, which is what stops "columnar is
+// always cheaper" from being the answer.
+//
+// This also pins a known LIMITATION rather than hiding it: each group commits to
+// a single winner chosen bottom-up, so the scan takes the locally-cheaper
+// columnar format without knowing the join above will demand rows. When the
+// conversion is dear enough that a row scan would have been globally better, this
+// bottom-up choice cannot see it. Lifting that needs a winner per required-
+// property set (property-directed group optimization, Increment 2). The assertion
+// here is therefore about the MECHANISM - the requirement is enforced and paid
+// for - not about global optimality, which this increment does not yet claim.
+static void test_join_requires_rows_and_conversion_is_priced() {
+    std::printf("test_join_requires_rows_and_conversion_is_priced\n");
+    db25::physical::StorageCatalog dual;
+    dual.formats["a"] = {db25::physical::StorageFormat::Row,
+                         db25::physical::StorageFormat::Column};
+    dual.formats["b"] = {db25::physical::StorageFormat::Row,
+                         db25::physical::StorageFormat::Column};
+    LoweringContext ctx;
+    ctx.storage = &dual;
+
+    auto logical = build_logical();
+    const LoweringResult r = lower(*logical, ctx);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    // The join's row requirement was enforced on the columnar inputs.
+    CHECK(contains(s, "fmt=column"));
+    CHECK(contains(s, "FormatConvert to=row"));
+
+    // And the requirement is real: a join always ends up fed row-format input.
+    const auto reqs = db25::physical::required_input_properties(
+        db25::physical::PhysicalOp::HashJoin, {{0, 0}});
+    CHECK(reqs.size() == 2);
+    CHECK(reqs[0].format == db25::physical::StorageFormat::Row);
+    CHECK(reqs[1].format == db25::physical::StorageFormat::Row);
+}
+
 int main() {
     test_lowers_the_increment0_query();
+    test_storage_substrate_is_chosen_by_cost();
+    test_join_requires_rows_and_conversion_is_priced();
     test_join_algorithm_is_chosen_by_cost();
     test_cost_chooses_between_candidates();
     test_spec_rules_and_builtin_agree();
