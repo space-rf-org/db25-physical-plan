@@ -1,0 +1,76 @@
+name: CI
+
+# Build and test the DB25 physical planner. It consumes db25-logical-plan (and
+# transitively the analyzer, parser, and tokenizer) as a recursive git submodule,
+# so every job checks out with submodules: recursive and builds the whole stack
+# with the supported toolchain (GCC 14).
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: build & gate (g++-14, ${{ matrix.build_type }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - name: Checkout (recursive)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install g++-14
+        run: |
+          if command -v g++-14 >/dev/null 2>&1; then
+            echo "g++-14 already present: $(g++-14 --version | head -1)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y g++-14
+          fi
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=g++-14
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: ASan + UBSan (g++-14)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (recursive)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install g++-14
+        run: |
+          if command -v g++-14 >/dev/null 2>&1; then
+            echo "g++-14 already present: $(g++-14 --version | head -1)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y g++-14
+          fi
+
+      - name: Configure (asan+ubsan)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build (asan+ubsan)
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test (asan+ubsan)
+        run: ctest --test-dir build --output-on-failure

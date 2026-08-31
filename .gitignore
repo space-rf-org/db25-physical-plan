@@ -1,0 +1,7 @@
+# Build trees
+/build*/
+build*/
+
+# Editor / OS cruft
+*.swp
+.DS_Store
