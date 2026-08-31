@@ -50,9 +50,10 @@ struct PhysicalSpec {
     CapabilityProfile profile;
 
     [[nodiscard]] const OperatorSpec* find_operator(const std::string& name) const;
-    // The physical operator name a logical operator lowers to, or empty if the
-    // spec has no rule for it.
-    [[nodiscard]] std::string physical_for_logical(const std::string& logical) const;
+    // Every physical operator a logical operator may lower to, in spec order.
+    // More than one makes the choice cost-based: the planner enumerates them all
+    // as candidates and the memo keeps the cheapest.
+    [[nodiscard]] std::vector<std::string> physicals_for_logical(const std::string& logical) const;
 };
 
 // Parse a spec from s-expression text. Returns the spec on success; on a parse

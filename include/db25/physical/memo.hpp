@@ -43,6 +43,11 @@ struct GroupExpr {
 struct Group {
     GroupId id = kInvalidGroup;
     Schema output;
+    // Estimated output rows of this group. Every group-expression in a group is
+    // semantically equivalent, so they all produce the same cardinality - it is a
+    // property of the GROUP, and costing a parent reads it from its input groups
+    // rather than re-deriving it down the tree.
+    double rows = 0.0;
     std::vector<GroupExpr> exprs;
     std::optional<std::uint32_t> winner;  // index into `exprs`, set by costing
 
@@ -62,6 +67,14 @@ public:
 
     // Mark the winning group-expression of a group (an index into its `exprs`).
     void set_winner(GroupId group, std::uint32_t expr_index);
+
+    // Record a group's estimated output cardinality.
+    void set_rows(GroupId group, double rows);
+
+    // Choose the lowest-cost group-expression as the winner. Returns false if the
+    // group has no expressions. This is the cost-based choice the memo exists to
+    // make; with a single candidate it degenerates to that candidate.
+    bool select_cheapest(GroupId group);
 
     [[nodiscard]] const Group& group(GroupId id) const { return groups_[id]; }
     [[nodiscard]] Group& group(GroupId id) { return groups_[id]; }

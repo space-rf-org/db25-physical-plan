@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace db25::physical {
 
@@ -68,6 +69,18 @@ struct CardinalityModel {
     // Estimated output rows of the plan rooted at `node`.
     [[nodiscard]] double rows(const PhysicalNode& node) const;
 };
+
+// ---- representation-independent per-operator formulas ---------------------
+// The single place each operator's cardinality and local cost are defined. Both
+// the tree form below and the memo form (a group-expression, whose inputs are
+// GROUPS rather than nodes) go through these, so a plan is costed identically
+// however it is currently represented - the "one cost model" invariant (D3) made
+// structural rather than merely intended. `input_rows` are the estimated output
+// rows of each input, in operand order.
+[[nodiscard]] double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
+                                   const std::string& table_name, const CardinalityModel& card);
+[[nodiscard]] double operator_cost(PhysicalOp op, const std::vector<double>& input_rows,
+                                   double out_rows, const CalibrationProfile& cal);
 
 // Estimated cost of the plan rooted at `node`, computed bottom-up from the
 // calibration coefficients and the cardinality model. Deterministic given its

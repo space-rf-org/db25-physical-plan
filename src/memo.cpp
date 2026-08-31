@@ -24,6 +24,21 @@ void Memo::set_winner(GroupId group, std::uint32_t expr_index) {
     groups_[group].winner = expr_index;
 }
 
+void Memo::set_rows(GroupId group, double rows) {
+    groups_[group].rows = rows;
+}
+
+bool Memo::select_cheapest(GroupId group) {
+    Group& g = groups_[group];
+    if (g.exprs.empty()) return false;
+    std::uint32_t best = 0;
+    for (std::uint32_t i = 1; i < g.exprs.size(); ++i) {
+        if (g.exprs[i].cost < g.exprs[best].cost) best = i;
+    }
+    g.winner = best;
+    return true;
+}
+
 PhysicalNodePtr Memo::extract_winner(GroupId id) const {
     if (id == kInvalidGroup) {
         id = root_;
