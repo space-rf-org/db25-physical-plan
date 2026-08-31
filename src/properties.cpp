@@ -89,6 +89,15 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
     return PhysicalProperties{};
 }
 
+bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys) {
+    // A merge join has nothing to merge on without keys. Note this cannot be left
+    // to costing: with no keys it also requires no sort, so it would incur no
+    // enforcement and its cheaper per-row cost would WIN - producing a merge join
+    // over a cross product. Applicability has to be decided before cost.
+    if (op == PhysicalOp::MergeJoin) return !keys.empty();
+    return true;
+}
+
 std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
                                                           const std::vector<HashKey>& keys) {
     std::vector<PhysicalProperties> reqs(expected_arity(op));
