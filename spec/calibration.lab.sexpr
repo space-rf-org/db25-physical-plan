@@ -11,5 +11,7 @@
   (project-row 0.3)
   (hash-build-row 1.2)
   (hash-probe-row 0.8)
+  (sort-row 1.0)
+  (convert-row 0.6)
   (simd-width 8)
   (cache-line 64))

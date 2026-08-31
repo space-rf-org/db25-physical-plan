@@ -25,12 +25,16 @@ using plan::ColumnSchema;
 using plan::Expr;
 using plan::Schema;
 
-// The physical operators of Increment 0.
+// The physical operators of Increment 0. Sort and FormatConvert are ENFORCERS:
+// operators inserted purely to establish a required physical property (a sort
+// order, a storage format) that a subplan does not already provide.
 enum class PhysicalOp : std::uint8_t {
-    SeqScan,   // base-table sequential scan (an access path)
-    Filter,    // predicate filter
-    Project,   // projection to named output columns
-    HashJoin,  // hash join (the one join algorithm of Increment 0)
+    SeqScan,        // base-table sequential scan (an access path)
+    Filter,         // predicate filter
+    Project,        // projection to named output columns
+    HashJoin,       // hash join (the one join algorithm of Increment 0)
+    Sort,           // enforcer: establishes a required sort order
+    FormatConvert,  // enforcer: converts the storage format (row <-> column)
 };
 
 [[nodiscard]] const char* physical_op_to_string(PhysicalOp op) noexcept;
@@ -38,8 +42,21 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 4> kAllPhysicalOps = {
-    PhysicalOp::SeqScan, PhysicalOp::Filter, PhysicalOp::Project, PhysicalOp::HashJoin};
+inline constexpr std::array<PhysicalOp, 6> kAllPhysicalOps = {
+    PhysicalOp::SeqScan, PhysicalOp::Filter,        PhysicalOp::Project,
+    PhysicalOp::HashJoin, PhysicalOp::Sort,         PhysicalOp::FormatConvert};
+
+// The storage format of a relation's rows - the HTAP substrate a subplan reads
+// from or produces in. `Any` means "no requirement" (a required property) or
+// "unconstrained" (never a derived property).
+enum class StorageFormat : std::uint8_t { Any, Row, Column };
+[[nodiscard]] const char* storage_format_to_string(StorageFormat f) noexcept;
+
+// One key of a sort order: a positional column index and its direction.
+struct SortKey {
+    std::uint32_t column = 0;
+    bool descending = false;
+};
 
 // The input arity the IR expects of each operator (a SeqScan is a leaf; a Filter
 // / Project has one input; a HashJoin has two). The spec declares its own arity;
@@ -74,6 +91,9 @@ struct PhysicalNode {
     const Expr* predicate = nullptr;       // Filter: predicate; HashJoin: optional residual
     std::vector<const Expr*> projections;  // Project: one borrowed expr per output column
     std::vector<HashKey> hash_keys;        // HashJoin: equi-join key pairs
+    std::vector<SortKey> sort_keys;        // Sort: the order it establishes
+    StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
+    StorageFormat target_format = StorageFormat::Any;    // FormatConvert: the format it produces
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}
 };
@@ -86,5 +106,8 @@ struct PhysicalNode {
 [[nodiscard]] PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                              std::vector<HashKey> keys, Schema output,
                                              const Expr* residual = nullptr);
+// Enforcers.
+[[nodiscard]] PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys);
+[[nodiscard]] PhysicalNodePtr make_format_convert(PhysicalNodePtr input, StorageFormat target);
 
 }  // namespace db25::physical
