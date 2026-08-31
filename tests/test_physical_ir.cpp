@@ -85,6 +85,23 @@ private:
     }
 };
 
+// Build a group-expression by field. Positional aggregate initialisation breaks
+// silently whenever GroupExpr gains a member, so name what we set.
+static GroupExpr group_expr(PhysicalOp op, std::vector<GroupId> inputs,
+                            std::string table = {}, const Expr* pred = nullptr,
+                            std::vector<const Expr*> projections = {},
+                            std::vector<HashKey> keys = {}) {
+    GroupExpr ge;
+    ge.op = op;
+    ge.inputs = std::move(inputs);
+    ge.table_name = std::move(table);
+    ge.predicate = pred;
+    ge.projections = std::move(projections);
+    ge.hash_keys = std::move(keys);
+    ge.cost = 0.0;
+    return ge;
+}
+
 static Schema a_schema() {
     return {{"id", DataType::Integer, false}, {"x", DataType::Integer, true}};
 }
@@ -150,26 +167,23 @@ static void test_memo_extracts_to_same_render() {
     // Same shape, built through the memo.
     Memo m;
     const GroupId g_a = m.add_group(a_schema());
-    m.add_expr(g_a, GroupExpr{PhysicalOp::SeqScan, {}, "a", nullptr, {}, {}, 0.0});
+    m.add_expr(g_a, group_expr(PhysicalOp::SeqScan, {}, "a"));
     m.set_winner(g_a, 0);
 
     const GroupId g_b = m.add_group(b_schema());
-    m.add_expr(g_b, GroupExpr{PhysicalOp::SeqScan, {}, "b", nullptr, {}, {}, 0.0});
+    m.add_expr(g_b, group_expr(PhysicalOp::SeqScan, {}, "b"));
     m.set_winner(g_b, 0);
 
     const GroupId g_join = m.add_group(join_schema());
-    m.add_expr(g_join,
-               GroupExpr{PhysicalOp::HashJoin, {g_a, g_b}, "", nullptr, {}, {{0, 0}}, 0.0});
+    m.add_expr(g_join, group_expr(PhysicalOp::HashJoin, {g_a, g_b}, "", nullptr, {}, {{0, 0}}));
     m.set_winner(g_join, 0);
 
     const GroupId g_filter = m.add_group(join_schema());
-    m.add_expr(g_filter,
-               GroupExpr{PhysicalOp::Filter, {g_join}, "", pred, {}, {}, 0.0});
+    m.add_expr(g_filter, group_expr(PhysicalOp::Filter, {g_join}, "", pred));
     m.set_winner(g_filter, 0);
 
     const GroupId g_proj = m.add_group(proj_schema());
-    m.add_expr(g_proj,
-               GroupExpr{PhysicalOp::Project, {g_filter}, "", nullptr, {px, py}, {}, 0.0});
+    m.add_expr(g_proj, group_expr(PhysicalOp::Project, {g_filter}, "", nullptr, {px, py}));
     m.set_winner(g_proj, 0);
     m.set_root(g_proj);
 
@@ -186,7 +200,7 @@ static void test_extract_without_winner_fails() {
     std::printf("test_extract_without_winner_fails\n");
     Memo m;
     const GroupId g = m.add_group(a_schema());
-    m.add_expr(g, GroupExpr{PhysicalOp::SeqScan, {}, "a", nullptr, {}, {}, 0.0});
+    m.add_expr(g, group_expr(PhysicalOp::SeqScan, {}, "a"));
     // No winner set.
     m.set_root(g);
     CHECK(m.extract_winner() == nullptr);

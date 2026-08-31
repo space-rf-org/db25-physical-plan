@@ -235,8 +235,55 @@ static void test_cost_chooses_between_candidates() {
     if (when_flipped.plan) CHECK(when_flipped.plan->op == PhysicalOp::FormatConvert);
 }
 
+// The first REAL algorithm choice: HashJoin vs MergeJoin. MergeJoin is cheaper
+// per row but needs both inputs sorted on the join keys; HashJoin needs nothing.
+// So the decision turns on whether the Sorts MergeJoin would cause are worth its
+// cheaper merge - which is precisely what enforcement_cost charges it for. Both
+// directions are checked: whichever way the calibration leans, the planner must
+// follow it, and when MergeJoin wins the Sorts it requires must actually be in
+// the plan that comes out (the plan built is the plan that was costed).
+static void test_join_algorithm_is_chosen_by_cost() {
+    std::printf("test_join_algorithm_is_chosen_by_cost\n");
+    std::string error;
+    auto spec =
+        db25::physical::load_spec(std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr",
+                                  error);
+    CHECK(spec.has_value());
+    if (!spec) { std::printf("  spec load error: %s\n", error.c_str()); return; }
+    CHECK(spec->physicals_for_logical("Join").size() == 2);  // HashJoin + MergeJoin
+
+    auto logical = build_logical();
+    LoweringContext ctx;
+    ctx.spec = &*spec;
+
+    // Sorting is expensive by default, so a MergeJoin would have to pay for two
+    // Sorts its inputs do not provide. The HashJoin wins.
+    const LoweringResult hashed = lower(*logical, ctx);
+    CHECK(hashed.ok);
+    if (hashed.plan) {
+        const std::string s = physical_to_sexpr(*hashed.plan);
+        CHECK(contains(s, "HashJoin"));
+        CHECK(!contains(s, "MergeJoin"));
+        CHECK(!contains(s, "(Sort by="));  // nothing needed enforcing
+    }
+
+    // Make sorting free: the merge's cheaper per-row cost is no longer outweighed
+    // by the enforcement it causes, so it wins - and the Sorts must appear.
+    db25::physical::CalibrationProfile free_sort = db25::physical::default_calibration();
+    free_sort.sort_row = 0.0;
+    ctx.calibration = &free_sort;
+    const LoweringResult merged = lower(*logical, ctx);
+    CHECK(merged.ok);
+    if (merged.plan) {
+        const std::string s = physical_to_sexpr(*merged.plan);
+        CHECK(contains(s, "MergeJoin"));
+        CHECK(contains(s, "(Sort by="));  // the enforcers its requirement caused
+    }
+}
+
 int main() {
     test_lowers_the_increment0_query();
+    test_join_algorithm_is_chosen_by_cost();
     test_cost_chooses_between_candidates();
     test_spec_rules_and_builtin_agree();
     test_non_equi_join_keeps_residual();

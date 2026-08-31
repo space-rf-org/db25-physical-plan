@@ -10,6 +10,7 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::Filter:        return "Filter";
         case PhysicalOp::Project:       return "Project";
         case PhysicalOp::HashJoin:      return "HashJoin";
+        case PhysicalOp::MergeJoin:     return "MergeJoin";
         case PhysicalOp::Sort:          return "Sort";
         case PhysicalOp::FormatConvert: return "FormatConvert";
     }
@@ -38,6 +39,7 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::Filter:        return 1;
         case PhysicalOp::Project:       return 1;
         case PhysicalOp::HashJoin:      return 2;
+        case PhysicalOp::MergeJoin:     return 2;
         case PhysicalOp::Sort:          return 1;
         case PhysicalOp::FormatConvert: return 1;
     }
@@ -73,6 +75,18 @@ PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                std::vector<HashKey> keys, Schema output,
                                const Expr* residual) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::HashJoin);
+    n->hash_keys = std::move(keys);
+    n->predicate = residual;
+    n->output = std::move(output);
+    n->children.push_back(std::move(left));
+    n->children.push_back(std::move(right));
+    return n;
+}
+
+PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
+                                std::vector<HashKey> keys, Schema output,
+                                const Expr* residual) {
+    auto n = std::make_unique<PhysicalNode>(PhysicalOp::MergeJoin);
     n->hash_keys = std::move(keys);
     n->predicate = residual;
     n->output = std::move(output);

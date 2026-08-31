@@ -151,8 +151,37 @@ static void test_enforcers_render() {
     CHECK(contains(s, "fmt=row"));  // the underlying scan's storage format
 }
 
+// MergeJoin is the first operator with a real REQUIREMENT on its inputs, and the
+// first join that gives an order back. Both halves matter: the requirement is
+// what enforcement costs, the derivation is what can save a later Sort.
+static void test_mergejoin_requires_and_derives_order() {
+    std::printf("test_mergejoin_requires_and_derives_order\n");
+    const std::vector<HashKey> keys = {{0, 1}};
+
+    // Requires: left sorted on its key column, right sorted on its own.
+    const auto reqs = required_input_properties(PhysicalOp::MergeJoin, keys);
+    CHECK(reqs.size() == 2);
+    CHECK(reqs[0].sort.size() == 1);
+    CHECK(reqs[1].sort.size() == 1);
+    if (reqs[0].sort.size() == 1) CHECK(reqs[0].sort[0].column == 0);
+    if (reqs[1].sort.size() == 1) CHECK(reqs[1].sort[0].column == 1);
+
+    // A HashJoin asks nothing of its inputs - that is its whole advantage.
+    const auto none = required_input_properties(PhysicalOp::HashJoin, keys);
+    CHECK(none.size() == 2);
+    CHECK(none[0].sort.empty());
+    CHECK(none[1].sort.empty());
+
+    // Derives: MergeJoin keeps the key order on its output; HashJoin does not.
+    auto mj = make_merge_join(make_seq_scan("a", {}), make_seq_scan("b", {}), keys, {});
+    CHECK(derive(*mj).sort.size() == 1);
+    auto hj = make_hash_join(make_seq_scan("a", {}), make_seq_scan("b", {}), keys, {});
+    CHECK(derive(*hj).sort.empty());
+}
+
 int main() {
     test_derive();
+    test_mergejoin_requires_and_derives_order();
     test_satisfies();
     test_enforce_inserts_minimal_enforcers();
     test_enforce_is_noop_when_satisfied();

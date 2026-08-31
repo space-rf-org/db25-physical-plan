@@ -42,7 +42,7 @@ static void test_shipped_spec_loads_and_conforms() {
         return;
     }
     CHECK(spec->version == 0);
-    CHECK(spec->operators.size() == 6);  // SeqScan Filter Project HashJoin Sort FormatConvert
+    CHECK(spec->operators.size() == 7);  // + MergeJoin
     CHECK(spec->profile.name == "reference");
 
     const auto problems = check_conformance(*spec);
@@ -92,6 +92,9 @@ static void test_arity_mismatch_is_reported() {
 
 static void test_phantom_operator_is_reported() {
     std::printf("test_phantom_operator_is_reported\n");
+    // A deliberately fictional name: this case previously used MergeJoin, which
+    // Unit 1.2 made real - at which point conformance rightly stopped flagging it
+    // and this test failed. Use a name no increment will ever implement.
     const std::string text =
         "(physical-spec (version 0)"
         "  (operators"
@@ -99,15 +102,15 @@ static void test_phantom_operator_is_reported() {
         "    (operator (name Filter)   (arity 1) (kind pipeline))"
         "    (operator (name Project)  (arity 1) (kind pipeline))"
         "    (operator (name HashJoin) (arity 2) (kind pipeline-breaker))"
-        "    (operator (name MergeJoin)(arity 2) (kind pipeline-breaker)))"
+        "    (operator (name PhantomScan)(arity 0) (kind access-path)))"
         "  (capability-profile (name reference)"
-        "    (executes SeqScan Filter Project HashJoin MergeJoin)))";
+        "    (executes SeqScan Filter Project HashJoin PhantomScan)))";
     std::string error;
     auto spec = parse_spec(text, error);
     CHECK(spec.has_value());
     if (!spec) return;
     const auto problems = check_conformance(*spec);
-    CHECK(any_contains(problems, "MergeJoin"));
+    CHECK(any_contains(problems, "PhantomScan"));
 }
 
 static void test_not_executable_is_reported() {

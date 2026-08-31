@@ -32,38 +32,72 @@ bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& req
     return sort_prefix(provided.sort, required.sort);
 }
 
-PhysicalProperties derive(const PhysicalNode& node) {
-    switch (node.op) {
+PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
+                             StorageFormat scan_format,
+                             const std::vector<PhysicalProperties>& input_props) {
+    const auto in = [&](std::size_t i) {
+        return i < input_props.size() ? input_props[i] : PhysicalProperties{};
+    };
+    switch (op) {
         case PhysicalOp::SeqScan:
             // A base scan produces the table's stored format, in no guaranteed order.
-            return PhysicalProperties{{}, node.scan_format};
+            return PhysicalProperties{{}, scan_format};
         case PhysicalOp::Filter:
-            // A filter drops rows but preserves order and format.
-            return child0(node) ? derive(*child0(node)) : PhysicalProperties{};
         case PhysicalOp::Project:
-            // Increment 0 conservatively preserves the child's order and format
-            // (a later increment tracks whether the projection keeps the sort
-            // columns / changes the format).
-            return child0(node) ? derive(*child0(node)) : PhysicalProperties{};
+            // Both drop or reshape columns but preserve order and format. (Project
+            // preserves conservatively in Increment 1; a later increment tracks
+            // whether the projection actually keeps the sort columns.)
+            return in(0);
         case PhysicalOp::HashJoin:
-            // A hash join materializes rows in no guaranteed order, row format.
+            // Builds a hash table: output order is not guaranteed.
             return PhysicalProperties{{}, StorageFormat::Row};
-        case PhysicalOp::Sort: {
-            // Establishes its order; preserves the child's format.
+        case PhysicalOp::MergeJoin: {
+            // Consumes both inputs in key order and emits in that same order, so
+            // the join keys' order survives - the property that can save a later
+            // Sort and is exactly why it may win over a HashJoin.
             PhysicalProperties p;
-            p.sort = node.sort_keys;
-            p.format = child0(node) ? derive(*child0(node)).format : StorageFormat::Any;
+            p.sort.reserve(keys.size());
+            for (const HashKey& k : keys) p.sort.push_back(SortKey{k.left_index, false});
+            p.format = StorageFormat::Row;
             return p;
         }
-        case PhysicalOp::FormatConvert: {
-            // Changes the format to its target; preserves the child's order.
-            PhysicalProperties p;
-            p.sort = child0(node) ? derive(*child0(node)).sort : std::vector<SortKey>{};
-            p.format = node.target_format;
-            return p;
-        }
+        case PhysicalOp::Sort:
+            // Establishes its order (filled in by the caller from sort_keys);
+            // preserves the child's format.
+            return PhysicalProperties{{}, in(0).format};
+        case PhysicalOp::FormatConvert:
+            // Changes the format to its target (filled in by the caller); preserves order.
+            return PhysicalProperties{in(0).sort, StorageFormat::Any};
     }
     return PhysicalProperties{};
+}
+
+std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
+                                                          const std::vector<HashKey>& keys) {
+    std::vector<PhysicalProperties> reqs(expected_arity(op));
+    if (op == PhysicalOp::MergeJoin) {
+        PhysicalProperties left, right;
+        left.sort.reserve(keys.size());
+        right.sort.reserve(keys.size());
+        for (const HashKey& k : keys) {
+            left.sort.push_back(SortKey{k.left_index, false});
+            right.sort.push_back(SortKey{k.right_index, false});
+        }
+        if (reqs.size() == 2) { reqs[0] = std::move(left); reqs[1] = std::move(right); }
+    }
+    return reqs;  // every other operator: no requirement on its inputs
+}
+
+PhysicalProperties derive(const PhysicalNode& node) {
+    std::vector<PhysicalProperties> input_props;
+    input_props.reserve(node.children.size());
+    for (const auto& c : node.children) input_props.push_back(derive(*c));
+
+    PhysicalProperties p = derive_op(node.op, node.hash_keys, node.scan_format, input_props);
+    // The two enforcers carry their established property in their own payload.
+    if (node.op == PhysicalOp::Sort) p.sort = node.sort_keys;
+    if (node.op == PhysicalOp::FormatConvert) p.format = node.target_format;
+    return p;
 }
 
 PhysicalNodePtr enforce(PhysicalNodePtr input, const PhysicalProperties& required) {
