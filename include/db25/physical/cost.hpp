@@ -53,6 +53,14 @@ struct CalibrationProfile {
     // because the operator maintains per-partition state and, for a frame, looks
     // at neighbours - but linear, because its input arrives already ordered.
     double window_row = 0.7;
+    double hash_distinct_row = 1.0;       // hash one input row to detect a duplicate
+    // One comparison against the previous row - no hash table, which is the whole
+    // reason to want a sorted input. Below hash_distinct_row, or the streaming
+    // variant could never win and the choice would be decorative.
+    double streaming_distinct_row = 0.4;
+    double union_all_row = 0.15;          // copy one row through; no comparison
+    double set_op_row = 1.0;              // hash-build or probe one row
+    double values_row = 0.05;             // materialize one literal row
     // Hardware facts (informational today; richer costing consumes them later).
     std::uint32_t simd_width = 8;
     std::uint32_t cache_line = 64;
@@ -96,6 +104,11 @@ struct CardinalityModel {
     // needs statistics, which arrive with the catalog's histograms. A SCALAR
     // aggregate (no grouping keys) is not a guess at all - it is exactly one row.
     double group_selectivity = 0.1;
+    // Fraction of rows surviving a DISTINCT. Separate from group_selectivity even
+    // though both estimate distinctness, because they are asked about different
+    // column sets - a GROUP BY key list versus every output column - and a real
+    // estimate from statistics will not give them the same answer.
+    double distinct_selectivity = 0.5;
 
     // Estimated output rows of the plan rooted at `node`.
     [[nodiscard]] double rows(const PhysicalNode& node) const;
@@ -119,7 +132,9 @@ struct CardinalityModel {
 // one row per GROUP, which is not a function of its input's cardinality alone.
 [[nodiscard]] double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                                    const std::string& table_name, const CardinalityModel& card,
-                                   LimitSpec limits = {}, GroupingSpec grouping = {});
+                                   LimitSpec limits = {}, GroupingSpec grouping = {},
+                                   ast::SetOp set_op = ast::SetOp::Union,
+                                   double values_rows = 0.0);
 [[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
                                    StorageFormat scan_format = StorageFormat::Row);

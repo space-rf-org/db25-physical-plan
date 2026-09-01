@@ -66,7 +66,8 @@ struct PhysicalProperties {
 // of what it would cost. Every other operator is unconditionally applicable.
 [[nodiscard]] bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys,
                                  ast::JoinType join_kind = ast::JoinType::Inner,
-                                 GroupingSpec grouping = {});
+                                 GroupingSpec grouping = {},
+                                 ast::SetOp set_op = ast::SetOp::Union);
 
 // The part of a consumer's requirement an operator can discharge by REQUIRING IT
 // OF ITS INPUT instead of having an enforcer placed above it - nullopt when it
@@ -82,8 +83,9 @@ struct PhysicalProperties {
 // makes it cheaper than a HashJoin when the order is already there and dearer
 // when it must be enforced. Every other operator is indifferent. The returned
 // vector is one entry per input, in operand order.
-// `group_sort` is the grouping order a StreamingAggregate consumes its input in -
-// the same ordered-key-set that `sort_keys` is elsewhere.
+// `group_sort` is the ordered key set the operator consumes: a StreamingAggregate's
+// grouping order, a Window's (PARTITION BY ++ ORDER BY), a StreamingDistinct's
+// every-column order. One name because it is one idea.
 [[nodiscard]] std::vector<PhysicalProperties> required_input_properties(
     PhysicalOp op, const std::vector<HashKey>& keys,
     std::span<const SortKey> group_sort = {});

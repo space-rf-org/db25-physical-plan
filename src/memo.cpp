@@ -42,7 +42,8 @@ void GroupKey::finish() noexcept {
     h = mix64(h, static_cast<std::uint64_t>(limits.limit));
     h = mix64(h, static_cast<std::uint64_t>(limits.has_offset));
     h = mix64(h, static_cast<std::uint64_t>(limits.offset));
-    h = mix64(h, group_key_count);
+    h = mix64(h, op_split);
+    h = mix64(h, static_cast<std::uint64_t>(set_op));
     hash = h;
 }
 
@@ -77,7 +78,8 @@ bool GroupKey::equals(const GroupKey& o) const noexcept {
     for (std::size_t i = 0; i < residual.size(); ++i) {
         if (!expr_structurally_equal(residual[i], o.residual[i])) return false;
     }
-    if (group_key_count != o.group_key_count) return false;
+    if (op_split != o.op_split) return false;
+    if (set_op != o.set_op) return false;
     if (op_exprs.size() != o.op_exprs.size()) return false;
     for (std::size_t i = 0; i < op_exprs.size(); ++i) {
         if (!expr_structurally_equal(op_exprs[i], o.op_exprs[i])) return false;
@@ -213,12 +215,16 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     // deque and so is not size-critical.
     if (ge.op == PhysicalOp::Window) {
         node->window_functions = g.op_exprs;
+    } else if (ge.op == PhysicalOp::ValuesScan) {
+        node->values = g.op_exprs;
+        node->values_columns = g.op_split;
     } else if (ge.op == PhysicalOp::HashAggregate || ge.op == PhysicalOp::StreamingAggregate) {
-        node->group_keys.assign(g.op_exprs.begin(), g.op_exprs.begin() + g.group_key_count);
-        node->aggregates.assign(g.op_exprs.begin() + g.group_key_count, g.op_exprs.end());
+        node->group_keys.assign(g.op_exprs.begin(), g.op_exprs.begin() + g.op_split);
+        node->aggregates.assign(g.op_exprs.begin() + g.op_split, g.op_exprs.end());
     } else {
         node->projections = g.op_exprs;
     }
+    node->set_op = g.set_op;
     node->hash_keys = g.hash_keys;
     node->join_kind = g.join_kind;
     node->sort_keys = g.sort_keys;

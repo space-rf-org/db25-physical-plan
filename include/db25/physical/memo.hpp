@@ -91,7 +91,7 @@ struct Group {
     std::vector<const Expr*> residual;     // Join: non-key conjuncts to re-check
     // Project: one borrowed expression per output column.
     // Aggregate: the GROUP BY keys followed by the aggregate calls, split at
-    // `group_key_count`. One vector for both is this struct's stated
+    // `op_split`. One vector for both is this struct's stated
     // union-by-convention on the logical operator - and here it is also load
     // bearing; see the note below.
     std::vector<const Expr*> op_exprs;
@@ -100,12 +100,15 @@ struct Group {
     // of a candidate: every group-expression in a group implements the SAME
     // logical operator, and an inner join is not equivalent to a left join.
     ast::JoinType join_kind = ast::JoinType::Inner;
-    // Aggregate: where `op_exprs` splits from grouping keys into aggregate calls.
-    // Declared HERE, immediately after the one-byte `join_kind`, so it lands in
-    // padding that already existed rather than adding eight bytes of its own.
-    // Moving it elsewhere in this struct costs 8 bytes and, at the current size,
-    // that is enough to change the deque packing - see the note below.
-    std::uint32_t group_key_count = 0;
+    ast::SetOp set_op = ast::SetOp::Union; // HashSetOp / UnionAll: which one
+    // Where `op_exprs` divides, per operator: for an Aggregate the number of
+    // leading grouping keys (the rest are aggregate calls); for a ValuesScan the
+    // number of COLUMNS per row (the list is flattened row-major). Declared HERE,
+    // packed against the one-byte enums above, so it lands in padding that already
+    // existed rather than adding eight bytes of its own. Moving it elsewhere in
+    // this struct costs 8 bytes and, at the current size, that is enough to change
+    // the deque packing - see the note below.
+    std::uint32_t op_split = 0;
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     LimitSpec limits;                      // Limit: LIMIT / OFFSET
 
@@ -223,7 +226,8 @@ struct GroupKey {
     // are different operators sharing one LogicalOp.
     std::vector<SortKey> sort_keys;
     LimitSpec limits;
-    std::uint32_t group_key_count = 0;
+    ast::SetOp set_op = ast::SetOp::Union;
+    std::uint32_t op_split = 0;
     bool comparable = false;
     std::uint64_t hash = 0;
 

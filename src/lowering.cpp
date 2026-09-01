@@ -34,6 +34,9 @@ const char* logical_op_name(plan::LogicalOp op) {
         case plan::LogicalOp::Limit:   return "Limit";
         case plan::LogicalOp::Aggregate: return "Aggregate";
         case plan::LogicalOp::Window:  return "Window";
+        case plan::LogicalOp::Distinct: return "Distinct";
+        case plan::LogicalOp::SetOp:   return "SetOp";
+        case plan::LogicalOp::Values:  return "Values";
         default:                       return nullptr;
     }
 }
@@ -55,6 +58,13 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
     static constexpr PhysicalOp kAggregate[]{PhysicalOp::HashAggregate,
                                              PhysicalOp::StreamingAggregate};
     static constexpr PhysicalOp kWindow[]{PhysicalOp::Window};
+    static constexpr PhysicalOp kDistinct[]{PhysicalOp::HashDistinct,
+                                            PhysicalOp::StreamingDistinct};
+    // UnionAll and HashSetOp are not alternatives for one another - they compute
+    // different things - so BOTH are offered and applicability, not cost, picks:
+    // UNION ALL admits only the concatenation, everything else only the hash.
+    static constexpr PhysicalOp kSetOp[]{PhysicalOp::UnionAll, PhysicalOp::HashSetOp};
+    static constexpr PhysicalOp kValues[]{PhysicalOp::ValuesScan};
     switch (op) {
         case plan::LogicalOp::Scan:    return kScan;
         case plan::LogicalOp::Filter:  return kFilter;
@@ -64,6 +74,9 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
         case plan::LogicalOp::Limit:   return kLimit;
         case plan::LogicalOp::Aggregate: return kAggregate;
         case plan::LogicalOp::Window:  return kWindow;
+        case plan::LogicalOp::Distinct: return kDistinct;
+        case plan::LogicalOp::SetOp:   return kSetOp;
+        case plan::LogicalOp::Values:  return kValues;
         default:                       return {};
     }
 }
@@ -144,8 +157,16 @@ bool same_window_spec(const plan::WindowSpecIR& a, const plan::WindowSpecIR& b) 
 // populated only when every grouping key could be turned into one, so the two
 // sizes agreeing is exactly the condition, and there is no second field to fall
 // out of step with the first.
+// How many literal rows a ValuesScan group produces. A FROM-less SELECT carries
+// no expressions and no columns, and is exactly one row - so an empty payload
+// means one row, not zero, and dividing by the width would say the wrong thing.
+double values_rows_of(const Group& g) {
+    if (g.op_split == 0) return 1.0;
+    return static_cast<double>(g.op_exprs.size() / g.op_split);
+}
+
 GroupingSpec grouping_of(const Group& g) {
-    return GroupingSpec{g.group_key_count, g.group_key_count == g.sort_keys.size()};
+    return GroupingSpec{g.op_split, g.op_split == g.sort_keys.size()};
 }
 
 // ---- phase 1: exploration -------------------------------------------------
@@ -240,7 +261,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             }
             payload.op_exprs.reserve(n.group_keys.size() + n.aggregates.size());
             for (const auto& e : n.group_keys) payload.op_exprs.push_back(e.get());
-            payload.group_key_count = static_cast<std::uint32_t>(n.group_keys.size());
+            payload.op_split = static_cast<std::uint32_t>(n.group_keys.size());
             for (const auto& e : n.aggregates) payload.op_exprs.push_back(e.get());
 
             // The grouping order, when it can be expressed at all. A sort
@@ -250,13 +271,13 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             // recorded, which makes the streaming candidate inapplicable. The
             // count mismatch IS the signal; see GroupingSpec::orderable.
             bool orderable = true;
-            for (std::uint32_t i = 0; i < payload.group_key_count; ++i) {
+            for (std::uint32_t i = 0; i < payload.op_split; ++i) {
                 const plan::Expr* e = payload.op_exprs[i];
                 if (e == nullptr || e->kind != plan::ExprKind::ColumnRef) { orderable = false; break; }
             }
             if (orderable) {
-                payload.sort_keys.reserve(payload.group_key_count);
-                for (std::uint32_t i = 0; i < payload.group_key_count; ++i) {
+                payload.sort_keys.reserve(payload.op_split);
+                for (std::uint32_t i = 0; i < payload.op_split; ++i) {
                     const plan::Expr* e = payload.op_exprs[i];
                     payload.sort_keys.push_back(SortKey{e->input_index, false, false, false});
                 }
@@ -314,6 +335,37 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             for (const auto& e : n.window_functions) payload.op_exprs.push_back(e.get());
             break;
         }
+        case plan::LogicalOp::Distinct:
+            // DISTINCT is over EVERY output column, and those are positional by
+            // construction - column i of the child is column i here - so the sort
+            // key list is always expressible and a streaming implementation is
+            // always available. No honest-failure path is needed, unlike the
+            // aggregate's grouping keys, which are arbitrary expressions.
+            payload.sort_keys.reserve(n.output.size());
+            for (std::uint32_t i = 0; i < n.output.size(); ++i) {
+                payload.sort_keys.push_back(SortKey{i, false, false, false});
+            }
+            break;
+        case plan::LogicalOp::SetOp:
+            payload.set_op = n.set_op;
+            break;
+        case plan::LogicalOp::Values: {
+            // Flattened row-major, `op_split` columns wide. A FROM-less SELECT is
+            // one row of zero columns, which is why the width is carried
+            // separately rather than inferred - it cannot be divided out of an
+            // empty list.
+            if (!n.value_rows.empty()) {
+                payload.op_split = static_cast<std::uint32_t>(n.value_rows.front().size());
+                for (const auto& row : n.value_rows) {
+                    if (row.size() != payload.op_split) {
+                        error = "VALUES rows of differing width in lowering";
+                        return kInvalidGroup;
+                    }
+                    for (const auto& e : row) payload.op_exprs.push_back(e.get());
+                }
+            }
+            break;
+        }
         case plan::LogicalOp::Limit:
             payload.limits.has_limit = n.has_limit;
             payload.limits.limit = n.limit;
@@ -344,7 +396,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.predicate = payload.predicate;
         key.residual = payload.residual;
         key.op_exprs = payload.op_exprs;
-        key.group_key_count = payload.group_key_count;
+        key.op_split = payload.op_split;
+        key.set_op = payload.set_op;
         key.hash_keys = payload.hash_keys;
         key.join_kind = payload.join_kind;
         key.sort_keys = payload.sort_keys;
@@ -364,7 +417,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         grp.predicate = payload.predicate;
         grp.residual = std::move(payload.residual);
         grp.op_exprs = std::move(payload.op_exprs);
-        grp.group_key_count = payload.group_key_count;
+        grp.op_split = payload.op_split;
+        grp.set_op = payload.set_op;
         grp.hash_keys = std::move(payload.hash_keys);
         grp.join_kind = payload.join_kind;
         grp.sort_keys = payload.sort_keys;
@@ -378,7 +432,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     for (const GroupId in : inputs) { if (n_in == 2) break; in_rows_buf[n_in++] = memo.group(in).rows; }
     memo.set_rows(g, operator_rows(cands.front(), std::span<const double>{in_rows_buf, n_in},
                                    memo.group(g).table_name, card, memo.group(g).limits,
-                                   grouping_of(memo.group(g))));
+                                   grouping_of(memo.group(g)), memo.group(g).set_op,
+                                   values_rows_of(memo.group(g))));
 
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot.
@@ -411,7 +466,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     for (const PhysicalOp cand : cands) {
         // A candidate whose precondition does not hold is not a cheaper option, it
         // is not an option at all.
-        if (!is_applicable(cand, keys, payload_join_kind, group_spec)) continue;
+        if (!is_applicable(cand, keys, payload_join_kind, group_spec,
+                           memo.group(g).set_op)) continue;
         for (const FormatAvailability& fa : scan_formats) {
             GroupExpr ge;
             ge.op = cand;

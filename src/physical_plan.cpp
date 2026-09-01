@@ -16,6 +16,11 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::FormatConvert: return "FormatConvert";
         case PhysicalOp::Limit:         return "Limit";
         case PhysicalOp::Window:        return "Window";
+        case PhysicalOp::HashDistinct:  return "HashDistinct";
+        case PhysicalOp::StreamingDistinct: return "StreamingDistinct";
+        case PhysicalOp::UnionAll:      return "UnionAll";
+        case PhysicalOp::HashSetOp:     return "HashSetOp";
+        case PhysicalOp::ValuesScan:    return "ValuesScan";
         case PhysicalOp::HashAggregate: return "HashAggregate";
         case PhysicalOp::StreamingAggregate: return "StreamingAggregate";
     }
@@ -52,6 +57,23 @@ bool join_null_extends_right(ast::JoinType k) noexcept {
            k == ast::JoinType::LeftLateral;
 }
 
+const char* set_op_to_string(ast::SetOp op) noexcept {
+    switch (op) {
+        case ast::SetOp::Union:        return "union";
+        case ast::SetOp::UnionAll:     return "union-all";
+        case ast::SetOp::Intersect:    return "intersect";
+        case ast::SetOp::Except:       return "except";
+        case ast::SetOp::IntersectAll: return "intersect-all";
+        case ast::SetOp::ExceptAll:    return "except-all";
+    }
+    return "?";
+}
+
+bool set_op_deduplicates(ast::SetOp op) noexcept {
+    return op == ast::SetOp::Union || op == ast::SetOp::Intersect ||
+           op == ast::SetOp::Except;
+}
+
 bool join_is_lateral(ast::JoinType k) noexcept {
     return k == ast::JoinType::Lateral || k == ast::JoinType::LeftLateral;
 }
@@ -86,6 +108,11 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::FormatConvert: return 1;
         case PhysicalOp::Limit:         return 1;
         case PhysicalOp::Window:        return 1;
+        case PhysicalOp::HashDistinct:  return 1;
+        case PhysicalOp::StreamingDistinct: return 1;
+        case PhysicalOp::UnionAll:      return 2;
+        case PhysicalOp::HashSetOp:     return 2;
+        case PhysicalOp::ValuesScan:    return 0;
         case PhysicalOp::HashAggregate: return 1;
         case PhysicalOp::StreamingAggregate: return 1;
     }

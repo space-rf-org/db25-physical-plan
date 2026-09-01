@@ -1380,7 +1380,7 @@ static void test_sorts_and_limits_are_not_interchangeable_groups() {
     // computing nothing carry the SAME expression list on the group - the payload
     // shares one vector - and differ only in where it splits. Without the split
     // count in the key they would dedup into one group and one would silently
-    // answer for the other. (Found by mutation: removing group_key_count from the
+    // answer for the other. (Found by mutation: removing op_split from the
     // key broke nothing until this existed.)
     auto keya = col(0, DataType::Integer);
     auto keyb = col(1, DataType::Integer);
@@ -1389,7 +1389,7 @@ static void test_sorts_and_limits_are_not_interchangeable_groups() {
         k.logical_op = static_cast<int>(plan::LogicalOp::Aggregate);
         k.output = &out;
         k.op_exprs = {keya.get(), keyb.get()};
-        k.group_key_count = split;
+        k.op_split = split;
         k.finish();
         return k;
     };
@@ -1723,6 +1723,176 @@ static void test_a_computed_window_key_fails_honestly() {
     CHECK(contains(r.error, "PARTITION BY"));
 }
 
+// ---------------------------------------------------------------------------
+// Increment 3.4: DISTINCT, set operations and VALUES.
+static plan::LogicalNodePtr build_distinct() {
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+    auto d = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Distinct);
+    d->output = a_schema();
+    d->add_child(std::move(scan));
+    return d;
+}
+
+static plan::LogicalNodePtr build_setop(db25::ast::SetOp op) {
+    auto l = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    l->table_name = "a";
+    l->output = a_schema();
+    auto r = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    r->table_name = "b";
+    r->output = a_schema();
+    auto s = std::make_unique<plan::LogicalNode>(plan::LogicalOp::SetOp);
+    s->output = a_schema();
+    s->set_op = op;
+    s->add_child(std::move(l));
+    s->add_child(std::move(r));
+    return s;
+}
+
+// DISTINCT is over EVERY output column, which are positional by construction, so
+// a streaming implementation is ALWAYS available - no honest-failure path, unlike
+// the aggregate's arbitrary grouping expressions.
+static void test_distinct_lowers_both_ways() {
+    std::printf("test_distinct_lowers_both_ways\n");
+    auto unconstrained = build_distinct();
+    const LoweringResult ru = lower(*unconstrained);
+    CHECK(ru.ok);
+    const std::string su = ru.plan ? physical_to_sexpr(*ru.plan) : std::string{};
+    CHECK(contains(su, "HashDistinct"));
+
+    // Requiring the output in column order does NOT by itself tip the balance,
+    // for exactly the reason it does not for an aggregate: DISTINCT reduces its
+    // input, so a Sort above it sorts the survivors (500 rows at the default 50%)
+    // while a Sort below it sorts all 1000. Hashing then sorting wins.
+    //
+    // Streaming wins where there is little to de-duplicate - both routes sort the
+    // same rows and only the per-row rate is left. That is the real condition.
+    // Worth recording that this test was written the naive way FIRST and failed,
+    // the same mistake made against the aggregate two increments earlier: the
+    // reducing-operator intuition does not survive contact with the cost model,
+    // and apparently has to be relearned per operator.
+    auto ordered = build_distinct();
+    db25::physical::CardinalityModel few_duplicates;
+    few_duplicates.distinct_selectivity = 1.0;
+    LoweringContext ctx;
+    ctx.cardinality = &few_duplicates;
+    ctx.required_output.sort = {SortKey{0, false, false, false},
+                                SortKey{1, false, false, false}};
+    const LoweringResult ro = lower(*ordered, ctx);
+    CHECK(ro.ok);
+    const std::string so = ro.plan ? physical_to_sexpr(*ro.plan) : std::string{};
+    CHECK(contains(so, "StreamingDistinct"));
+    CHECK(su != so);
+    if (ro.plan) CHECK(satisfies(derive(*ro.plan), ctx.required_output));
+    // No Sort above the streaming operator: it already emits the order it consumed.
+    CHECK(so.find("Sort") > so.find("StreamingDistinct"));
+}
+
+// UnionAll and HashSetOp are not alternatives - they compute different things.
+// Applicability, not cost, must choose: UnionAll is the CHEAPER of the two and
+// would otherwise win an INTERSECT and silently keep every row.
+static void test_set_operations_pick_by_applicability_not_cost() {
+    std::printf("test_set_operations_pick_by_applicability_not_cost\n");
+    struct Case { db25::ast::SetOp op; const char* want; const char* kind; };
+    const Case cases[] = {
+        {db25::ast::SetOp::UnionAll,     "UnionAll",  "union-all"},
+        {db25::ast::SetOp::Union,        "HashSetOp", "union"},
+        {db25::ast::SetOp::Intersect,    "HashSetOp", "intersect"},
+        {db25::ast::SetOp::Except,       "HashSetOp", "except"},
+        {db25::ast::SetOp::IntersectAll, "HashSetOp", "intersect-all"},
+        {db25::ast::SetOp::ExceptAll,    "HashSetOp", "except-all"},
+    };
+    std::string seen[6];
+    for (int i = 0; i < 6; ++i) {
+        auto logical = build_setop(cases[i].op);
+        const LoweringResult r = lower(*logical);
+        CHECK(r.ok);
+        if (!r.plan) continue;
+        seen[i] = physical_to_sexpr(*r.plan);
+        CHECK(contains(seen[i], cases[i].want));
+        CHECK(contains(seen[i], (std::string("kind=") + cases[i].kind).c_str()));
+    }
+    // All six render differently. A set operation that does not say which one it
+    // is reads the same as any other - the join-kind lesson, applied here.
+    for (int i = 0; i < 6; ++i) {
+        for (int j = i + 1; j < 6; ++j) CHECK(seen[i] != seen[j]);
+    }
+
+    using db25::physical::PhysicalOp;
+    CHECK(!db25::physical::is_applicable(PhysicalOp::UnionAll, {}, db25::ast::JoinType::Inner,
+                                         {}, db25::ast::SetOp::Intersect));
+    CHECK(db25::physical::is_applicable(PhysicalOp::UnionAll, {}, db25::ast::JoinType::Inner,
+                                        {}, db25::ast::SetOp::UnionAll));
+    CHECK(!db25::physical::is_applicable(PhysicalOp::HashSetOp, {}, db25::ast::JoinType::Inner,
+                                         {}, db25::ast::SetOp::UnionAll));
+}
+
+// VALUES, including the degenerate case a FROM-less SELECT lowers over: ONE row
+// of ZERO columns. Estimating that as zero rows would make every operator above
+// it free, so the width is carried rather than divided out of an empty list.
+static void test_values_lowers_including_the_from_less_select() {
+    std::printf("test_values_lowers_including_the_from_less_select\n");
+    {
+        auto v = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Values);
+        v->output = {{"x", DataType::Integer, false}, {"y", DataType::Integer, false}};
+        std::vector<plan::ExprPtr> r0;
+        r0.push_back(int_lit(1)); r0.push_back(int_lit(2));
+        std::vector<plan::ExprPtr> r1;
+        r1.push_back(int_lit(3)); r1.push_back(int_lit(4));
+        v->value_rows.push_back(std::move(r0));
+        v->value_rows.push_back(std::move(r1));
+        const LoweringResult r = lower(*v);
+        CHECK(r.ok);
+        if (!r.plan) return;
+        const std::string s = physical_to_sexpr(*r.plan);
+        CHECK(contains(s, "ValuesScan rows=[((lit 1) (lit 2)) ((lit 3) (lit 4))]"));
+        const db25::physical::CardinalityModel card;
+        CHECK(card.rows(*r.plan) == 2.0);
+    }
+    {
+        // A FROM-less SELECT: one row, no columns.
+        auto v = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Values);
+        const LoweringResult r = lower(*v);
+        CHECK(r.ok);
+        if (!r.plan) return;
+        const db25::physical::CardinalityModel card;
+        CHECK(card.rows(*r.plan) == 1.0);
+    }
+}
+
+// Two set operations over the same inputs differ only in `set_op`, and two VALUES
+// with the same flattened expressions differ only in their width. Both must stay
+// distinct groups, for the reason the join kind and the aggregate split must.
+static void test_setop_kind_and_values_width_are_part_of_group_identity() {
+    std::printf("test_setop_kind_and_values_width_are_part_of_group_identity\n");
+    const db25::plan::Schema out = a_schema();
+    auto make_setop = [&](db25::ast::SetOp op) {
+        db25::physical::GroupKey k;
+        k.logical_op = static_cast<int>(plan::LogicalOp::SetOp);
+        k.output = &out;
+        k.set_op = op;
+        k.finish();
+        return k;
+    };
+    CHECK(!make_setop(db25::ast::SetOp::Union).equals(make_setop(db25::ast::SetOp::Intersect)));
+    CHECK(make_setop(db25::ast::SetOp::Union).hash !=
+          make_setop(db25::ast::SetOp::Intersect).hash);
+    CHECK(make_setop(db25::ast::SetOp::Union).equals(make_setop(db25::ast::SetOp::Union)));
+
+    auto a1 = int_lit(1), a2 = int_lit(2);
+    auto make_values = [&](std::uint32_t width) {
+        db25::physical::GroupKey k;
+        k.logical_op = static_cast<int>(plan::LogicalOp::Values);
+        k.output = &out;
+        k.op_exprs = {a1.get(), a2.get()};
+        k.op_split = width;   // (1,2) as one row of two vs two rows of one
+        k.finish();
+        return k;
+    };
+    CHECK(!make_values(1).equals(make_values(2)));
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -1768,6 +1938,10 @@ int main() {
     test_window_lowers_and_requires_its_order();
     test_differing_over_clauses_fail_rather_than_pick_one();
     test_a_computed_window_key_fails_honestly();
+    test_distinct_lowers_both_ways();
+    test_set_operations_pick_by_applicability_not_cost();
+    test_values_lowers_including_the_from_less_select();
+    test_setop_kind_and_values_width_are_part_of_group_identity();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

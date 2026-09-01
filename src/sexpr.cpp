@@ -214,6 +214,30 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             out += "]";
             break;
         }
+        case PhysicalOp::UnionAll:
+        case PhysicalOp::HashSetOp:
+            // Printed for both, including UnionAll where it is implied by the
+            // operator name: a set operation that does not say which one it is
+            // reads the same as any other, and silence is what let INNER and LEFT
+            // joins share a golden.
+            out += " kind=";
+            out += set_op_to_string(n.set_op);
+            break;
+        case PhysicalOp::ValuesScan: {
+            out += " rows=[";
+            const std::size_t w = n.values_columns;
+            for (std::size_t i = 0; i < n.values.size(); ++i) {
+                if (i != 0) out += (w != 0 && i % w == 0) ? ") (" : " ";
+                if (i == 0) out += "(";
+                out += render_expr(n.values[i]);
+            }
+            if (!n.values.empty()) out += ")";
+            out += "]";
+            break;
+        }
+        case PhysicalOp::HashDistinct:
+        case PhysicalOp::StreamingDistinct:
+            break;  // no payload: DISTINCT is over every output column
         case PhysicalOp::Window: {
             out += " fns=[";
             for (std::size_t i = 0; i < n.window_functions.size(); ++i) {

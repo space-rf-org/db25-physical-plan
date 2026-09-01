@@ -42,6 +42,16 @@
     ; Window consumes its input sorted by (PARTITION BY ++ ORDER BY) and appends
     ; one column per window function, emitting in that same order.
     (operator (name Window)             (arity 1) (kind pipeline))
+    ; Two implementations of SELECT DISTINCT, the same trade as the aggregates.
+    (operator (name HashDistinct)       (arity 1) (kind pipeline-breaker))
+    (operator (name StreamingDistinct)  (arity 1) (kind pipeline))
+    ; Set operations. UnionAll compares nothing; HashSetOp builds from the right
+    ; and probes with the left. They are NOT alternatives for one another -
+    ; applicability, not cost, selects between them.
+    (operator (name UnionAll)           (arity 2) (kind pipeline))
+    (operator (name HashSetOp)          (arity 2) (kind pipeline-breaker))
+    ; A literal row set, and the synthetic single row of a FROM-less SELECT.
+    (operator (name ValuesScan)         (arity 0) (kind access-path))
     ; Sort is BOTH the implementation of a logical Sort (ORDER BY) and the
     ; enforcer inserted to establish a required order - one operator, because they
     ; are one operation; only who asked for it differs.
@@ -73,7 +83,12 @@
     (rule (logical Limit)   (physical Limit))
     (rule (logical Aggregate) (physical HashAggregate))
     (rule (logical Aggregate) (physical StreamingAggregate))
-    (rule (logical Window)    (physical Window)))
+    (rule (logical Window)    (physical Window))
+    (rule (logical Distinct)  (physical HashDistinct))
+    (rule (logical Distinct)  (physical StreamingDistinct))
+    (rule (logical SetOp)     (physical UnionAll))
+    (rule (logical SetOp)     (physical HashSetOp))
+    (rule (logical Values)    (physical ValuesScan)))
 
   ; Where exhaustive search stops being affordable (design D5). Past this many
   ; joins the planner falls back to a bounded enumeration - a worse plan chosen by
@@ -92,4 +107,5 @@
   (capability-profile
     (name reference)
     (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
-              Sort FormatConvert Limit HashAggregate StreamingAggregate Window)))
+              Sort FormatConvert Limit HashAggregate StreamingAggregate Window
+              HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan)))
