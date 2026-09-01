@@ -43,10 +43,35 @@ std::string render_expr(const Expr* e) {
             return std::string("(") + ast::unary_op_to_string(e->un_op) + " " +
                    render_expr(o) + ")";
         }
+        case plan::ExprKind::Aggregate: {
+            // DISTINCT, FILTER and ORDER BY are rendered, not skipped. They are
+            // part of WHAT the aggregate computes, not decoration: `COUNT(*)` and
+            // `COUNT(*) FILTER (WHERE salary > 100)` return different numbers.
+            //
+            // The plan itself was never wrong - a physical node borrows the whole
+            // logical Expr, so an executor sees all three. But this writer is what
+            // the goldens are made of, and a golden that renders both as `(COUNT)`
+            // cannot fail when one silently becomes the other. Exactly the hole
+            // that let an INNER and a LEFT join share a physical golden.
+            std::string s = "(" + e->func_name;
+            if (e->distinct) s += " distinct";
+            for (const auto& c : e->children) s += " " + render_expr(c.get());
+            if (e->filter != nullptr) s += " :filter " + render_expr(e->filter.get());
+            if (!e->agg_order_by.empty()) {
+                s += " :order [";
+                for (std::size_t i = 0; i < e->agg_order_by.size(); ++i) {
+                    if (i != 0) s += " ";
+                    s += render_expr(e->agg_order_by[i].expr.get());
+                    s += e->agg_order_by[i].descending ? " desc" : " asc";
+                }
+                s += "]";
+            }
+            return s + ")";
+        }
         case plan::ExprKind::ScalarFunction:
-        case plan::ExprKind::Aggregate:
         case plan::ExprKind::WindowFunction: {
             std::string s = "(" + e->func_name;
+            if (e->distinct) s += " distinct";
             for (const auto& c : e->children) s += " " + render_expr(c.get());
             return s + ")";
         }

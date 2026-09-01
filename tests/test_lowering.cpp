@@ -1563,6 +1563,45 @@ static void test_grouping_sets_fail_rather_than_silently_flatten() {
     CHECK(contains(r.error, "grouping sets"));
 }
 
+// An aggregate's DISTINCT, FILTER and ORDER BY change WHAT IT COMPUTES, so the
+// rendered plan must show them. The plan was never wrong - a physical node borrows
+// the whole logical Expr - but the goldens are made of this writer, and a golden
+// that renders `COUNT(*)` and `COUNT(*) FILTER (WHERE p)` identically cannot fail
+// when one silently becomes the other. Found by reading a real corpus fixture
+// (16_window_filter) whose new physical golden had lost its FILTER.
+static void test_aggregate_modifiers_are_rendered() {
+    std::printf("test_aggregate_modifiers_are_rendered\n");
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+    auto agg = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Aggregate);
+    agg->output = a_schema();
+    agg->group_keys.push_back(col(0, DataType::Integer));
+
+    auto call = std::make_unique<plan::Expr>(plan::ExprKind::Aggregate);
+    call->func_name = "COUNT";
+    call->type = DataType::BigInt;
+    call->distinct = true;
+    call->filter = binop(BinaryOp::GreaterThan, col(1, DataType::Integer), int_lit(100));
+    plan::SortKeyIR ob;
+    ob.expr = col(1, DataType::Integer);
+    ob.descending = true;
+    call->agg_order_by.push_back(std::move(ob));
+    agg->aggregates.push_back(std::move(call));
+    agg->add_child(std::move(scan));
+
+    const LoweringResult r = lower(*agg);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "distinct"));
+    CHECK(contains(s, ":filter (> (col #1) (lit 100))"));
+    CHECK(contains(s, ":order [(col #1) desc]"));
+    // The point, stated as the thing that was false: a filtered aggregate must not
+    // render the same as a plain one.
+    CHECK(s.find("(COUNT)") == std::string::npos);
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -1604,6 +1643,7 @@ int main() {
     test_a_computed_grouping_key_still_lowers_via_hash();
     test_a_scalar_aggregate_estimates_one_row();
     test_grouping_sets_fail_rather_than_silently_flatten();
+    test_aggregate_modifiers_are_rendered();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");
