@@ -122,8 +122,8 @@ static plan::LogicalNodePtr reference_query() {
 //
 // A legitimate increase means editing these numbers in a commit that explains
 // why. That is the mechanism, not an obstacle to it.
-constexpr long kBudgetDefault = 88;   // measured 84
-constexpr long kBudgetDedup = 104;    // measured 99 (dedup builds a key per group)
+constexpr long kBudgetDefault = 69;   // measured 65
+constexpr long kBudgetDedup = 84;     // measured 80 (dedup builds a key per group)
 
 static long allocations_for(const LoweringContext& ctx, const plan::LogicalNode& q) {
     { const LoweringResult warm = lower(q, ctx); (void)warm; }  // one-off caches

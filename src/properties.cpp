@@ -190,18 +190,26 @@ PhysicalProperties derive(const PhysicalNode& node) {
 }
 
 PhysicalNodePtr enforce(PhysicalNodePtr input, const PhysicalProperties& required) {
-    if (satisfies(derive(*input), required)) {
+    // derive() walks the whole subtree, so calling it once per decision made
+    // enforcement quadratic in plan depth: extraction enforces per child, and
+    // each enforce re-walked everything below it. Derive ONCE, then track what
+    // each enforcer establishes - the enforcers are the only thing changing the
+    // properties, and each one's effect on them is exactly its own definition.
+    PhysicalProperties have = derive(*input);
+    if (satisfies(have, required)) {
         return input;  // already satisfied - no enforcer inserted
     }
     PhysicalNodePtr node = std::move(input);
 
     // Format first, so the sort (if also needed) runs on the required format.
-    if (required.format != StorageFormat::Any && derive(*node).format != required.format) {
+    if (required.format != StorageFormat::Any && have.format != required.format) {
         node = make_format_convert(std::move(node), required.format);
+        have.format = required.format;  // what a FormatConvert establishes
     }
     // Then the order.
-    if (!sort_prefix(derive(*node).sort, required.sort)) {
+    if (!sort_prefix(have.sort, required.sort)) {
         node = make_sort(std::move(node), required.sort);
+        have.sort = required.sort;      // what a Sort establishes
     }
     // Verify rather than assume. The enforcers establish order and format; NO
     // enforcer establishes freshness, so a Fresh requirement over stale input
@@ -210,6 +218,11 @@ PhysicalNodePtr enforce(PhysicalNodePtr input, const PhysicalProperties& require
     // is precisely the correctness hole the Freshness property exists to close.
     // Checking the postcondition rather than special-casing freshness also means
     // any future unenforceable property is caught the day it is added.
+    //
+    // This one derive stays deliberately: it reads the TREE rather than the
+    // tracked value, so it would catch an enforcer whose real effect diverged
+    // from what this function believes it establishes. Checking `have` here
+    // instead would only confirm the bookkeeping agrees with itself.
     if (!satisfies(derive(*node), required)) {
         return nullptr;
     }

@@ -105,6 +105,11 @@ void Memo::set_winner(GroupId group, const PhysicalProperties& required,
             return;
         }
     }
+    // A group is asked for a handful of goals at most, and a WinnerEntry is not
+    // small, so this reserve trades a little unused capacity for not reallocating
+    // (and copying every entry) as goals arrive. Two, not four: it covers the
+    // common case without over-allocating for the many groups asked only once.
+    if (g.winners.capacity() == 0) g.winners.reserve(2);
     g.winners.push_back(WinnerEntry{required, expr_index, cost, std::move(provided),
                                     std::move(input_required)});
 }
@@ -174,23 +179,23 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
 
     auto node = std::make_unique<PhysicalNode>(ge.op);
     if (g.output != nullptr) node->output = *g.output;
-    node->table_name = ge.table_name;
+    node->table_name = g.table_name;
     node->scan_format = ge.scan_format;
     node->scan_freshness = ge.scan_freshness;
-    node->predicate = ge.predicate;
-    node->residual = ge.residual;
-    node->projections = ge.projections;
-    node->hash_keys = ge.hash_keys;
+    node->predicate = g.predicate;
+    node->residual = g.residual;
+    node->projections = g.projections;
+    node->hash_keys = g.hash_keys;
 
     // Recurse on the SAME goals the winner was costed against, not on each
     // child's unconstrained winner: a child optimized for "sorted on k" is a
     // different plan from the same child optimized for nothing, and extracting
     // the wrong one would build a plan nobody costed.
     const ArityVec<PhysicalProperties>& reqs = won->input_required;
-    for (std::size_t i = 0; i < ge.inputs.size(); ++i) {
+    for (std::size_t i = 0; i < g.inputs.size(); ++i) {
         const PhysicalProperties& child_req =
             i < reqs.size() ? reqs[i] : Group::unconstrained();
-        auto child = extract_winner_for(ge.inputs[i], child_req);
+        auto child = extract_winner_for(g.inputs[i], child_req);
         if (!child) {
             return nullptr;  // an input group had no winner: extraction fails
         }

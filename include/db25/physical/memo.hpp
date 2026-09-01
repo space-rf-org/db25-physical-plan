@@ -33,17 +33,19 @@ inline constexpr GroupId kInvalidGroup = std::numeric_limits<GroupId>::max();
 // One physical operator whose inputs are GROUPS. Payload mirrors PhysicalNode's
 // (borrowed expressions; see physical_plan.hpp). `cost` is filled by costing
 // (Unit 0.4); infinite until then.
+// One physical operator ALTERNATIVE within a group. It carries only what
+// distinguishes it from its siblings - the algorithm, the substrate it reads, and
+// what that costs. Everything the alternatives share (which relation, which
+// predicate, which keys, which input groups) belongs to the GROUP, because they
+// are alternative algorithms for ONE logical operator, not different operators.
+//
+// Holding the shared payload per candidate meant copying a string and three
+// vectors for every alternative of every group - duplicating, per algorithm
+// choice, data that no algorithm choice can change.
 struct GroupExpr {
     PhysicalOp op;
-    ArityVec<GroupId> inputs;  // child groups, in operand order
-
-    std::string table_name;                // SeqScan
     StorageFormat scan_format = StorageFormat::Row;  // SeqScan: the format read
     Freshness scan_freshness = Freshness::Fresh;     // SeqScan: does that copy lag?
-    const Expr* predicate = nullptr;       // Filter
-    std::vector<const Expr*> residual;     // Join: non-key conjuncts to re-check
-    std::vector<const Expr*> projections;  // Project
-    std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin
 
     double cost = std::numeric_limits<double>::infinity();
     // What THIS candidate's output looks like, derived when it was added. Stored
@@ -81,6 +83,15 @@ struct WinnerEntry {
 // all produce, and the winner (lowest-cost member) once costing has run.
 struct Group {
     GroupId id = kInvalidGroup;
+
+    // --- the logical operator every candidate in this group implements ---
+    ArityVec<GroupId> inputs;              // child groups, in operand order
+    std::string table_name;                // Scan
+    const Expr* predicate = nullptr;       // Filter
+    std::vector<const Expr*> residual;     // Join: non-key conjuncts to re-check
+    std::vector<const Expr*> projections;  // Project
+    std::vector<HashKey> hash_keys;        // equi-join keys
+
     // BORROWED, on the same contract as every expression payload in this planner:
     // the logical plan outlives the physical plan. Copying it here meant one full
     // vector-of-ColumnSchema copy per group, and the group's schema is only ever

@@ -89,19 +89,33 @@ private:
 
 // Build a group-expression by field. Positional aggregate initialisation breaks
 // silently whenever GroupExpr gains a member, so name what we set.
-static GroupExpr group_expr(PhysicalOp op, std::vector<GroupId> inputs,
-                            std::string table = {}, const Expr* pred = nullptr,
-                            std::vector<const Expr*> projections = {},
-                            std::vector<HashKey> keys = {}) {
+// A candidate is now only its ALGORITHM; the logical payload it implements lives
+// on the group, because every candidate in a group shares it. So building one for
+// a test means setting the group's payload and appending the alternative.
+static GroupExpr group_expr(PhysicalOp op) {
     GroupExpr ge;
     ge.op = op;
-    ge.inputs = std::move(inputs);
-    ge.table_name = std::move(table);
-    ge.predicate = pred;
-    ge.projections = std::move(projections);
-    ge.hash_keys = std::move(keys);
     ge.cost = 0.0;
     return ge;
+}
+static void set_payload(Memo& m, GroupId g, std::vector<GroupId> inputs,
+                        std::string table = {}, const Expr* pred = nullptr,
+                        std::vector<const Expr*> projections = {},
+                        std::vector<HashKey> keys = {}) {
+    Group& grp = m.group(g);
+    grp.inputs = inputs;
+    grp.table_name = std::move(table);
+    grp.predicate = pred;
+    grp.projections = std::move(projections);
+    grp.hash_keys = std::move(keys);
+}
+static void add_candidate(Memo& m, GroupId g, PhysicalOp op, std::vector<GroupId> inputs,
+                          std::string table = {}, const Expr* pred = nullptr,
+                          std::vector<const Expr*> projections = {},
+                          std::vector<HashKey> keys = {}) {
+    set_payload(m, g, std::move(inputs), std::move(table), pred, std::move(projections),
+                std::move(keys));
+    m.add_expr(g, group_expr(op));
 }
 
 static Schema a_schema() {
@@ -177,27 +191,27 @@ static void test_memo_extracts_to_same_render() {
     Memo m;
     const Schema sch_a = a_schema();
     const GroupId g_a = m.add_group(sch_a);
-    m.add_expr(g_a, group_expr(PhysicalOp::SeqScan, {}, "a"));
+    add_candidate(m, g_a, PhysicalOp::SeqScan, {}, "a");
     win(m, g_a, 0);
 
     const Schema sch_b = b_schema();
     const GroupId g_b = m.add_group(sch_b);
-    m.add_expr(g_b, group_expr(PhysicalOp::SeqScan, {}, "b"));
+    add_candidate(m, g_b, PhysicalOp::SeqScan, {}, "b");
     win(m, g_b, 0);
 
     const Schema sch_join = join_schema();
     const GroupId g_join = m.add_group(sch_join);
-    m.add_expr(g_join, group_expr(PhysicalOp::HashJoin, {g_a, g_b}, "", nullptr, {}, {{0, 0}}));
+    add_candidate(m, g_join, PhysicalOp::HashJoin, {g_a, g_b}, "", nullptr, {}, {{0, 0}});
     win(m, g_join, 0);
 
     const Schema sch_filter = join_schema();
     const GroupId g_filter = m.add_group(sch_filter);
-    m.add_expr(g_filter, group_expr(PhysicalOp::Filter, {g_join}, "", pred));
+    add_candidate(m, g_filter, PhysicalOp::Filter, {g_join}, "", pred);
     win(m, g_filter, 0);
 
     const Schema sch_proj = proj_schema();
     const GroupId g_proj = m.add_group(sch_proj);
-    m.add_expr(g_proj, group_expr(PhysicalOp::Project, {g_filter}, "", nullptr, {px, py}));
+    add_candidate(m, g_proj, PhysicalOp::Project, {g_filter}, "", nullptr, {px, py});
     win(m, g_proj, 0);
     m.set_root(g_proj);
 
@@ -215,7 +229,7 @@ static void test_extract_without_winner_fails() {
     Memo m;
     const Schema sch = a_schema();  // borrowed by the memo: must outlive it
     const GroupId g = m.add_group(sch);
-    m.add_expr(g, group_expr(PhysicalOp::SeqScan, {}, "a"));
+    add_candidate(m, g, PhysicalOp::SeqScan, {}, "a");
     // No winner set.
     m.set_root(g);
     CHECK(m.extract_winner() == nullptr);
@@ -241,7 +255,7 @@ static void test_group_answers_per_requirement() {
     m.set_rows(g, kRows);
 
     // Cheap, but unordered.
-    GroupExpr unsorted = group_expr(PhysicalOp::SeqScan, {}, "a");
+    GroupExpr unsorted = group_expr(PhysicalOp::SeqScan);
     unsorted.cost = 1000.0;
     unsorted.provided = PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
     m.add_expr(g, unsorted);
@@ -249,7 +263,7 @@ static void test_group_answers_per_requirement() {
     // Dearer, but already in the order a consumer might want. Sorting the cheap
     // one instead costs n*log2(n) ~ 9966 at these coefficients, which is what
     // makes the requirement decisive rather than marginal.
-    GroupExpr presorted = group_expr(PhysicalOp::SeqScan, {}, "a");
+    GroupExpr presorted = group_expr(PhysicalOp::SeqScan);
     presorted.cost = 1200.0;
     presorted.provided = PhysicalProperties{{SortKey{0, false}}, StorageFormat::Row,
                                             Freshness::Fresh};
@@ -333,13 +347,13 @@ static void test_requirement_may_change_only_what_is_provided() {
     const GroupId g = m.add_group(sch);
     m.set_rows(g, kRows);
 
-    GroupExpr row_scan = group_expr(PhysicalOp::SeqScan, {}, "a");
+    GroupExpr row_scan = group_expr(PhysicalOp::SeqScan);
     row_scan.scan_format = StorageFormat::Row;
     row_scan.cost = kRows * cal.scan_row;             // 1000
     row_scan.provided = PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
     m.add_expr(g, row_scan);
 
-    GroupExpr col_scan = group_expr(PhysicalOp::SeqScan, {}, "a");
+    GroupExpr col_scan = group_expr(PhysicalOp::SeqScan);
     col_scan.scan_format = StorageFormat::Column;
     col_scan.cost = kRows * cal.column_scan_row;      // 350
     col_scan.provided = PhysicalProperties{{}, StorageFormat::Column, Freshness::Fresh};
@@ -368,7 +382,7 @@ static void test_unsatisfiable_requirement_has_no_winner() {
     const GroupId g = m.add_group(sch);
     m.set_rows(g, 100.0);
 
-    GroupExpr stale = group_expr(PhysicalOp::SeqScan, {}, "a");
+    GroupExpr stale = group_expr(PhysicalOp::SeqScan);
     stale.scan_freshness = Freshness::Stale;
     stale.provided = PhysicalProperties{{}, StorageFormat::Row, Freshness::Stale};
     stale.cost = 1.0;

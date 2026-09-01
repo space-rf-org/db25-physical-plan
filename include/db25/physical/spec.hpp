@@ -13,7 +13,9 @@
 
 #include <optional>
 #include <cstdint>
+#include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace db25::physical {
@@ -69,6 +71,17 @@ struct PhysicalSpec {
     // More than one makes the choice cost-based: the planner enumerates them all
     // as candidates and the memo keeps the cheapest.
     [[nodiscard]] std::vector<std::string> physicals_for_logical(const std::string& logical) const;
+
+    // The same rules, RESOLVED to operators once at load time. Lowering asks this
+    // per logical node, and answering from the rule list meant building a vector
+    // of strings and then mapping each name back to its enum by comparing it
+    // against every operator name - per node, on the hot path, to compute
+    // something that cannot change after the spec is parsed. Empty span for a
+    // logical operator with no rule.
+    [[nodiscard]] std::span<const PhysicalOp> ops_for_logical(const std::string& logical) const;
+
+    // Built by parse_spec from impl_rules; not part of the spec's text.
+    std::unordered_map<std::string, std::vector<PhysicalOp>> resolved_rules;
 };
 
 // Parse a spec from s-expression text. Returns the spec on success; on a parse

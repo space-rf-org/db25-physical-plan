@@ -33,6 +33,12 @@ std::vector<std::string> PhysicalSpec::physicals_for_logical(const std::string& 
     return out;
 }
 
+std::span<const PhysicalOp> PhysicalSpec::ops_for_logical(const std::string& logical) const {
+    const auto it = resolved_rules.find(logical);
+    if (it == resolved_rules.end()) return {};
+    return it->second;
+}
+
 std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& error) {
     SNode root;
     if (!read_sexpr(text, root, error)) return std::nullopt;
@@ -100,6 +106,14 @@ std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& err
             if (std::from_chars(v.data(), v.data() + v.size(), parsed).ec == std::errc{}) {
                 spec.budget.max_join_count = static_cast<std::uint32_t>(parsed);
             }
+        }
+    }
+
+    // Resolve the implementation rules to operators once, here, rather than on
+    // every logical node the planner lowers.
+    for (const ImplRule& r : spec.impl_rules) {
+        if (const std::optional<PhysicalOp> op = physical_op_from_name(r.physical)) {
+            spec.resolved_rules[r.logical].push_back(*op);
         }
     }
 
