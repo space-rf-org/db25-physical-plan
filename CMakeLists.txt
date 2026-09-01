@@ -101,6 +101,16 @@ if(DB25_PHYSICAL_BUILD_TESTS)
         DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
     add_test(NAME lowering_tests COMMAND lowering_tests)
 
+    # The applicability sweep. Iterates kAllPhysicalOps, so an operator added
+    # without a decision about its preconditions, its cost, its derivation or its
+    # name fails HERE rather than in a query months later.
+    add_executable(applicability_tests tests/test_applicability.cpp)
+    target_link_libraries(applicability_tests PRIVATE db25physicalplan)
+    target_compile_options(applicability_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    target_compile_definitions(applicability_tests PRIVATE
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME applicability_tests COMMAND applicability_tests)
+
     # The allocation budget replaces global operator new to count, which does not
     # coexist with the sanitizers' own allocator interception - so it is built and
     # run only in an unsanitized build. The metric is deterministic, so one
