@@ -68,8 +68,44 @@ std::string render_expr(const Expr* e) {
             }
             return s + ")";
         }
-        case plan::ExprKind::ScalarFunction:
         case plan::ExprKind::WindowFunction: {
+            // The OVER clause is rendered for the same reason an aggregate's
+            // FILTER is: RANK() OVER (PARTITION BY a) and RANK() OVER (PARTITION
+            // BY b) compute different values, and a golden that renders both as
+            // `(RANK)` cannot fail when one becomes the other.
+            std::string s = "(" + e->func_name;
+            if (e->distinct) s += " distinct";
+            for (const auto& c : e->children) s += " " + render_expr(c.get());
+            {
+                s += " :over [";
+                if (!e->window.partition_by.empty()) {
+                    s += ":partition [";
+                    for (std::size_t i = 0; i < e->window.partition_by.size(); ++i) {
+                        if (i != 0) s += " ";
+                        s += render_expr(e->window.partition_by[i].get());
+                    }
+                    s += "]";
+                }
+                if (!e->window.order_by.empty()) {
+                    if (!e->window.partition_by.empty()) s += " ";
+                    s += ":order [";
+                    for (std::size_t i = 0; i < e->window.order_by.size(); ++i) {
+                        if (i != 0) s += " ";
+                        s += render_expr(e->window.order_by[i].expr.get());
+                        s += e->window.order_by[i].descending ? " desc" : " asc";
+                    }
+                    s += "]";
+                }
+                // The frame is carried as text at this layer (the logical IR does
+                // not interpret it yet), so it is rendered as text rather than
+                // dropped - a plan that silently forgot ROWS BETWEEN would compute
+                // a different answer.
+                if (e->window.frame.present) s += " :frame \"" + e->window.frame.spec + "\"";
+                s += "]";
+            }
+            return s + ")";
+        }
+        case plan::ExprKind::ScalarFunction: {
             std::string s = "(" + e->func_name;
             if (e->distinct) s += " distinct";
             for (const auto& c : e->children) s += " " + render_expr(c.get());
@@ -174,6 +210,15 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             for (std::size_t i = 0; i < n.aggregates.size(); ++i) {
                 if (i != 0) out += " ";
                 out += render_expr(n.aggregates[i]);
+            }
+            out += "]";
+            break;
+        }
+        case PhysicalOp::Window: {
+            out += " fns=[";
+            for (std::size_t i = 0; i < n.window_functions.size(); ++i) {
+                if (i != 0) out += " ";
+                out += render_expr(n.window_functions[i]);
             }
             out += "]";
             break;

@@ -39,6 +39,9 @@
     ; grouping keys, is cheaper per row, and keeps that order on its output.
     (operator (name HashAggregate)      (arity 1) (kind pipeline-breaker))
     (operator (name StreamingAggregate) (arity 1) (kind pipeline))
+    ; Window consumes its input sorted by (PARTITION BY ++ ORDER BY) and appends
+    ; one column per window function, emitting in that same order.
+    (operator (name Window)             (arity 1) (kind pipeline))
     ; Sort is BOTH the implementation of a logical Sort (ORDER BY) and the
     ; enforcer inserted to establish a required order - one operator, because they
     ; are one operation; only who asked for it differs.
@@ -69,7 +72,8 @@
     (rule (logical Sort)    (physical Sort))
     (rule (logical Limit)   (physical Limit))
     (rule (logical Aggregate) (physical HashAggregate))
-    (rule (logical Aggregate) (physical StreamingAggregate)))
+    (rule (logical Aggregate) (physical StreamingAggregate))
+    (rule (logical Window)    (physical Window)))
 
   ; Where exhaustive search stops being affordable (design D5). Past this many
   ; joins the planner falls back to a bounded enumeration - a worse plan chosen by
@@ -88,4 +92,4 @@
   (capability-profile
     (name reference)
     (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
-              Sort FormatConvert Limit HashAggregate StreamingAggregate)))
+              Sort FormatConvert Limit HashAggregate StreamingAggregate Window)))
