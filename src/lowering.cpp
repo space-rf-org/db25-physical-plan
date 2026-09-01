@@ -472,20 +472,45 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     const GroupingSpec group_spec = grouping_of(memo.group(g));
     // The candidate count is known before the loop, so the vector never has to
     // grow and re-move what it already holds.
-    memo.group(g).exprs.reserve(cands.size() * scan_formats.size());
+    // Reserve the EXACT candidate count, build sides included. Reserving only
+    // cands * formats left the vector one grow short as soon as a join offered
+    // both build sides, and that grow showed up as +2 allocations on the budget
+    // query - a reserve that is nearly right is a reserve that reallocates.
+    {
+        std::size_t n_cand = 0;
+        for (const PhysicalOp cand : cands) {
+            n_cand += scan_formats.size() *
+                      (is_build_side_choosable(cand, memo.group(g).join_kind) ? 2u : 1u);
+        }
+        memo.group(g).exprs.reserve(n_cand);
+    }
     for (const PhysicalOp cand : cands) {
         // A candidate whose precondition does not hold is not a cheaper option, it
         // is not an option at all.
         if (!is_applicable(cand, keys, payload_join_kind, group_spec,
                            memo.group(g).set_op)) continue;
+        // Where the build side is a real choice, offer BOTH and let the search
+        // cost them like any other pair. Where it is not, offer only the
+        // semantically fixed one - a swapped candidate there would compute a
+        // different relation, not a cheaper plan.
+        const bool choose_build = is_build_side_choosable(cand, payload_join_kind);
         for (const FormatAvailability& fa : scan_formats) {
-            GroupExpr ge;
-            ge.op = cand;
-            ge.scan_format = fa.format;
-            ge.scan_freshness = fa.freshness;
-            ge.input_reqs = required_input_properties(cand, keys, memo.group(g).sort_keys);
-            memo.add_expr(g, std::move(ge));
-            ++candidates;
+            for (int side = 0; side < (choose_build ? 2 : 1); ++side) {
+                GroupExpr ge;
+                ge.op = cand;
+                ge.scan_format = fa.format;
+                ge.scan_freshness = fa.freshness;
+                ge.build_right = (side == 0);
+                // Recomputed per candidate rather than hoisted out of these loops.
+                // Hoisting looks like an obvious win - it depends on neither the
+                // format nor the build side - but the result must then be COPIED
+                // into each candidate, and a copy of an ArityVec<PhysicalProperties>
+                // copies the sort vectors inside it. Measured: hoisting made the
+                // budget query WORSE by one allocation, not better.
+                ge.input_reqs = required_input_properties(cand, keys, memo.group(g).sort_keys);
+                memo.add_expr(g, std::move(ge));
+                ++candidates;
+            }
         }
     }
     if (memo.group(g).exprs.empty()) {
@@ -605,7 +630,7 @@ struct Optimizer {
             const std::span<const double> in_rows{in_rows_buf, n_in};
             const ArityVec<PhysicalProperties>& op_reqs = ge.input_reqs;
             const double own_cost =
-                operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format);
+                operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format, ge.build_right);
 
             // The operator's own work alone already costs at least the bound, so
             // no arrangement of its inputs can rescue it.

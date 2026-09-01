@@ -46,6 +46,12 @@ struct GroupExpr {
     PhysicalOp op;
     StorageFormat scan_format = StorageFormat::Row;  // SeqScan: the format read
     Freshness scan_freshness = Freshness::Fresh;     // SeqScan: does that copy lag?
+    // HashJoin: which input is MATERIALIZED into the hash table; the other streams
+    // past it. Building the SMALLER side is what makes a hash join cheap, and
+    // which side is smaller is not knowable until cardinalities are - so it is a
+    // costed CANDIDATE rather than a rule, settled by the same comparison as every
+    // other physical decision. See is_build_side_choosable for where it is sound.
+    bool build_right = true;
 
     double cost = std::numeric_limits<double>::infinity();
     // What THIS candidate's output looks like, derived when it was added. Stored

@@ -135,9 +135,13 @@ struct CardinalityModel {
                                    LimitSpec limits = {}, GroupingSpec grouping = {},
                                    ast::SetOp set_op = ast::SetOp::Union,
                                    double values_rows = 0.0);
+// `build_right` says which input a hash join materializes - the difference
+// between hashing a thousand rows and probing ten, and hashing ten and probing a
+// thousand.
 [[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
-                                   StorageFormat scan_format = StorageFormat::Row);
+                                   StorageFormat scan_format = StorageFormat::Row,
+                                   bool build_right = true);
 
 // What it would cost to make `rows` rows satisfying `provided` also satisfy
 // `required` - i.e. the enforcers that would have to be inserted. Zero when the

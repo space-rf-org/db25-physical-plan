@@ -111,6 +111,19 @@ inline constexpr std::array<PhysicalOp, 21> kAllPhysicalOps = {
 // one equi-key to hash on?
 [[nodiscard]] bool needs_equi_key(PhysicalOp op) noexcept;
 
+// May the planner choose WHICH input a hash-family operator builds its table
+// from? Only for an INNER or CROSS HashJoin, where the two inputs are
+// interchangeable to the algorithm and only the output column order - fixed by
+// the group's schema, not by the build side - distinguishes them.
+//
+// Everything else has a semantically FIXED build side and would be wrong with a
+// chosen one. An outer join must keep unmatched rows of a particular input, so it
+// has to track matches on that side; a semi or anti join probes the left stream
+// against a set built from the right, and swapping them computes a different
+// relation; EXCEPT is not symmetric at all. The choice is offered exactly where
+// it is sound.
+[[nodiscard]] bool is_build_side_choosable(PhysicalOp op, ast::JoinType join_kind) noexcept;
+
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
 // "unconstrained" (never a derived property).
@@ -257,6 +270,9 @@ struct PhysicalNode {
     // the operator's obligation, so they cannot stand in for this.
     ast::JoinType join_kind = ast::JoinType::Inner;
     ast::SetOp set_op = ast::SetOp::Union;               // HashSetOp: which one
+    // HashJoin: which input is materialized into the hash table. Recorded on the
+    // node because an executor cannot infer it - the plan has to say.
+    bool build_right = true;
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
     Freshness scan_freshness = Freshness::Fresh;         // SeqScan: does this copy lag?

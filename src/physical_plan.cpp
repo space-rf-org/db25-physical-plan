@@ -66,6 +66,11 @@ bool is_nested_loop(PhysicalOp op) noexcept {
            op == PhysicalOp::NestedLoopAntiJoin;
 }
 
+bool is_build_side_choosable(PhysicalOp op, ast::JoinType join_kind) noexcept {
+    if (op != PhysicalOp::HashJoin) return false;
+    return join_kind == ast::JoinType::Inner || join_kind == ast::JoinType::Cross;
+}
+
 bool needs_equi_key(PhysicalOp op) noexcept {
     // A merge join has nothing to merge on without a key; the three hash-building
     // operators have nothing to hash on. Grouped here rather than listed at each
