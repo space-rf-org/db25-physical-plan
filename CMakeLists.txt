@@ -100,4 +100,17 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_compile_definitions(lowering_tests PRIVATE
         DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
     add_test(NAME lowering_tests COMMAND lowering_tests)
+
+    # The allocation budget replaces global operator new to count, which does not
+    # coexist with the sanitizers' own allocator interception - so it is built and
+    # run only in an unsanitized build. The metric is deterministic, so one
+    # configuration measuring it is enough.
+    if(NOT CMAKE_CXX_FLAGS MATCHES "sanitize")
+        add_executable(allocation_budget_tests tests/test_allocation_budget.cpp)
+        target_link_libraries(allocation_budget_tests PRIVATE db25physicalplan)
+        target_compile_options(allocation_budget_tests PRIVATE -fno-exceptions -Wall -Wextra)
+        target_compile_definitions(allocation_budget_tests PRIVATE
+            DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+        add_test(NAME allocation_budget_tests COMMAND allocation_budget_tests)
+    endif()
 endif()

@@ -10,6 +10,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <span>
 #include <vector>
 
 namespace db25::physical {
@@ -93,7 +94,7 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
 // plan is costed identically however it is currently represented. This is the
 // "one cost model" invariant (design D3) made structural.
 
-double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
+double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                      const std::string& table_name, const CardinalityModel& card) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
@@ -117,7 +118,7 @@ double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
     return 0.0;
 }
 
-double operator_cost(PhysicalOp op, const std::vector<double>& input_rows, double out_rows,
+double operator_cost(PhysicalOp op, std::span<const double> input_rows, double out_rows,
                      const CalibrationProfile& cal, StorageFormat scan_format) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
@@ -163,11 +164,13 @@ double enforcement_cost(const PhysicalProperties& provided, const PhysicalProper
     double c = 0.0;
     PhysicalProperties after = provided;
     if (required.format != StorageFormat::Any && required.format != provided.format) {
-        c += operator_cost(PhysicalOp::FormatConvert, {rows}, rows, cal);
+        const double one[1] = {rows};
+        c += operator_cost(PhysicalOp::FormatConvert, one, rows, cal);
         after.format = required.format;
     }
     if (!satisfies(after, required)) {  // order still unmet
-        c += operator_cost(PhysicalOp::Sort, {rows}, rows, cal);
+        const double one[1] = {rows};
+        c += operator_cost(PhysicalOp::Sort, one, rows, cal);
     }
     return c;
 }
