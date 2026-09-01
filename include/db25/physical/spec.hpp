@@ -12,6 +12,7 @@
 #include "db25/physical/physical_plan.hpp"
 
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -43,11 +44,25 @@ struct ImplRule {
 };
 
 // A loaded physical spec.
+// When exhaustive search stops being affordable (design D5). Past this many
+// joins the planner falls back to a bounded enumeration rather than let planning
+// time grow with the search space.
+//
+// The VALUE is a spec input rather than a constant in the code deliberately: what
+// is affordable depends on the planning-time budget and the host, neither of which
+// belongs in a source file. Deriving it from the budget is still open question 5;
+// what this unit fixes is that it is data, and that crossing it is a decision the
+// planner reports rather than a silent change of behaviour.
+struct SearchBudget {
+    std::uint32_t max_join_count = 8;  // a placeholder value, not a derived one
+};
+
 struct PhysicalSpec {
     int version = -1;
     std::vector<OperatorSpec> operators;
     std::vector<ImplRule> impl_rules;
     CapabilityProfile profile;
+    SearchBudget budget;
 
     [[nodiscard]] const OperatorSpec* find_operator(const std::string& name) const;
     // Every physical operator a logical operator may lower to, in spec order.

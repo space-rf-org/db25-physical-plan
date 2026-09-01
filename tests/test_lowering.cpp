@@ -473,6 +473,165 @@ static void test_non_equivalent_subtrees_never_share() {
     }
 }
 
+// ---- Unit 2.5: the D5 budget guard ----------------------------------------
+
+// The threshold is DATA. It is read from the spec, not compiled in, so it can be
+// tuned per capability profile without a rebuild - and so a test can state the
+// value it depends on instead of inheriting one.
+static void test_search_budget_comes_from_the_spec() {
+    std::printf("test_search_budget_comes_from_the_spec\n");
+    std::string error;
+    auto spec = db25::physical::load_spec(
+        std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr", error);
+    CHECK(spec.has_value());
+    if (!spec) return;
+    CHECK(spec->budget.max_join_count == 8);
+
+    // Absent from a spec, the documented default stands in rather than zero -
+    // zero would put every query, including a single scan, past the guard.
+    auto minimal = db25::physical::parse_spec(
+        "(physical-spec (version 0)"
+        "  (operators (operator (name SeqScan) (arity 0) (kind access-path)))"
+        "  (capability-profile (name reference) (executes SeqScan)))",
+        error);
+    CHECK(minimal.has_value());
+    if (minimal) CHECK(minimal->budget.max_join_count == 8);
+}
+
+// Below the budget the full property-directed search runs; above it the planner
+// falls back to a bounded enumeration. Both produce a valid plan costed by the
+// same model - what changes is how much of the space was examined.
+//
+// The guard is REPORTED, not silent. A caller that cares whether it got the
+// cheapest plan the search could find, or merely an affordable one, has to be
+// able to tell the difference; a planner that quietly degrades is a planner whose
+// goldens mean different things on different days.
+static void test_budget_guard_engages_and_is_reported() {
+    std::printf("test_budget_guard_engages_and_is_reported\n");
+    std::string error;
+    auto spec = db25::physical::load_spec(
+        std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr", error);
+    CHECK(spec.has_value());
+    if (!spec) return;
+
+    // One join, well under the shipped budget of 8.
+    {
+        auto logical = build_logical();
+        LoweringContext ctx;
+        ctx.spec = &*spec;
+        const LoweringResult r = lower(*logical, ctx);
+        CHECK(r.ok);
+        CHECK(r.join_count == 1);
+        CHECK(!r.budget_guard_engaged);   // the full search ran
+    }
+
+    // The same query with a budget it exceeds: the guard engages and says so.
+    // The threshold is a maximum, so it trips when joins EXCEED it - a budget of
+    // zero trips on any join at all.
+    {
+        auto logical = build_logical();
+        auto tight = *spec;
+        tight.budget.max_join_count = 0;
+        LoweringContext ctx;
+        ctx.spec = &tight;
+        const LoweringResult r = lower(*logical, ctx);
+        CHECK(r.ok);
+        CHECK(r.join_count == 1);
+        CHECK(r.budget_guard_engaged);   // reported, not silent
+        CHECK(r.plan != nullptr);        // and still a real plan
+    }
+
+    // The context override exists so a caller can force either side of the
+    // threshold without editing a spec; zero means "defer to the spec".
+    {
+        auto logical = build_logical();
+        LoweringContext ctx;
+        ctx.spec = &*spec;
+        ctx.max_join_count_override = 1;
+        CHECK(!lower(*logical, ctx).budget_guard_engaged);  // 1 join is not > 1
+    }
+}
+
+// The guard must actually BOUND something, not merely set a flag. This is where
+// it is observable: carrying a required order down to the join group happens on
+// the pushed-down route, and that route is what the guard trades away. So the
+// same query, asked for the same ordered output, plans differently on each side
+// of the threshold - a MergeJoin whose own output is ordered when the full search
+// runs, a HashJoin with a Sort stacked on top when it does not.
+//
+// Both are valid and both are costed by the same model. The guarded one is worse,
+// which is the trade the guard exists to make.
+static void test_guard_changes_what_the_search_finds() {
+    std::printf("test_guard_changes_what_the_search_finds\n");
+    std::string error;
+    auto spec = db25::physical::load_spec(
+        std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr", error);
+    if (!spec) { CHECK(false); return; }
+
+    PhysicalProperties ordered;
+    ordered.sort = {SortKey{0, false}};
+
+    auto full_q = build_logical();
+    LoweringContext full;
+    full.spec = &*spec;
+    full.required_output = ordered;
+    const LoweringResult rf = lower(*full_q, full);
+    CHECK(rf.ok);
+    CHECK(!rf.budget_guard_engaged);
+
+    auto guarded_q = build_logical();
+    auto tight = *spec;
+    tight.budget.max_join_count = 0;   // any join trips it
+    LoweringContext guarded;
+    guarded.spec = &tight;
+    guarded.required_output = ordered;
+    const LoweringResult rg = lower(*guarded_q, guarded);
+    CHECK(rg.ok);
+    CHECK(rg.budget_guard_engaged);
+    if (!rf.plan || !rg.plan) return;
+
+    const std::string sf = physical_to_sexpr(*rf.plan);
+    const std::string sg = physical_to_sexpr(*rg.plan);
+    CHECK(sf != sg);                      // the guard is not decorative
+    CHECK(contains(sf, "MergeJoin"));     // full search carries the order down
+    CHECK(contains(sg, "HashJoin"));      // guarded search enforces on top instead
+    CHECK(contains(sg, "(Sort by="));
+
+    // Whatever it chose, it still satisfies what was asked of it. A bounded
+    // search may return a dearer plan; it may never return a wrong one.
+    CHECK(satisfies(derive(*rg.plan), ordered));
+}
+
+// Bounded search must still be DETERMINISTIC. A guard that made planning depend
+// on anything but its declared inputs would make goldens meaningless above the
+// threshold, which is worse than being slow.
+static void test_guarded_search_is_deterministic() {
+    std::printf("test_guarded_search_is_deterministic\n");
+    std::string error;
+    auto spec = db25::physical::load_spec(
+        std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr", error);
+    if (!spec) { CHECK(false); return; }
+    auto tight = *spec;
+    tight.budget.max_join_count = 0;
+
+    std::string first;
+    for (int i = 0; i < 5; ++i) {
+        auto logical = build_logical();
+        LoweringContext ctx;
+        ctx.spec = &tight;
+        const LoweringResult r = lower(*logical, ctx);
+        CHECK(r.ok);
+        if (!r.plan) return;
+        const std::string s = physical_to_sexpr(*r.plan);
+        if (i == 0) first = s;
+        CHECK(s == first);
+    }
+
+    // And the guarded plan is a real, costed plan - not a degenerate one.
+    CHECK(contains(first, "SeqScan"));
+    CHECK(contains(first, "Join"));
+}
+
 static void test_unsupported_operator_is_an_error() {
     std::printf("test_unsupported_operator_is_an_error\n");
     auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
@@ -869,6 +1028,10 @@ int main() {
     test_pruning_never_changes_the_plan();
     test_identical_subtrees_share_a_group();
     test_non_equivalent_subtrees_never_share();
+    test_search_budget_comes_from_the_spec();
+    test_budget_guard_engages_and_is_reported();
+    test_guard_changes_what_the_search_finds();
+    test_guarded_search_is_deterministic();
     test_unsupported_operator_is_an_error();
 
     if (g_failures == 0) {

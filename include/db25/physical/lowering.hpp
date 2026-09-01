@@ -20,6 +20,7 @@
 
 #include "db25/plan/logical_plan.hpp"
 
+#include <cstdint>
 #include <string>
 
 namespace db25::physical {
@@ -71,6 +72,9 @@ struct LoweringContext {
     // re-derivation exponential. Turn this on with that, or for a workload with
     // genuinely repeated subtrees; the mechanism is ready either way.
     bool dedup = false;
+    // Override the spec's search budget (design D5). Zero means "use the spec's".
+    // A test can force the guard on a small query; production reads the spec.
+    std::uint32_t max_join_count_override = 0;
     const RuntimeProfile* runtime = nullptr;
 };
 
@@ -94,6 +98,14 @@ struct LoweringResult {
     // already explored, and so shared its memo group instead of building a
     // second. Zero on a query with no repeated subtree - which is most of them.
     std::size_t groups_shared = 0;
+    // Joins in the logical plan, and whether that count crossed the spec's search
+    // budget. When it did, the plan was chosen by a BOUNDED enumeration rather
+    // than the full property-directed search: still costed by the same model, but
+    // not guaranteed to be the cheapest plan the full search would have found.
+    // Reported rather than silent, because a caller that cares about plan quality
+    // needs to know which of the two it got.
+    std::size_t join_count = 0;
+    bool budget_guard_engaged = false;
 };
 
 // Lower a logical plan to a physical plan. The physical plan borrows expression

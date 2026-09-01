@@ -106,7 +106,9 @@ void split_join_predicate(const plan::Expr* e, std::uint32_t left_width,
 // than a bottom-up sweep that happens to consult properties.
 GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
                 const CardinalityModel& card, const StorageCatalog& storage,
-                std::size_t& candidates, std::size_t& shared, std::string& error) {
+                std::size_t& candidates, std::size_t& shared, std::size_t& joins,
+                std::string& error) {
+    if (n.op == plan::LogicalOp::Join) ++joins;
     const std::vector<PhysicalOp> cands = resolve_candidates(n.op, ctx);
     if (cands.empty()) {
         const char* ln = logical_op_name(n.op);
@@ -117,8 +119,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 
     std::vector<GroupId> inputs;
     for (std::size_t i = 0; i < n.child_count(); ++i) {
-        const GroupId g =
-            explore(*n.child(i), memo, ctx, card, storage, candidates, shared, error);
+        const GroupId g = explore(*n.child(i), memo, ctx, card, storage, candidates, shared,
+                                  joins, error);
         if (g == kInvalidGroup) return kInvalidGroup;
         inputs.push_back(g);
     }
@@ -252,6 +254,13 @@ struct Optimizer {
     Memo& memo;
     const CalibrationProfile& cal;
     bool prune = true;
+    // The D5 budget guard. When engaged the search still costs every APPLICABLE
+    // candidate with the same cost model - it just stops exploring the second
+    // route, so the enforce-vs-push-down choice is not made and enforcement is
+    // simply charged on top. That halves the work per candidate and bounds the
+    // goals a group is asked for, at the price of a plan that may not be the one
+    // the full search would have chosen.
+    bool greedy = false;
     std::size_t goals = 0;
     std::size_t pruned = 0;
 
@@ -365,6 +374,10 @@ struct Optimizer {
             }
 
             // --- route 2: push the requirement into the input instead ---
+            // Skipped under the budget guard: this is the half of the search that
+            // explores an ALTERNATIVE placement, and it is what the guard trades
+            // away first because route 1 alone still yields a valid, costed plan.
+            if (greedy) continue;
             if (const std::optional<PhysicalProperties> down =
                     pushdown_requirement(ge.op, required)) {
                 ArityVec<PhysicalProperties> pushed = op_reqs;
@@ -437,16 +450,22 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     const StorageCatalog storage = ctx.storage != nullptr ? *ctx.storage : StorageCatalog{};
 
     Memo memo;
-    const GroupId root_group = explore(root, memo, ctx, card, storage,
-                                       result.candidates_considered, result.groups_shared,
-                                       result.error);
+    const GroupId root_group =
+        explore(root, memo, ctx, card, storage, result.candidates_considered,
+                result.groups_shared, result.join_count, result.error);
     if (root_group == kInvalidGroup) {
         return result;  // ok stays false, error set
     }
     memo.set_root(root_group);
     result.memo_groups = memo.size();
 
-    Optimizer opt{memo, cal, ctx.prune, 0, 0};
+    const std::uint32_t budget = ctx.max_join_count_override != 0
+                                     ? ctx.max_join_count_override
+                                     : (ctx.spec != nullptr ? ctx.spec->budget.max_join_count
+                                                            : SearchBudget{}.max_join_count);
+    result.budget_guard_engaged = result.join_count > budget;
+
+    Optimizer opt{memo, cal, ctx.prune, result.budget_guard_engaged, 0, 0};
     if (!opt.optimize(root_group, ctx.required_output)) {
         result.error = "no plan satisfies the required output properties";
         return result;
