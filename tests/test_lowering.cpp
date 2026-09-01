@@ -640,11 +640,16 @@ static void test_unsupported_operator_is_an_error() {
     auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
     scan->table_name = "a";
     scan->output = a_schema();
-    auto agg = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Aggregate);  // not in Inc 0
-    agg->output = a_schema();
-    agg->add_child(std::move(scan));
+    // Deliberately an operator with NO implementation rule. This was Aggregate
+    // until Increment 3.2 gave Aggregate one, at which point the test started
+    // asserting that a supported operator fails - which is why it is written
+    // against the furthest-out operator in the roadmap rather than the nearest.
+    // When RecursiveCTE lowers, move this to whatever still does not.
+    auto unsupported = std::make_unique<plan::LogicalNode>(plan::LogicalOp::RecursiveCTE);
+    unsupported->output = a_schema();
+    unsupported->add_child(std::move(scan));
 
-    const LoweringResult r = lower(*agg);
+    const LoweringResult r = lower(*unsupported);
     CHECK(!r.ok);
     CHECK(!r.error.empty());
     CHECK(r.plan == nullptr);
@@ -1370,6 +1375,192 @@ static void test_sorts_and_limits_are_not_interchangeable_groups() {
     };
     CHECK(!make_limit(10).equals(make_limit(20)));
     CHECK(make_limit(10).equals(make_limit(10)));
+
+    // And the aggregate split. `GROUP BY a` computing agg(b) and `GROUP BY a, b`
+    // computing nothing carry the SAME expression list on the group - the payload
+    // shares one vector - and differ only in where it splits. Without the split
+    // count in the key they would dedup into one group and one would silently
+    // answer for the other. (Found by mutation: removing group_key_count from the
+    // key broke nothing until this existed.)
+    auto keya = col(0, DataType::Integer);
+    auto keyb = col(1, DataType::Integer);
+    auto make_agg = [&](std::uint32_t split) {
+        db25::physical::GroupKey k;
+        k.logical_op = static_cast<int>(plan::LogicalOp::Aggregate);
+        k.output = &out;
+        k.op_exprs = {keya.get(), keyb.get()};
+        k.group_key_count = split;
+        k.finish();
+        return k;
+    };
+    CHECK(!make_agg(1).equals(make_agg(2)));
+    CHECK(make_agg(1).hash != make_agg(2).hash);
+    CHECK(make_agg(1).equals(make_agg(1)));
+}
+
+// ---------------------------------------------------------------------------
+// Increment 3.2: GROUP BY lowers, and WHICH aggregate is a cost decision.
+//
+// This is the first property-directed choice outside a join. A streaming
+// aggregate is cheaper per row but needs its input sorted on the grouping keys;
+// hashing needs nothing but produces no order. Neither is universally better,
+// which is exactly the shape Increment 2's search was built for.
+static plan::LogicalNodePtr build_aggregate(bool computed_key = false,
+                                            bool scalar = false,
+                                            bool grouping_sets = false) {
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+
+    auto agg = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Aggregate);
+    agg->output = a_schema();
+    if (!scalar) {
+        agg->group_keys.push_back(computed_key
+            ? binop(BinaryOp::Add, col(0, DataType::Integer), col(1, DataType::Integer))
+            : col(0, DataType::Integer));
+    }
+    agg->aggregates.push_back(col(1, DataType::Integer));  // stands in for an agg call
+    if (grouping_sets) agg->grouping_sets.push_back({0});
+    agg->add_child(std::move(scan));
+    return agg;
+}
+
+static void test_group_by_lowers() {
+    std::printf("test_group_by_lowers\n");
+    auto logical = build_aggregate();
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "Aggregate keys=[(col #0)] aggs=[(col #1)]"));
+    CHECK(contains(s, "(SeqScan table=a"));
+    // Both candidates were built - the choice is real, not a single option
+    // dressed up as one.
+    CHECK(r.candidates_considered >= 2);
+}
+
+// The trade, made visible - and it does NOT go the way one first guesses.
+//
+// A streaming aggregate is cheaper per row (0.5 vs 1.1) but must have its input
+// sorted on the grouping keys. The naive expectation is that requiring the
+// aggregate's output in grouping-key order tips the balance to streaming, since
+// the sort is then needed anyway. It does not, and the cost model is right to say
+// so: an aggregate REDUCES its input, so a Sort placed ABOVE it sorts the groups
+// while a Sort placed BELOW it sorts every row. With the default 10% group
+// selectivity that is 100 rows against 1000, and hashing wins comfortably:
+//
+//   groups   hash + sort-above    sort-below + stream    winner
+//      100              1764.4                10465.8    HASH
+//      500              5582.9                10465.8    HASH
+//     1000             11065.8                10465.8    STREAM
+//
+// Streaming wins where the grouping key is HIGH-CARDINALITY - the aggregate
+// barely reduces, both routes sort the same number of rows, and streaming's
+// cheaper per-row rate is all that is left to separate them. That is the real
+// condition, so that is what this test sets up. The first version of this test
+// asserted the naive expectation and failed; the planner was correct and the
+// test was not.
+//
+// If both halves ever show the same operator, the second candidate has become
+// decoration.
+static void test_aggregate_algorithm_is_chosen_by_cost() {
+    std::printf("test_aggregate_algorithm_is_chosen_by_cost\n");
+
+    auto unconstrained = build_aggregate();
+    const LoweringResult ru = lower(*unconstrained);
+    CHECK(ru.ok);
+    const std::string su = ru.plan ? physical_to_sexpr(*ru.plan) : std::string{};
+    CHECK(contains(su, "HashAggregate"));
+
+    // Every row its own group: the aggregate reduces nothing, so the Sort costs
+    // the same on either side of it and only the per-row rate decides.
+    db25::physical::CardinalityModel distinct_keys;
+    distinct_keys.group_selectivity = 1.0;
+    LoweringContext ctx;
+    ctx.cardinality = &distinct_keys;
+    ctx.required_output.sort = {SortKey{0, false, false, false}};
+
+    auto ordered = build_aggregate();
+    const LoweringResult ro = lower(*ordered, ctx);
+    CHECK(ro.ok);
+    const std::string so = ro.plan ? physical_to_sexpr(*ro.plan) : std::string{};
+    CHECK(contains(so, "StreamingAggregate"));
+    CHECK(su != so);
+
+    // The chosen plan must actually satisfy what was asked of it, not merely pick
+    // the operator this test hoped for.
+    if (ro.plan) CHECK(satisfies(derive(*ro.plan), ctx.required_output));
+    // And no Sort may sit ABOVE the streaming aggregate: it already emits the
+    // grouping order, and a Sort there would mean the search cannot see that.
+    CHECK(so.find("Sort") > so.find("StreamingAggregate"));
+    // The Sort that IS there feeds the aggregate, so it must be below it.
+    CHECK(contains(so, "Sort"));
+}
+
+// A grouping key that is not a plain column reference cannot be expressed as a
+// sort requirement, so streaming is inapplicable - but the query still lowers,
+// via hashing, which hashes the expression itself. A missing capability costs a
+// plan ALTERNATIVE here, not an answer.
+static void test_a_computed_grouping_key_still_lowers_via_hash() {
+    std::printf("test_a_computed_grouping_key_still_lowers_via_hash\n");
+    auto logical = build_aggregate(/*computed_key=*/true);
+    LoweringContext ctx;
+    // Ask for the order that would ordinarily tempt the search into streaming.
+    ctx.required_output.sort = {SortKey{0, false, false, false}};
+    const LoweringResult r = lower(*logical, ctx);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "HashAggregate"));
+    CHECK(!contains(s, "StreamingAggregate"));
+
+    using db25::physical::PhysicalOp;
+    CHECK(!db25::physical::is_applicable(PhysicalOp::StreamingAggregate, {},
+                                         db25::ast::JoinType::Inner,
+                                         db25::physical::GroupingSpec{1, false}));
+    CHECK(db25::physical::is_applicable(PhysicalOp::StreamingAggregate, {},
+                                        db25::ast::JoinType::Inner,
+                                        db25::physical::GroupingSpec{1, true}));
+    CHECK(db25::physical::is_applicable(PhysicalOp::HashAggregate, {},
+                                        db25::ast::JoinType::Inner,
+                                        db25::physical::GroupingSpec{1, false}));
+}
+
+// A scalar aggregate - SELECT COUNT(*) FROM t - returns exactly ONE row, however
+// large t is. Estimating it as a fraction of the input would be wrong rather than
+// imprecise, and every operator above it would inherit the error.
+static void test_a_scalar_aggregate_estimates_one_row() {
+    std::printf("test_a_scalar_aggregate_estimates_one_row\n");
+    const db25::physical::CardinalityModel card;
+    const double in_rows[1] = {1000.0};
+    const auto rows = [&](db25::physical::GroupingSpec g) {
+        return operator_rows(db25::physical::PhysicalOp::HashAggregate,
+                             std::span<const double>{in_rows, 1}, "", card, {}, g);
+    };
+    CHECK(rows(db25::physical::GroupingSpec{0, false}) == 1.0);
+    CHECK(rows(db25::physical::GroupingSpec{1, true}) == 1000.0 * card.group_selectivity);
+    // The ALGORITHM cannot change how many rows come out, exactly as for the joins.
+    CHECK(operator_rows(db25::physical::PhysicalOp::StreamingAggregate,
+                        std::span<const double>{in_rows, 1}, "", card, {},
+                        db25::physical::GroupingSpec{0, true}) == 1.0);
+
+    auto logical = build_aggregate(false, /*scalar=*/true);
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (r.plan) CHECK(card.rows(*r.plan) == 1.0);
+}
+
+// ROLLUP / CUBE / GROUPING SETS ask for several grouping-key combinations at
+// once. Neither operator computes that, and treating it as a plain GROUP BY would
+// return the WRONG ROWS while reporting success - the failure mode this project
+// keeps finding and keeps refusing to ship.
+static void test_grouping_sets_fail_rather_than_silently_flatten() {
+    std::printf("test_grouping_sets_fail_rather_than_silently_flatten\n");
+    auto logical = build_aggregate(false, false, /*grouping_sets=*/true);
+    const LoweringResult r = lower(*logical);
+    CHECK(!r.ok);
+    CHECK(r.plan == nullptr);
+    CHECK(contains(r.error, "grouping sets"));
 }
 
 int main() {
@@ -1408,6 +1599,11 @@ int main() {
     test_limit_bounds_the_row_estimate();
     test_a_computed_sort_key_fails_honestly();
     test_sorts_and_limits_are_not_interchangeable_groups();
+    test_group_by_lowers();
+    test_aggregate_algorithm_is_chosen_by_cost();
+    test_a_computed_grouping_key_still_lowers_via_hash();
+    test_a_scalar_aggregate_estimates_one_row();
+    test_grouping_sets_fail_rather_than_silently_flatten();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

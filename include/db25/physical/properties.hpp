@@ -43,7 +43,8 @@ struct PhysicalProperties {
 // The physical properties an operator's output has, given what its inputs
 // provide. Representation-independent (as the cost formulas are), so the tree
 // form below and the memo form - where inputs are GROUPS - derive identically.
-// `sort_keys` is the Sort operator's own payload - the order it establishes.
+// `sort_keys` is the ordered key set this operator works in: the order a Sort
+// establishes, and the grouping order a StreamingAggregate consumes and preserves.
 // It has to be an input here, not patched on afterwards, because a Sort is now
 // both an ENFORCER (built by enforce(), which knows the order it is creating) and
 // the implementation of a logical Sort (a memo group, whose provided properties
@@ -64,7 +65,8 @@ struct PhysicalProperties {
 // merge on and it is not a valid way to compute the (cross) product - regardless
 // of what it would cost. Every other operator is unconditionally applicable.
 [[nodiscard]] bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys,
-                                 ast::JoinType join_kind = ast::JoinType::Inner);
+                                 ast::JoinType join_kind = ast::JoinType::Inner,
+                                 GroupingSpec grouping = {});
 
 // The part of a consumer's requirement an operator can discharge by REQUIRING IT
 // OF ITS INPUT instead of having an enforcer placed above it - nullopt when it
@@ -80,8 +82,11 @@ struct PhysicalProperties {
 // makes it cheaper than a HashJoin when the order is already there and dearer
 // when it must be enforced. Every other operator is indifferent. The returned
 // vector is one entry per input, in operand order.
+// `group_sort` is the grouping order a StreamingAggregate consumes its input in -
+// the same ordered-key-set that `sort_keys` is elsewhere.
 [[nodiscard]] std::vector<PhysicalProperties> required_input_properties(
-    PhysicalOp op, const std::vector<HashKey>& keys);
+    PhysicalOp op, const std::vector<HashKey>& keys,
+    std::span<const SortKey> group_sort = {});
 
 // The physical properties of the output of `node`, derived bottom-up.
 [[nodiscard]] PhysicalProperties derive(const PhysicalNode& node);

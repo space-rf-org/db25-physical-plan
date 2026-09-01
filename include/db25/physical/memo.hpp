@@ -89,14 +89,35 @@ struct Group {
     std::string table_name;                // Scan
     const Expr* predicate = nullptr;       // Filter
     std::vector<const Expr*> residual;     // Join: non-key conjuncts to re-check
-    std::vector<const Expr*> projections;  // Project
+    // Project: one borrowed expression per output column.
+    // Aggregate: the GROUP BY keys followed by the aggregate calls, split at
+    // `group_key_count`. One vector for both is this struct's stated
+    // union-by-convention on the logical operator - and here it is also load
+    // bearing; see the note below.
+    std::vector<const Expr*> op_exprs;
     std::vector<HashKey> hash_keys;        // equi-join keys
     // Join: the relational join being implemented. Part of the GROUP payload, not
     // of a candidate: every group-expression in a group implements the SAME
     // logical operator, and an inner join is not equivalent to a left join.
     ast::JoinType join_kind = ast::JoinType::Inner;
+    // Aggregate: where `op_exprs` splits from grouping keys into aggregate calls.
+    // Declared HERE, immediately after the one-byte `join_kind`, so it lands in
+    // padding that already existed rather than adding eight bytes of its own.
+    // Moving it elsewhere in this struct costs 8 bytes and, at the current size,
+    // that is enough to change the deque packing - see the note below.
+    std::uint32_t group_key_count = 0;
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     LimitSpec limits;                      // Limit: LIMIT / OFFSET
+
+    // WHY THE AGGREGATE PAYLOAD SHARES ONE VECTOR. Groups live in a std::deque,
+    // and libstdc++ packs 512/sizeof(T) elements into each deque node - one per
+    // node once sizeof(T) reaches 512, two while it is 256. Giving the Aggregate
+    // its own `group_keys` and `aggregates` vectors pushed sizeof(Group) from 256
+    // to 304, which halved the packing and doubled the memo's node allocations FOR
+    // EVERY QUERY: +4 on the five-group budget query, and growing with every later
+    // operator that wanted a payload field of its own. The allocation budget test
+    // caught it, reporting it as a count rather than as a size, which is why this
+    // note exists. Keep sizeof(Group) at or below 256.
 
     // BORROWED, on the same contract as every expression payload in this planner:
     // the logical plan outlives the physical plan. Copying it here meant one full
@@ -190,7 +211,7 @@ struct GroupKey {
     ArityVec<GroupId> inputs;
     const Expr* predicate = nullptr;
     std::vector<const Expr*> residual;
-    std::vector<const Expr*> projections;
+    std::vector<const Expr*> op_exprs;
     std::vector<HashKey> hash_keys;
     // Part of the key. Two joins over the same inputs with the same keys and the
     // same predicate are NOT the same group if one is inner and the other left:
@@ -202,6 +223,7 @@ struct GroupKey {
     // are different operators sharing one LogicalOp.
     std::vector<SortKey> sort_keys;
     LimitSpec limits;
+    std::uint32_t group_key_count = 0;
     bool comparable = false;
     std::uint64_t hash = 0;
 

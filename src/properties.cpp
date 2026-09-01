@@ -123,6 +123,19 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
         case PhysicalOp::FormatConvert:
             // Changes the format to its target (filled in by the caller); preserves order.
             return PhysicalProperties{in(0).sort, StorageFormat::Any, in(0).freshness};
+        case PhysicalOp::HashAggregate:
+            // Builds a hash table on the grouping keys: the output comes out in
+            // hash-bucket order, which is no order at all. Same as a HashJoin.
+            return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
+        case PhysicalOp::StreamingAggregate:
+            // Consumes its input in grouping-key order and emits one row per group
+            // as each group closes, so that order SURVIVES - the property that can
+            // save a later Sort and is exactly why it may win over hashing.
+            // `sort_keys` is the grouping order here, on the same footing as it is
+            // the established order for a Sort: in both cases it is the ordered key
+            // set this operator works in.
+            return PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, StorageFormat::Row,
+                                      in(0).freshness};
         case PhysicalOp::Limit:
             // Takes a contiguous window of its input's rows, so everything about
             // them is preserved: still in the same order, same format, same
@@ -133,7 +146,8 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
     return PhysicalProperties{};
 }
 
-bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinType join_kind) {
+bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinType join_kind,
+                   GroupingSpec grouping) {
     // A LATERAL join's right input is CORRELATED: its subtree reads the current
     // left row through an OuterRef, so it has no meaning evaluated on its own.
     // Only a nested-loop join re-evaluates the right input per left row; a hash
@@ -149,6 +163,16 @@ bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinTyp
     // correct; add an equi-condition to the ON clause and the same query lowered
     // to a HashJoin over a correlated right input, with lower() reporting ok.
     if (join_is_lateral(join_kind) && op != PhysicalOp::NestedLoopJoin) return false;
+
+    // A streaming aggregate needs its input sorted on the grouping keys, and a
+    // sort requirement is POSITIONAL - so if any grouping key is not a plain
+    // column reference there is no requirement to state, and streaming is not an
+    // option. Hashing is, because it hashes the expressions themselves.
+    //
+    // Applicability, not cost, for the usual reason: a streaming aggregate is the
+    // CHEAPER of the two per row, so left to the cost model it would win and emit
+    // a plan whose stated input requirement does not describe what it needs.
+    if (op == PhysicalOp::StreamingAggregate && !grouping.orderable) return false;
 
     // Both keyed joins need at least one equi-key: a merge join has nothing to
     // merge on without one, and a hash join has nothing to hash on. Note this
@@ -199,7 +223,8 @@ std::optional<PhysicalProperties> pushdown_requirement(PhysicalOp op,
 }
 
 std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
-                                                          const std::vector<HashKey>& keys) {
+                                                          const std::vector<HashKey>& keys,
+                                                          std::span<const SortKey> group_sort) {
     std::vector<PhysicalProperties> reqs(expected_arity(op));
 
     // The reference engine's join operators consume ROW-format input (they
@@ -208,9 +233,22 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
     // which is what makes the substrate choice a real trade rather than "columnar
     // is always cheaper". A vectorized columnar join is a later operator; when it
     // arrives it simply declares a different requirement here.
+    // Both aggregates materialize rows too - into a hash table, or into a running
+    // group accumulator - so they take the same row-format requirement.
     if (op == PhysicalOp::HashJoin || op == PhysicalOp::MergeJoin ||
-        op == PhysicalOp::NestedLoopJoin) {
+        op == PhysicalOp::NestedLoopJoin || op == PhysicalOp::HashAggregate ||
+        op == PhysicalOp::StreamingAggregate) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
+    }
+
+    // The requirement that makes a streaming aggregate what it is: its input must
+    // already be grouped, i.e. sorted on the grouping keys. It is cheaper per row
+    // than hashing and dearer once a Sort has to be enforced to supply this - the
+    // same trade as MergeJoin against HashJoin, and settled the same way, by
+    // costing both routes rather than by a rule.
+    if (op == PhysicalOp::StreamingAggregate && !reqs.empty()) {
+        reqs[0].sort.assign(group_sort.begin(), group_sort.end());
+        reqs[0].format = StorageFormat::Row;
     }
 
     if (op == PhysicalOp::MergeJoin) {

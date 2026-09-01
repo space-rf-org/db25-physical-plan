@@ -19,7 +19,7 @@ std::uint64_t mix64(std::uint64_t h, std::uint64_t v) noexcept {
 void GroupKey::finish() noexcept {
     comparable = expr_is_comparable(predicate);
     for (const Expr* e : residual) comparable = comparable && expr_is_comparable(e);
-    for (const Expr* e : projections) comparable = comparable && expr_is_comparable(e);
+    for (const Expr* e : op_exprs) comparable = comparable && expr_is_comparable(e);
 
     std::uint64_t h = mix64(13, static_cast<std::uint64_t>(logical_op));
     if (table_name != nullptr) {
@@ -29,7 +29,7 @@ void GroupKey::finish() noexcept {
     for (const GroupId g : inputs) h = mix64(h, g);
     h = mix64(h, expr_structural_hash(predicate));
     for (const Expr* e : residual) h = mix64(h, expr_structural_hash(e));
-    for (const Expr* e : projections) h = mix64(h, expr_structural_hash(e));
+    for (const Expr* e : op_exprs) h = mix64(h, expr_structural_hash(e));
     for (const HashKey& k : hash_keys) { h = mix64(h, k.left_index); h = mix64(h, k.right_index); }
     h = mix64(h, static_cast<std::uint64_t>(join_kind));
     for (const SortKey& k : sort_keys) {
@@ -42,6 +42,7 @@ void GroupKey::finish() noexcept {
     h = mix64(h, static_cast<std::uint64_t>(limits.limit));
     h = mix64(h, static_cast<std::uint64_t>(limits.has_offset));
     h = mix64(h, static_cast<std::uint64_t>(limits.offset));
+    h = mix64(h, group_key_count);
     hash = h;
 }
 
@@ -76,9 +77,10 @@ bool GroupKey::equals(const GroupKey& o) const noexcept {
     for (std::size_t i = 0; i < residual.size(); ++i) {
         if (!expr_structurally_equal(residual[i], o.residual[i])) return false;
     }
-    if (projections.size() != o.projections.size()) return false;
-    for (std::size_t i = 0; i < projections.size(); ++i) {
-        if (!expr_structurally_equal(projections[i], o.projections[i])) return false;
+    if (group_key_count != o.group_key_count) return false;
+    if (op_exprs.size() != o.op_exprs.size()) return false;
+    for (std::size_t i = 0; i < op_exprs.size(); ++i) {
+        if (!expr_structurally_equal(op_exprs[i], o.op_exprs[i])) return false;
     }
     return true;
 }
@@ -206,7 +208,15 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     node->scan_freshness = ge.scan_freshness;
     node->predicate = g.predicate;
     node->residual = g.residual;
-    node->projections = g.projections;
+    // A Project's expressions and an Aggregate's payload share one vector on the
+    // group; they are separate fields on the extracted NODE, which is not in a
+    // deque and so is not size-critical.
+    if (ge.op == PhysicalOp::HashAggregate || ge.op == PhysicalOp::StreamingAggregate) {
+        node->group_keys.assign(g.op_exprs.begin(), g.op_exprs.begin() + g.group_key_count);
+        node->aggregates.assign(g.op_exprs.begin() + g.group_key_count, g.op_exprs.end());
+    } else {
+        node->projections = g.op_exprs;
+    }
     node->hash_keys = g.hash_keys;
     node->join_kind = g.join_kind;
     node->sort_keys = g.sort_keys;

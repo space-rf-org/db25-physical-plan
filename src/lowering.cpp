@@ -32,6 +32,7 @@ const char* logical_op_name(plan::LogicalOp op) {
         case plan::LogicalOp::Join:    return "Join";
         case plan::LogicalOp::Sort:    return "Sort";
         case plan::LogicalOp::Limit:   return "Limit";
+        case plan::LogicalOp::Aggregate: return "Aggregate";
         default:                       return nullptr;
     }
 }
@@ -48,6 +49,10 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
     static constexpr PhysicalOp kJoin[]{PhysicalOp::HashJoin, PhysicalOp::NestedLoopJoin};
     static constexpr PhysicalOp kSort[]{PhysicalOp::Sort};
     static constexpr PhysicalOp kLimit[]{PhysicalOp::Limit};
+    // Two candidates, like a join: hashing works on any input, streaming needs a
+    // sorted one and is cheaper when it gets it. The search costs both.
+    static constexpr PhysicalOp kAggregate[]{PhysicalOp::HashAggregate,
+                                             PhysicalOp::StreamingAggregate};
     switch (op) {
         case plan::LogicalOp::Scan:    return kScan;
         case plan::LogicalOp::Filter:  return kFilter;
@@ -55,6 +60,7 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
         case plan::LogicalOp::Join:    return kJoin;
         case plan::LogicalOp::Sort:    return kSort;
         case plan::LogicalOp::Limit:   return kLimit;
+        case plan::LogicalOp::Aggregate: return kAggregate;
         default:                       return {};
     }
 }
@@ -103,6 +109,15 @@ void split_join_predicate(const plan::Expr* e, std::uint32_t left_width,
     residual.push_back(e);
 }
 
+// A group's grouping information, derived from the payload it already carries.
+// `orderable` is a COUNT COMPARISON rather than a separate flag: the sort keys are
+// populated only when every grouping key could be turned into one, so the two
+// sizes agreeing is exactly the condition, and there is no second field to fall
+// out of step with the first.
+GroupingSpec grouping_of(const Group& g) {
+    return GroupingSpec{g.group_key_count, g.group_key_count == g.sort_keys.size()};
+}
+
 // ---- phase 1: exploration -------------------------------------------------
 // Build the memo's groups and their candidate group-expressions. NO costing and
 // NO winner here: what a candidate costs, and therefore which one wins, depends
@@ -144,7 +159,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             payload.predicate = n.predicate.get();  // borrowed
             break;
         case plan::LogicalOp::Project:
-            for (const auto& e : n.exprs) payload.projections.push_back(e.get());
+            for (const auto& e : n.exprs) payload.op_exprs.push_back(e.get());
             break;
         case plan::LogicalOp::Join: {
             // WHICH join this is. Everything below chooses an ALGORITHM; this
@@ -183,6 +198,41 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 payload.sort_keys.push_back(sk);
             }
             break;
+        case plan::LogicalOp::Aggregate: {
+            // ROLLUP / CUBE / GROUPING SETS ask for several grouping-key
+            // combinations at once. Neither operator here computes that, and
+            // treating it as a plain GROUP BY would return the wrong ROWS while
+            // reporting success - so it fails, and says which construct it is.
+            if (!n.grouping_sets.empty()) {
+                error = "grouping sets (ROLLUP / CUBE / GROUPING SETS) are not yet "
+                        "implemented in physical lowering";
+                return kInvalidGroup;
+            }
+            payload.op_exprs.reserve(n.group_keys.size() + n.aggregates.size());
+            for (const auto& e : n.group_keys) payload.op_exprs.push_back(e.get());
+            payload.group_key_count = static_cast<std::uint32_t>(n.group_keys.size());
+            for (const auto& e : n.aggregates) payload.op_exprs.push_back(e.get());
+
+            // The grouping order, when it can be expressed at all. A sort
+            // requirement is positional, so a key that is not a plain column
+            // reference has no index to be. Rather than fail - hashing needs no
+            // order and can hash any expression - the keys are simply not
+            // recorded, which makes the streaming candidate inapplicable. The
+            // count mismatch IS the signal; see GroupingSpec::orderable.
+            bool orderable = true;
+            for (std::uint32_t i = 0; i < payload.group_key_count; ++i) {
+                const plan::Expr* e = payload.op_exprs[i];
+                if (e == nullptr || e->kind != plan::ExprKind::ColumnRef) { orderable = false; break; }
+            }
+            if (orderable) {
+                payload.sort_keys.reserve(payload.group_key_count);
+                for (std::uint32_t i = 0; i < payload.group_key_count; ++i) {
+                    const plan::Expr* e = payload.op_exprs[i];
+                    payload.sort_keys.push_back(SortKey{e->input_index, false, false, false});
+                }
+            }
+            break;
+        }
         case plan::LogicalOp::Limit:
             payload.limits.has_limit = n.has_limit;
             payload.limits.limit = n.limit;
@@ -212,7 +262,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.inputs = inputs;
         key.predicate = payload.predicate;
         key.residual = payload.residual;
-        key.projections = payload.projections;
+        key.op_exprs = payload.op_exprs;
+        key.group_key_count = payload.group_key_count;
         key.hash_keys = payload.hash_keys;
         key.join_kind = payload.join_kind;
         key.sort_keys = payload.sort_keys;
@@ -231,7 +282,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         grp.table_name = std::move(payload.table_name);
         grp.predicate = payload.predicate;
         grp.residual = std::move(payload.residual);
-        grp.projections = std::move(payload.projections);
+        grp.op_exprs = std::move(payload.op_exprs);
+        grp.group_key_count = payload.group_key_count;
         grp.hash_keys = std::move(payload.hash_keys);
         grp.join_kind = payload.join_kind;
         grp.sort_keys = payload.sort_keys;
@@ -244,7 +296,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     std::size_t n_in = 0;
     for (const GroupId in : inputs) { if (n_in == 2) break; in_rows_buf[n_in++] = memo.group(in).rows; }
     memo.set_rows(g, operator_rows(cands.front(), std::span<const double>{in_rows_buf, n_in},
-                                   memo.group(g).table_name, card, memo.group(g).limits));
+                                   memo.group(g).table_name, card, memo.group(g).limits,
+                                   grouping_of(memo.group(g))));
 
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot.
@@ -270,19 +323,20 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 
     const std::vector<HashKey>& keys = memo.group(g).hash_keys;
     const ast::JoinType payload_join_kind = memo.group(g).join_kind;
+    const GroupingSpec group_spec = grouping_of(memo.group(g));
     // The candidate count is known before the loop, so the vector never has to
     // grow and re-move what it already holds.
     memo.group(g).exprs.reserve(cands.size() * scan_formats.size());
     for (const PhysicalOp cand : cands) {
         // A candidate whose precondition does not hold is not a cheaper option, it
         // is not an option at all.
-        if (!is_applicable(cand, keys, payload_join_kind)) continue;
+        if (!is_applicable(cand, keys, payload_join_kind, group_spec)) continue;
         for (const FormatAvailability& fa : scan_formats) {
             GroupExpr ge;
             ge.op = cand;
             ge.scan_format = fa.format;
             ge.scan_freshness = fa.freshness;
-            ge.input_reqs = required_input_properties(cand, keys);
+            ge.input_reqs = required_input_properties(cand, keys, memo.group(g).sort_keys);
             memo.add_expr(g, std::move(ge));
             ++candidates;
         }

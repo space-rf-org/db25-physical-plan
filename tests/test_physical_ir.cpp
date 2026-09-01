@@ -106,7 +106,7 @@ static void set_payload(Memo& m, GroupId g, std::vector<GroupId> inputs,
     grp.inputs = inputs;
     grp.table_name = std::move(table);
     grp.predicate = pred;
-    grp.projections = std::move(projections);
+    grp.op_exprs = std::move(projections);
     grp.hash_keys = std::move(keys);
 }
 static void add_candidate(Memo& m, GroupId g, PhysicalOp op, std::vector<GroupId> inputs,
