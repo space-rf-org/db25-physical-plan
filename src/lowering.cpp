@@ -37,13 +37,18 @@ const char* logical_op_name(plan::LogicalOp op) {
 // The built-in mapping used when no spec is supplied. A join offers BOTH keyed
 // and keyless candidates: with no spec, a cross product still has to have a legal
 // implementation, and only the nested loop is one.
-std::vector<PhysicalOp> builtin_physical(plan::LogicalOp op) {
+std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
+    // Static tables: the built-in mapping is fixed, so answering with a span
+    // costs nothing per node.
+    static constexpr PhysicalOp kScan[]{PhysicalOp::SeqScan};
+    static constexpr PhysicalOp kFilter[]{PhysicalOp::Filter};
+    static constexpr PhysicalOp kProject[]{PhysicalOp::Project};
+    static constexpr PhysicalOp kJoin[]{PhysicalOp::HashJoin, PhysicalOp::NestedLoopJoin};
     switch (op) {
-        case plan::LogicalOp::Scan:    return {PhysicalOp::SeqScan};
-        case plan::LogicalOp::Filter:  return {PhysicalOp::Filter};
-        case plan::LogicalOp::Project: return {PhysicalOp::Project};
-        case plan::LogicalOp::Join:    return {PhysicalOp::HashJoin,
-                                               PhysicalOp::NestedLoopJoin};
+        case plan::LogicalOp::Scan:    return kScan;
+        case plan::LogicalOp::Filter:  return kFilter;
+        case plan::LogicalOp::Project: return kProject;
+        case plan::LogicalOp::Join:    return kJoin;
         default:                       return {};
     }
 }
@@ -51,16 +56,10 @@ std::vector<PhysicalOp> builtin_physical(plan::LogicalOp op) {
 // Every physical operator a logical operator may lower to: the spec's
 // implementation rules when a spec is supplied, else the built-in mapping. More
 // than one candidate makes the choice cost-based.
-std::vector<PhysicalOp> resolve_candidates(plan::LogicalOp op, const LoweringContext& ctx) {
-    std::vector<PhysicalOp> out;
+std::span<const PhysicalOp> resolve_candidates(plan::LogicalOp op, const LoweringContext& ctx) {
     const char* ln = logical_op_name(op);
-    if (ln == nullptr) return out;
-    if (ctx.spec != nullptr) {
-        for (const std::string& name : ctx.spec->physicals_for_logical(ln)) {
-            if (const std::optional<PhysicalOp> p = physical_op_from_name(name)) out.push_back(*p);
-        }
-        return out;
-    }
+    if (ln == nullptr) return {};
+    if (ctx.spec != nullptr) return ctx.spec->ops_for_logical(ln);
     return builtin_physical(op);
 }
 
@@ -109,7 +108,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 std::size_t& candidates, std::size_t& shared, std::size_t& joins,
                 std::string& error) {
     if (n.op == plan::LogicalOp::Join) ++joins;
-    const std::vector<PhysicalOp> cands = resolve_candidates(n.op, ctx);
+    const std::span<const PhysicalOp> cands = resolve_candidates(n.op, ctx);
     if (cands.empty()) {
         const char* ln = logical_op_name(n.op);
         error = ln ? ("no implementation rule for logical operator '" + std::string(ln) + "'")
@@ -125,26 +124,29 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         inputs.push_back(g);
     }
 
-    // The payload is shared by every candidate: they are alternative ALGORITHMS
-    // for the same logical operator, not different operators.
-    GroupExpr base;
-    base.inputs = inputs;
+    // The payload every candidate shares - they are alternative ALGORITHMS for
+    // one logical operator, not different operators - so it is built ONCE and
+    // lives on the group. Assembled here before the group exists so that dedup
+    // can key on it; moved in below.
+    Group payload;
+    payload.inputs = inputs;
     switch (n.op) {
         case plan::LogicalOp::Scan:
-            base.table_name = n.table_name;
+            payload.table_name = n.table_name;
             break;
         case plan::LogicalOp::Filter:
-            base.predicate = n.predicate.get();  // borrowed
+            payload.predicate = n.predicate.get();  // borrowed
             break;
         case plan::LogicalOp::Project:
-            for (const auto& e : n.exprs) base.projections.push_back(e.get());
+            for (const auto& e : n.exprs) payload.projections.push_back(e.get());
             break;
         case plan::LogicalOp::Join: {
             const std::uint32_t left_width =
                 n.child(0) != nullptr ? static_cast<std::uint32_t>(n.child(0)->output.size()) : 0;
             // Keys and residual are independent outputs: a join may have both
             // (an equi-key plus an extra condition), either, or neither (CROSS).
-            split_join_predicate(n.predicate.get(), left_width, base.hash_keys, base.residual);
+            split_join_predicate(n.predicate.get(), left_width, payload.hash_keys,
+                                 payload.residual);
             break;
         }
         default:
@@ -168,10 +170,10 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.table_name = n.op == plan::LogicalOp::Scan ? &n.table_name : nullptr;
         key.output = &n.output;
         key.inputs = inputs;
-        key.predicate = base.predicate;
-        key.residual = base.residual;
-        key.projections = base.projections;
-        key.hash_keys = base.hash_keys;
+        key.predicate = payload.predicate;
+        key.residual = payload.residual;
+        key.projections = payload.projections;
+        key.hash_keys = payload.hash_keys;
         key.finish();
         if (const std::optional<GroupId> existing = memo.find_group(key)) {
             ++shared;
@@ -180,6 +182,15 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     }
 
     const GroupId g = memo.add_group(n.output);
+    {
+        Group& grp = memo.group(g);
+        grp.inputs = payload.inputs;
+        grp.table_name = std::move(payload.table_name);
+        grp.predicate = payload.predicate;
+        grp.residual = std::move(payload.residual);
+        grp.projections = std::move(payload.projections);
+        grp.hash_keys = std::move(payload.hash_keys);
+    }
 
     // Cardinality belongs to the GROUP: the candidates are equivalent, so any of
     // them yields the same estimate, and it does not depend on any requirement.
@@ -187,13 +198,13 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     std::size_t n_in = 0;
     for (const GroupId in : inputs) { if (n_in == 2) break; in_rows_buf[n_in++] = memo.group(in).rows; }
     memo.set_rows(g, operator_rows(cands.front(), std::span<const double>{in_rows_buf, n_in},
-                                   base.table_name, card));
+                                   memo.group(g).table_name, card));
 
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot.
     std::vector<FormatAvailability> scan_formats{FormatAvailability{StorageFormat::Row}};
     if (n.op == plan::LogicalOp::Scan) {
-        scan_formats = storage.formats_for(base.table_name);
+        scan_formats = storage.formats_for(memo.group(g).table_name);
         // A correctness constraint, not a cost one: drop the copies that cannot
         // answer this query at all. No enforcer could rescue them, so they must
         // not reach the cost comparison in the first place.
@@ -203,7 +214,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 if (fa.freshness == Freshness::Fresh) eligible.push_back(fa);
             }
             if (eligible.empty()) {
-                error = "table '" + base.table_name +
+                error = "table '" + memo.group(g).table_name +
                         "' has no copy fresh enough for this query";
                 return kInvalidGroup;
             }
@@ -211,16 +222,20 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         }
     }
 
+    const std::vector<HashKey>& keys = memo.group(g).hash_keys;
+    // The candidate count is known before the loop, so the vector never has to
+    // grow and re-move what it already holds.
+    memo.group(g).exprs.reserve(cands.size() * scan_formats.size());
     for (const PhysicalOp cand : cands) {
         // A candidate whose precondition does not hold is not a cheaper option, it
         // is not an option at all.
-        if (!is_applicable(cand, base.hash_keys)) continue;
+        if (!is_applicable(cand, keys)) continue;
         for (const FormatAvailability& fa : scan_formats) {
-            GroupExpr ge = base;
+            GroupExpr ge;
             ge.op = cand;
             ge.scan_format = fa.format;
             ge.scan_freshness = fa.freshness;
-            ge.input_reqs = required_input_properties(cand, ge.hash_keys);
+            ge.input_reqs = required_input_properties(cand, keys);
             memo.add_expr(g, std::move(ge));
             ++candidates;
         }
@@ -331,10 +346,11 @@ struct Optimizer {
             // addressed by index, so neither of those moves either.) If a later
             // unit ever applies rules DURING search, this is the line that has to
             // change - copying it back cost five allocations per candidate.
-            const GroupExpr& ge = memo.group(g).exprs[i];
+            const Group& grp = memo.group(g);
+            const GroupExpr& ge = grp.exprs[i];
             double in_rows_buf[kMaxArity] = {};
             std::size_t n_in = 0;
-            for (const GroupId in : ge.inputs) {
+            for (const GroupId in : grp.inputs) {
                 if (n_in == kMaxArity) break;
                 in_rows_buf[n_in++] = memo.group(in).rows;
             }
@@ -351,10 +367,10 @@ struct Optimizer {
             double child_cost = 0.0;
             PhysicalProperties child_props[kMaxArity];
             std::size_t n_child = 0;
-            if (optimize_inputs(ge.inputs, op_reqs, bound - own_cost, child_cost,
+            if (optimize_inputs(grp.inputs, op_reqs, bound - own_cost, child_cost,
                                 child_props, n_child)) {
                 const PhysicalProperties provided =
-                    derive_op(ge.op, ge.hash_keys, ge.scan_format,
+                    derive_op(ge.op, grp.hash_keys, ge.scan_format,
                               std::span<const PhysicalProperties>{child_props, n_child},
                               ge.scan_freshness);
                 const double top = enforcement_cost(provided, required, out_rows, cal);
@@ -393,10 +409,10 @@ struct Optimizer {
                     double pd_cost = 0.0;
                     PhysicalProperties pd_props[kMaxArity];
                     std::size_t n_pd = 0;
-                    if (optimize_inputs(ge.inputs, pushed, bound - own_cost, pd_cost,
+                    if (optimize_inputs(grp.inputs, pushed, bound - own_cost, pd_cost,
                                         pd_props, n_pd)) {
                         const PhysicalProperties provided = derive_op(
-                            ge.op, ge.hash_keys, ge.scan_format,
+                            ge.op, grp.hash_keys, ge.scan_format,
                             std::span<const PhysicalProperties>{pd_props, n_pd},
                             ge.scan_freshness);
                         const double top =
