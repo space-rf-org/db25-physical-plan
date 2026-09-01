@@ -1,6 +1,7 @@
 #include "db25/physical/lowering.hpp"
 
 #include "db25/physical/cost.hpp"
+#include "db25/physical/arity_vec.hpp"
 #include "db25/physical/memo.hpp"
 #include "db25/physical/properties.hpp"
 #include "db25/physical/structural_key.hpp"
@@ -269,8 +270,8 @@ struct Optimizer {
     // kMaxArity, so the search has no reason to reach the heap once per candidate
     // per goal. This is the allocation the search MULTIPLIES - every other one is
     // bounded by plan size rather than by how hard the search works.
-    bool optimize_inputs(const std::vector<GroupId>& inputs,
-                         const std::vector<PhysicalProperties>& reqs, double budget,
+    bool optimize_inputs(const ArityVec<GroupId>& inputs,
+                         const ArityVec<PhysicalProperties>& reqs, double budget,
                          double& cost_out, PhysicalProperties* provided_out,
                          std::size_t& provided_count) {
         cost_out = 0.0;
@@ -308,7 +309,7 @@ struct Optimizer {
         std::uint32_t best = static_cast<std::uint32_t>(n_exprs);
         double best_cost = std::numeric_limits<double>::infinity();
         PhysicalProperties best_provided;
-        std::vector<PhysicalProperties> best_input_required;
+        ArityVec<PhysicalProperties> best_input_required;
 
         for (std::uint32_t i = 0; i < n_exprs; ++i) {
             // The tightest bound available for this candidate: the caller's, or
@@ -329,7 +330,7 @@ struct Optimizer {
                 in_rows_buf[n_in++] = memo.group(in).rows;
             }
             const std::span<const double> in_rows{in_rows_buf, n_in};
-            const std::vector<PhysicalProperties>& op_reqs = ge.input_reqs;
+            const ArityVec<PhysicalProperties>& op_reqs = ge.input_reqs;
             const double own_cost =
                 operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format);
 
@@ -366,7 +367,7 @@ struct Optimizer {
             // --- route 2: push the requirement into the input instead ---
             if (const std::optional<PhysicalProperties> down =
                     pushdown_requirement(ge.op, required)) {
-                std::vector<PhysicalProperties> pushed = op_reqs;
+                ArityVec<PhysicalProperties> pushed = op_reqs;
                 if (!pushed.empty()) {
                     // The operator's own need AND the consumer's, on input 0.
                     PhysicalProperties combined = *down;

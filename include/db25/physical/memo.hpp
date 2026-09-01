@@ -11,6 +11,7 @@
 // branch-and-bound - arrives in later Increment 0 units; until then a caller
 // (or the deterministic lowering of Unit 0.6) populates groups directly and sets
 // winners, and extract_winner materializes the chosen physical plan.
+#include "db25/physical/arity_vec.hpp"
 #include "db25/physical/cost.hpp"
 #include "db25/physical/physical_plan.hpp"
 #include "db25/physical/properties.hpp"
@@ -34,7 +35,7 @@ inline constexpr GroupId kInvalidGroup = std::numeric_limits<GroupId>::max();
 // (Unit 0.4); infinite until then.
 struct GroupExpr {
     PhysicalOp op;
-    std::vector<GroupId> inputs;  // child groups, in operand order
+    ArityVec<GroupId> inputs;  // child groups, in operand order
 
     std::string table_name;                // SeqScan
     StorageFormat scan_format = StorageFormat::Row;  // SeqScan: the format read
@@ -54,7 +55,7 @@ struct GroupExpr {
     // op and hash_keys alone, both fixed once the candidate exists - so it is
     // computed once at exploration rather than rebuilt (with its vector) on every
     // candidate of every goal the search evaluates.
-    std::vector<PhysicalProperties> input_reqs;
+    ArityVec<PhysicalProperties> input_reqs;
 };
 
 // A group's answer to one question: "the best plan for this group that satisfies
@@ -73,14 +74,19 @@ struct WinnerEntry {
     // for "sorted on k" is a different plan from the same child optimized for
     // nothing. Cascades calls these the child goals; they are part of the winner,
     // not a detail of how it was found.
-    std::vector<PhysicalProperties> input_required;
+    ArityVec<PhysicalProperties> input_required;
 };
 
 // A memo group: a set of equivalent group-expressions, the output schema they
 // all produce, and the winner (lowest-cost member) once costing has run.
 struct Group {
     GroupId id = kInvalidGroup;
-    Schema output;
+    // BORROWED, on the same contract as every expression payload in this planner:
+    // the logical plan outlives the physical plan. Copying it here meant one full
+    // vector-of-ColumnSchema copy per group, and the group's schema is only ever
+    // read to fill the extracted node's own copy - so the copy was pure duplication.
+    // The referent must outlive the memo.
+    const Schema* output = nullptr;
     // Estimated output rows of this group. Every group-expression in a group is
     // semantically equivalent, so they all produce the same cardinality - it is a
     // property of the GROUP, and costing a parent reads it from its input groups
@@ -164,7 +170,7 @@ struct GroupKey {
     // the index's stored copy - and measured as more than half of unit 2.4's cost.
     const std::string* table_name = nullptr;
     const Schema* output = nullptr;
-    std::vector<GroupId> inputs;
+    ArityVec<GroupId> inputs;
     const Expr* predicate = nullptr;
     std::vector<const Expr*> residual;
     std::vector<const Expr*> projections;
@@ -179,8 +185,9 @@ struct GroupKey {
 // The memo. Owns its groups; group ids are stable indices into that storage.
 class Memo {
 public:
-    // Create an empty group with the given output schema; returns its id.
-    GroupId add_group(Schema output);
+    // Create an empty group with the given output schema; returns its id. The
+    // schema is BORROWED - it must outlive the memo (see Group::output).
+    GroupId add_group(const Schema& output);
 
     // The id of an existing group structurally identical to `key`, if there is
     // one. Buckets by hash and then VERIFIES field by field: a hash collision
@@ -197,7 +204,7 @@ public:
     // Record the winner for a requirement, replacing any entry under that key.
     void set_winner(GroupId group, const PhysicalProperties& required,
                     std::uint32_t expr_index, double cost, PhysicalProperties provided,
-                    std::vector<PhysicalProperties> input_required = {});
+                    ArityVec<PhysicalProperties> input_required = {});
 
     // Record a group's estimated output cardinality.
     void set_rows(GroupId group, double rows);

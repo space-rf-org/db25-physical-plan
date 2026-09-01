@@ -76,11 +76,11 @@ void Memo::index_group(const GroupKey& key, GroupId id) {
     index_[key.hash].emplace_back(key, id);
 }
 
-GroupId Memo::add_group(Schema output) {
+GroupId Memo::add_group(const Schema& output) {
     const auto id = static_cast<GroupId>(groups_.size());
     Group g;
     g.id = id;
-    g.output = std::move(output);
+    g.output = &output;  // borrowed; must outlive the memo
     groups_.push_back(std::move(g));
     return id;
 }
@@ -94,7 +94,7 @@ std::uint32_t Memo::add_expr(GroupId group, GroupExpr expr) {
 
 void Memo::set_winner(GroupId group, const PhysicalProperties& required,
                       std::uint32_t expr_index, double cost, PhysicalProperties provided,
-                      std::vector<PhysicalProperties> input_required) {
+                      ArityVec<PhysicalProperties> input_required) {
     Group& g = groups_[group];
     for (WinnerEntry& w : g.winners) {
         if (w.required == required) {  // replace in place: one winner per key
@@ -173,7 +173,7 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     const GroupExpr& ge = g.exprs[won->expr_index];
 
     auto node = std::make_unique<PhysicalNode>(ge.op);
-    node->output = g.output;
+    if (g.output != nullptr) node->output = *g.output;
     node->table_name = ge.table_name;
     node->scan_format = ge.scan_format;
     node->scan_freshness = ge.scan_freshness;
@@ -186,7 +186,7 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     // child's unconstrained winner: a child optimized for "sorted on k" is a
     // different plan from the same child optimized for nothing, and extracting
     // the wrong one would build a plan nobody costed.
-    const std::vector<PhysicalProperties>& reqs = won->input_required;
+    const ArityVec<PhysicalProperties>& reqs = won->input_required;
     for (std::size_t i = 0; i < ge.inputs.size(); ++i) {
         const PhysicalProperties& child_req =
             i < reqs.size() ? reqs[i] : Group::unconstrained();

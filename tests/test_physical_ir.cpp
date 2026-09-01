@@ -175,23 +175,28 @@ static void test_memo_extracts_to_same_render() {
 
     // Same shape, built through the memo.
     Memo m;
-    const GroupId g_a = m.add_group(a_schema());
+    const Schema sch_a = a_schema();
+    const GroupId g_a = m.add_group(sch_a);
     m.add_expr(g_a, group_expr(PhysicalOp::SeqScan, {}, "a"));
     win(m, g_a, 0);
 
-    const GroupId g_b = m.add_group(b_schema());
+    const Schema sch_b = b_schema();
+    const GroupId g_b = m.add_group(sch_b);
     m.add_expr(g_b, group_expr(PhysicalOp::SeqScan, {}, "b"));
     win(m, g_b, 0);
 
-    const GroupId g_join = m.add_group(join_schema());
+    const Schema sch_join = join_schema();
+    const GroupId g_join = m.add_group(sch_join);
     m.add_expr(g_join, group_expr(PhysicalOp::HashJoin, {g_a, g_b}, "", nullptr, {}, {{0, 0}}));
     win(m, g_join, 0);
 
-    const GroupId g_filter = m.add_group(join_schema());
+    const Schema sch_filter = join_schema();
+    const GroupId g_filter = m.add_group(sch_filter);
     m.add_expr(g_filter, group_expr(PhysicalOp::Filter, {g_join}, "", pred));
     win(m, g_filter, 0);
 
-    const GroupId g_proj = m.add_group(proj_schema());
+    const Schema sch_proj = proj_schema();
+    const GroupId g_proj = m.add_group(sch_proj);
     m.add_expr(g_proj, group_expr(PhysicalOp::Project, {g_filter}, "", nullptr, {px, py}));
     win(m, g_proj, 0);
     m.set_root(g_proj);
@@ -208,7 +213,8 @@ static void test_memo_extracts_to_same_render() {
 static void test_extract_without_winner_fails() {
     std::printf("test_extract_without_winner_fails\n");
     Memo m;
-    const GroupId g = m.add_group(a_schema());
+    const Schema sch = a_schema();  // borrowed by the memo: must outlive it
+    const GroupId g = m.add_group(sch);
     m.add_expr(g, group_expr(PhysicalOp::SeqScan, {}, "a"));
     // No winner set.
     m.set_root(g);
@@ -230,7 +236,8 @@ static void test_group_answers_per_requirement() {
     // Memo-level test: the candidates are synthetic, because what is under test is
     // the memo's bookkeeping, not which operator produced which property.
     Memo m;
-    const GroupId g = m.add_group(a_schema());
+    const Schema sch = a_schema();  // borrowed by the memo: must outlive it
+    const GroupId g = m.add_group(sch);
     m.set_rows(g, kRows);
 
     // Cheap, but unordered.
@@ -322,7 +329,8 @@ static void test_requirement_may_change_only_what_is_provided() {
     const double kRows = 1000.0;
 
     Memo m;
-    const GroupId g = m.add_group(a_schema());
+    const Schema sch = a_schema();  // borrowed by the memo: must outlive it
+    const GroupId g = m.add_group(sch);
     m.set_rows(g, kRows);
 
     GroupExpr row_scan = group_expr(PhysicalOp::SeqScan, {}, "a");
@@ -356,7 +364,8 @@ static void test_unsatisfiable_requirement_has_no_winner() {
     std::printf("test_unsatisfiable_requirement_has_no_winner\n");
     const CalibrationProfile cal = default_calibration();
     Memo m;
-    const GroupId g = m.add_group(a_schema());
+    const Schema sch = a_schema();  // borrowed by the memo: must outlive it
+    const GroupId g = m.add_group(sch);
     m.set_rows(g, 100.0);
 
     GroupExpr stale = group_expr(PhysicalOp::SeqScan, {}, "a");
