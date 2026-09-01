@@ -2,11 +2,79 @@
 
 #include "db25/physical/cost.hpp"
 #include "db25/physical/properties.hpp"
+#include "db25/physical/structural_key.hpp"
 
 #include <limits>
 #include <utility>
 
 namespace db25::physical {
+
+namespace {
+std::uint64_t mix64(std::uint64_t h, std::uint64_t v) noexcept {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+}  // namespace
+
+void GroupKey::finish() noexcept {
+    comparable = expr_is_comparable(predicate);
+    for (const Expr* e : residual) comparable = comparable && expr_is_comparable(e);
+    for (const Expr* e : projections) comparable = comparable && expr_is_comparable(e);
+
+    std::uint64_t h = mix64(13, static_cast<std::uint64_t>(logical_op));
+    if (table_name != nullptr) {
+        for (const char c : *table_name) h = mix64(h, static_cast<unsigned char>(c));
+    }
+    if (output != nullptr) h = mix64(h, schema_hash(*output));
+    for (const GroupId g : inputs) h = mix64(h, g);
+    h = mix64(h, expr_structural_hash(predicate));
+    for (const Expr* e : residual) h = mix64(h, expr_structural_hash(e));
+    for (const Expr* e : projections) h = mix64(h, expr_structural_hash(e));
+    for (const HashKey& k : hash_keys) { h = mix64(h, k.left_index); h = mix64(h, k.right_index); }
+    hash = h;
+}
+
+bool GroupKey::equals(const GroupKey& o) const noexcept {
+    if (!comparable || !o.comparable) return false;  // never share an unknown payload
+    if (logical_op != o.logical_op) return false;
+    const std::string empty;
+    if ((table_name ? *table_name : empty) != (o.table_name ? *o.table_name : empty)) return false;
+    if (inputs != o.inputs) return false;
+    if (hash_keys.size() != o.hash_keys.size()) return false;
+    for (std::size_t i = 0; i < hash_keys.size(); ++i) {
+        if (hash_keys[i].left_index != o.hash_keys[i].left_index ||
+            hash_keys[i].right_index != o.hash_keys[i].right_index) {
+            return false;
+        }
+    }
+    if ((output == nullptr) != (o.output == nullptr)) return false;
+    if (output != nullptr && !schema_equal(*output, *o.output)) return false;
+    if (!expr_structurally_equal(predicate, o.predicate)) return false;
+    if (residual.size() != o.residual.size()) return false;
+    for (std::size_t i = 0; i < residual.size(); ++i) {
+        if (!expr_structurally_equal(residual[i], o.residual[i])) return false;
+    }
+    if (projections.size() != o.projections.size()) return false;
+    for (std::size_t i = 0; i < projections.size(); ++i) {
+        if (!expr_structurally_equal(projections[i], o.projections[i])) return false;
+    }
+    return true;
+}
+
+std::optional<GroupId> Memo::find_group(const GroupKey& key) const {
+    if (!key.comparable) return std::nullopt;
+    const auto it = index_.find(key.hash);
+    if (it == index_.end()) return std::nullopt;
+    for (const auto& [k, id] : it->second) {
+        if (k.equals(key)) return id;  // verified, not merely hash-equal
+    }
+    return std::nullopt;
+}
+
+void Memo::index_group(const GroupKey& key, GroupId id) {
+    if (!key.comparable) return;
+    index_[key.hash].emplace_back(key, id);
+}
 
 GroupId Memo::add_group(Schema output) {
     const auto id = static_cast<GroupId>(groups_.size());

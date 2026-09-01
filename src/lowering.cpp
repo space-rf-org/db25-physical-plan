@@ -3,6 +3,7 @@
 #include "db25/physical/cost.hpp"
 #include "db25/physical/memo.hpp"
 #include "db25/physical/properties.hpp"
+#include "db25/physical/structural_key.hpp"
 
 #include "db25/ast/node_types.hpp"
 #include "db25/plan/expr_ir.hpp"
@@ -102,7 +103,7 @@ void split_join_predicate(const plan::Expr* e, std::uint32_t left_width,
 // than a bottom-up sweep that happens to consult properties.
 GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
                 const CardinalityModel& card, const StorageCatalog& storage,
-                std::size_t& candidates, std::string& error) {
+                std::size_t& candidates, std::size_t& shared, std::string& error) {
     const std::vector<PhysicalOp> cands = resolve_candidates(n.op, ctx);
     if (cands.empty()) {
         const char* ln = logical_op_name(n.op);
@@ -113,7 +114,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 
     std::vector<GroupId> inputs;
     for (std::size_t i = 0; i < n.child_count(); ++i) {
-        const GroupId g = explore(*n.child(i), memo, ctx, card, storage, candidates, error);
+        const GroupId g =
+            explore(*n.child(i), memo, ctx, card, storage, candidates, shared, error);
         if (g == kInvalidGroup) return kInvalidGroup;
         inputs.push_back(g);
     }
@@ -142,6 +144,34 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         }
         default:
             break;
+    }
+
+    // Structural identity: if an equivalent subtree has already been explored,
+    // share its group rather than build a second copy. Children are explored (and
+    // shared) first, so by the time this runs the input GroupIds are themselves
+    // canonical - which is what makes a shallow key sufficient.
+    //
+    // The key is built ONLY when dedup is on. Building it unconditionally and
+    // testing the flag afterwards still copied four vectors per group, which cost
+    // most of the feature's price on queries that had opted out of it.
+    GroupKey key;
+    if (ctx.dedup) {
+        key.logical_op = static_cast<int>(n.op);
+        // Borrowed from the LOGICAL NODE, not from the local GroupExpr: the index
+        // outlives this call, and pointing at a local was a stack-use-after-return
+        // (ASan caught it on the first run). Only a Scan carries a table name.
+        key.table_name = n.op == plan::LogicalOp::Scan ? &n.table_name : nullptr;
+        key.output = &n.output;
+        key.inputs = inputs;
+        key.predicate = base.predicate;
+        key.residual = base.residual;
+        key.projections = base.projections;
+        key.hash_keys = base.hash_keys;
+        key.finish();
+        if (const std::optional<GroupId> existing = memo.find_group(key)) {
+            ++shared;
+            return *existing;
+        }
     }
 
     const GroupId g = memo.add_group(n.output);
@@ -195,6 +225,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 (ln ? ln : "?") + "'";
         return kInvalidGroup;
     }
+    if (ctx.dedup) memo.index_group(key, g);
     return g;
 }
 
@@ -384,8 +415,9 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     const StorageCatalog storage = ctx.storage != nullptr ? *ctx.storage : StorageCatalog{};
 
     Memo memo;
-    const GroupId root_group =
-        explore(root, memo, ctx, card, storage, result.candidates_considered, result.error);
+    const GroupId root_group = explore(root, memo, ctx, card, storage,
+                                       result.candidates_considered, result.groups_shared,
+                                       result.error);
     if (root_group == kInvalidGroup) {
         return result;  // ok stays false, error set
     }

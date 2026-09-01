@@ -377,6 +377,102 @@ static void test_pruning_never_changes_the_plan() {
     CHECK(total_pruned > 0);
 }
 
+// ---- Unit 2.4: structural memo dedup ---------------------------------------
+
+// Two identical scans of the same relation share ONE group instead of being
+// explored and optimized twice. Built by hand because no query in the corpus
+// repeats a table - see the negative tests below for why the bar for sharing is
+// deliberately high.
+static plan::LogicalNodePtr twin_scan_join(bool same_schema) {
+    auto left = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    left->table_name = "a";
+    left->output = a_schema();
+    auto right = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    right->table_name = "a";
+    right->output = a_schema();
+    if (!same_schema) right->output[0].alias = "other";  // a self-join's two sides
+    auto join = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Join);
+    join->join_type = db25::ast::JoinType::Inner;
+    join->output = a_schema();
+    join->predicate = binop(BinaryOp::Equal, col(0, DataType::Integer),
+                            col(2, DataType::Integer));
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+    return join;
+}
+
+static void test_identical_subtrees_share_a_group() {
+    std::printf("test_identical_subtrees_share_a_group\n");
+    // Dedup is off by default (it does not pay for itself yet - see
+    // LoweringContext::dedup); these tests exercise the mechanism explicitly.
+    auto logical = twin_scan_join(true);
+    LoweringContext ctx;
+    ctx.dedup = true;
+    const LoweringResult r = lower(*logical, ctx);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    CHECK(r.groups_shared == 1);   // the second scan reused the first group
+    CHECK(r.memo_groups == 2);     // one scan group + the join, not three
+
+    // Sharing a group must not change the plan: both sides still appear.
+    const std::string s = physical_to_sexpr(*r.plan);
+    std::size_t scans = 0;
+    for (std::size_t i = s.find("(SeqScan"); i != std::string::npos;
+         i = s.find("(SeqScan", i + 1)) {
+        ++scans;
+    }
+    CHECK(scans == 2);
+}
+
+// The dangerous failure for dedup is not a MISSED share, it is a WRONG one:
+// merging two subtrees that are not equivalent plans one query as another. These
+// pin the cases that must NOT merge.
+static void test_non_equivalent_subtrees_never_share() {
+    std::printf("test_non_equivalent_subtrees_never_share\n");
+
+    // (a) Same table, different alias in the output schema - a self-join's two
+    //     sides. They share (table_id, column_id), so the alias is the only thing
+    //     that distinguishes them.
+    {
+        auto logical = twin_scan_join(false);
+        LoweringContext ctx;
+        ctx.dedup = true;
+        const LoweringResult r = lower(*logical, ctx);
+        CHECK(r.ok);
+        CHECK(r.groups_shared == 0);
+        CHECK(r.memo_groups == 3);
+    }
+
+    // (b) Filters over the same scan differing ONLY in a literal.
+    {
+        auto mk = [](std::int64_t k) {
+            auto sc = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+            sc->table_name = "a";
+            sc->output = a_schema();
+            auto f = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Filter);
+            f->output = a_schema();
+            f->predicate = binop(BinaryOp::GreaterThan, col(1, DataType::Integer), int_lit(k));
+            f->add_child(std::move(sc));
+            return f;
+        };
+        auto join = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Join);
+        join->join_type = db25::ast::JoinType::Inner;
+        join->output = a_schema();
+        join->predicate = binop(BinaryOp::Equal, col(0, DataType::Integer),
+                                col(2, DataType::Integer));
+        join->add_child(mk(10));
+        join->add_child(mk(20));   // differs only in the literal
+        LoweringContext ctx;
+        ctx.dedup = true;
+        const LoweringResult r = lower(*join, ctx);
+        CHECK(r.ok);
+        // The two SCANS underneath are identical and legitimately share; the two
+        // FILTERS are not equivalent and must not.
+        CHECK(r.groups_shared == 1);
+        CHECK(r.memo_groups == 4);  // scan, filter(>10), filter(>20), join
+    }
+}
+
 static void test_unsupported_operator_is_an_error() {
     std::printf("test_unsupported_operator_is_an_error\n");
     auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
@@ -771,6 +867,8 @@ int main() {
     test_root_enforcer_is_inserted();
     test_unsatisfiable_required_output_fails_honestly();
     test_pruning_never_changes_the_plan();
+    test_identical_subtrees_share_a_group();
+    test_non_equivalent_subtrees_never_share();
     test_unsupported_operator_is_an_error();
 
     if (g_failures == 0) {
