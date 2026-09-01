@@ -44,6 +44,10 @@ struct CalibrationProfile {
     // only operator here for which that is the honest shape.
     double limit_row = 0.1;
     double hash_aggregate_row = 1.1;   // hash one input row into its group
+    // Per input row PER GROUPING SET: the operator hashes each row once into each
+    // set's table. Slightly above the plain hash aggregate per set, because it
+    // also masks the inactive keys out of each probe.
+    double grouping_set_row = 1.2;
     // One pass, no hash table: cheaper per row than hashing, which is the whole
     // reason to want a sorted input. The ratio is what matters - if this were not
     // below hash_aggregate_row the streaming variant could never win, and the
@@ -141,7 +145,8 @@ struct CardinalityModel {
 [[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
                                    StorageFormat scan_format = StorageFormat::Row,
-                                   bool build_right = true);
+                                   bool build_right = true,
+                                   std::uint32_t grouping_sets = 0);
 
 // What it would cost to make `rows` rows satisfying `provided` also satisfy
 // `required` - i.e. the enforcers that would have to be inserted. Zero when the

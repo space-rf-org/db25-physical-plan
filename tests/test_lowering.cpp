@@ -1550,17 +1550,79 @@ static void test_a_scalar_aggregate_estimates_one_row() {
     if (r.plan) CHECK(card.rows(*r.plan) == 1.0);
 }
 
-// ROLLUP / CUBE / GROUPING SETS ask for several grouping-key combinations at
-// once. Neither operator computes that, and treating it as a plain GROUP BY would
-// return the WRONG ROWS while reporting success - the failure mode this project
-// keeps finding and keeps refusing to ship.
-static void test_grouping_sets_fail_rather_than_silently_flatten() {
-    std::printf("test_grouping_sets_fail_rather_than_silently_flatten\n");
-    auto logical = build_aggregate(false, false, /*grouping_sets=*/true);
+// GROUPING SETS / ROLLUP / CUBE compute SEVERAL grouping-key combinations at once.
+// Until Increment 3.7 they failed honestly rather than being flattened to a plain
+// GROUP BY, which would have returned the wrong ROWS while reporting success. They
+// now lower to a dedicated operator, and the sets are part of the plan.
+static void test_grouping_sets_lower_and_are_rendered() {
+    std::printf("test_grouping_sets_lower_and_are_rendered\n");
+    auto render = [](std::vector<std::vector<std::uint32_t>> sets) {
+        auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+        scan->table_name = "a";
+        scan->output = a_schema();
+        auto agg = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Aggregate);
+        agg->output = a_schema();
+        agg->group_keys.push_back(col(0, DataType::Integer));
+        agg->group_keys.push_back(col(1, DataType::Integer));
+        agg->aggregates.push_back(col(1, DataType::Integer));
+        agg->grouping_sets = std::move(sets);
+        agg->add_child(std::move(scan));
+        const LoweringResult r = lower(*agg);
+        CHECK(r.ok);
+        return r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    };
+    // ROLLUP(a, b) is {a,b}, {a}, {}; CUBE(a, b) adds {b}. They share every key
+    // and every aggregate and differ ONLY in the sets, so a plan that omitted them
+    // would render the two identically - and they return different rows.
+    const std::string rollup = render({{0, 1}, {0}, {}});
+    const std::string cube = render({{0, 1}, {0}, {1}, {}});
+    CHECK(contains(rollup, "HashGroupingSets"));
+    CHECK(contains(rollup, "sets=[(0 1) (0) ()]"));
+    CHECK(contains(cube, "sets=[(0 1) (0) (1) ()]"));
+    CHECK(rollup != cube);
+
+    // The plain aggregates are NOT offered here. They compute one combination, so
+    // either would return the wrong rows - and both are cheaper, so the cost model
+    // would have taken one.
+    CHECK(!contains(rollup, "HashAggregate"));
+    CHECK(!contains(rollup, "StreamingAggregate"));
+}
+
+// And the converse: a plain GROUP BY must not get the grouping-sets operator,
+// which would compute a redundant set and is dearer.
+static void test_a_plain_group_by_does_not_use_the_grouping_sets_operator() {
+    std::printf("test_a_plain_group_by_does_not_use_the_grouping_sets_operator\n");
+    auto logical = build_aggregate();
     const LoweringResult r = lower(*logical);
-    CHECK(!r.ok);
-    CHECK(r.plan == nullptr);
-    CHECK(contains(r.error, "grouping sets"));
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(!contains(s, "HashGroupingSets"));
+    CHECK(contains(s, "HashAggregate"));
+
+    using db25::physical::PhysicalOp;
+    using db25::physical::GroupingSpec;
+    CHECK(!db25::physical::is_applicable(PhysicalOp::HashGroupingSets, {},
+                                         db25::ast::JoinType::Inner,
+                                         GroupingSpec{1, true, false, 0}));
+    CHECK(!db25::physical::is_applicable(PhysicalOp::HashAggregate, {},
+                                         db25::ast::JoinType::Inner,
+                                         GroupingSpec{1, true, true, 2}));
+}
+
+// An aggregate over N sets emits roughly N times the rows of one. Estimating it as
+// one would understate every operator above it.
+static void test_grouping_sets_multiply_the_row_estimate() {
+    std::printf("test_grouping_sets_multiply_the_row_estimate\n");
+    const db25::physical::CardinalityModel card;
+    const double in[1] = {1000.0};
+    const auto rows = [&](std::uint32_t sets) {
+        return operator_rows(db25::physical::PhysicalOp::HashGroupingSets,
+                             std::span<const double>{in, 1}, "", card, {},
+                             db25::physical::GroupingSpec{2, true, true, sets});
+    };
+    CHECK(rows(4) == 4.0 * rows(1));
+    CHECK(rows(1) == 1000.0 * card.group_selectivity);
 }
 
 // An aggregate's DISTINCT, FILTER and ORDER BY change WHAT IT COMPUTES, so the
@@ -2113,7 +2175,9 @@ int main() {
     test_aggregate_algorithm_is_chosen_by_cost();
     test_a_computed_grouping_key_still_lowers_via_hash();
     test_a_scalar_aggregate_estimates_one_row();
-    test_grouping_sets_fail_rather_than_silently_flatten();
+    test_grouping_sets_lower_and_are_rendered();
+    test_a_plain_group_by_does_not_use_the_grouping_sets_operator();
+    test_grouping_sets_multiply_the_row_estimate();
     test_aggregate_modifiers_are_rendered();
     test_window_lowers_and_requires_its_order();
     test_differing_over_clauses_fail_rather_than_pick_one();

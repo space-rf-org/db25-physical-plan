@@ -92,7 +92,12 @@ struct Group {
 
     // --- the logical operator every candidate in this group implements ---
     ArityVec<GroupId> inputs;              // child groups, in operand order
-    std::string table_name;                // Scan
+    // BORROWED from the logical node, like every other payload here - the logical
+    // plan already has to outlive the physical plan, and GroupKey has borrowed
+    // this same string since dedup was written. Owning a copy cost 32 bytes per
+    // group where a pointer costs 8, and those 24 bytes are what pays for
+    // `grouping_sets` below without pushing sizeof(Group) past the deque cliff.
+    const std::string* table_name = nullptr;   // Scan
     const Expr* predicate = nullptr;       // Filter
     std::vector<const Expr*> residual;     // Join: non-key conjuncts to re-check
     // Project: one borrowed expression per output column.
@@ -115,6 +120,13 @@ struct Group {
     // this struct costs 8 bytes and, at the current size, that is enough to change
     // the deque packing - see the note below.
     std::uint32_t op_split = 0;
+    // Aggregate with GROUPING SETS / ROLLUP / CUBE: one BITMASK per grouping set,
+    // bit i meaning group key i is active in that set. A bitmask rather than a
+    // vector-of-vectors because it is one allocation instead of one per set, is
+    // trivially comparable and hashable for the dedup key, and 64 grouping keys is
+    // already 2^64 sets under CUBE - the limit is not a limit. Empty means a plain
+    // GROUP BY over every key.
+    std::vector<std::uint64_t> grouping_sets;
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     LimitSpec limits;                      // Limit: LIMIT / OFFSET
 
@@ -234,6 +246,7 @@ struct GroupKey {
     LimitSpec limits;
     ast::SetOp set_op = ast::SetOp::Union;
     std::uint32_t op_split = 0;
+    std::vector<std::uint64_t> grouping_sets;
     bool comparable = false;
     std::uint64_t hash = 0;
 

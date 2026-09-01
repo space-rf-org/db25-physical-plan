@@ -42,6 +42,9 @@
     ; Window consumes its input sorted by (PARTITION BY ++ ORDER BY) and appends
     ; one column per window function, emitting in that same order.
     (operator (name Window)             (arity 1) (kind pipeline))
+    ; GROUPING SETS / ROLLUP / CUBE in one pass, hashing each row into every set's
+    ; table. No streaming counterpart: different sets want different orderings.
+    (operator (name HashGroupingSets)   (arity 1) (kind pipeline-breaker))
     ; Two implementations of SELECT DISTINCT, the same trade as the aggregates.
     (operator (name HashDistinct)       (arity 1) (kind pipeline-breaker))
     (operator (name StreamingDistinct)  (arity 1) (kind pipeline))
@@ -92,6 +95,9 @@
     (rule (logical Limit)   (physical Limit))
     (rule (logical Aggregate) (physical HashAggregate))
     (rule (logical Aggregate) (physical StreamingAggregate))
+    ; Applicability, not cost, picks between these and the two above: a plain
+    ; aggregate computes ONE key combination and this computes several.
+    (rule (logical Aggregate) (physical HashGroupingSets))
     (rule (logical Window)    (physical Window))
     (rule (logical Distinct)  (physical HashDistinct))
     (rule (logical Distinct)  (physical StreamingDistinct))
@@ -122,4 +128,5 @@
     (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
               Sort FormatConvert Limit HashAggregate StreamingAggregate Window
               HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan
-              HashSemiJoin HashAntiJoin NestedLoopSemiJoin NestedLoopAntiJoin)))
+              HashSemiJoin HashAntiJoin NestedLoopSemiJoin NestedLoopAntiJoin
+              HashGroupingSets)))

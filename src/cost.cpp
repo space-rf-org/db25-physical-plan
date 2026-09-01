@@ -116,6 +116,15 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
         case PhysicalOp::Sort:
         case PhysicalOp::FormatConvert:
             return in(0);  // both pass every input row through unchanged
+        case PhysicalOp::HashGroupingSets: {
+            // One group per (set, active-key-combination). Summed over the sets
+            // rather than taken once: GROUP BY CUBE(a, b) emits four groups' worth
+            // of rows, not one, and every operator above it inherits the estimate.
+            // The empty set contributes exactly one row - the grand total.
+            double rows = 0.0;
+            for (std::uint32_t i = 0; i < grouping.set_count; ++i) rows += 1.0;
+            return rows == 0.0 ? 1.0 : in(0) * card.group_selectivity * rows;
+        }
         case PhysicalOp::HashAggregate:
         case PhysicalOp::StreamingAggregate:
             // One row per group. With no grouping keys that is exactly one row -
@@ -169,7 +178,7 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
 
 double operator_cost(PhysicalOp op, std::span<const double> input_rows, double out_rows,
                      const CalibrationProfile& cal, StorageFormat scan_format,
-                     bool build_right) {
+                     bool build_right, std::uint32_t grouping_sets) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan:
@@ -204,6 +213,8 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)
         case PhysicalOp::FormatConvert:
             return in(0) * cal.convert_row;
+        case PhysicalOp::HashGroupingSets:
+            return in(0) * cal.grouping_set_row * (grouping_sets == 0 ? 1.0 : grouping_sets);
         case PhysicalOp::HashAggregate:
             return in(0) * cal.hash_aggregate_row;   // every INPUT row is hashed
         case PhysicalOp::StreamingAggregate:
@@ -265,7 +276,9 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
     for (const auto& c : node.children) input_rows.push_back(rows(*c));
     return operator_rows(node.op, input_rows, node.table_name, *this, node.limits,
                          GroupingSpec{static_cast<std::uint32_t>(node.group_keys.size()),
-                                      node.group_keys.size() == node.sort_keys.size()},
+                                      node.group_keys.size() == node.sort_keys.size(),
+                                      !node.grouping_sets.empty(),
+                                      static_cast<std::uint32_t>(node.grouping_sets.size())},
                          node.set_op,
                          node.values_columns != 0
                              ? static_cast<double>(node.values.size() / node.values_columns)
@@ -282,7 +295,8 @@ double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
         input_rows.push_back(card.rows(*c));
     }
     return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal,
-                                      node.scan_format, node.build_right);
+                                      node.scan_format, node.build_right,
+                                      static_cast<std::uint32_t>(node.grouping_sets.size()));
 }
 
 }  // namespace db25::physical

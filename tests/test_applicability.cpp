@@ -76,8 +76,9 @@ std::vector<Context> all_contexts() {
     std::vector<Context> out;
     const std::vector<std::vector<HashKey>> key_sets{{}, {{0, 0}}, {{0, 0}, {1, 1}}};
     const std::vector<GroupingSpec> groupings{
-        GroupingSpec{0, false}, GroupingSpec{0, true},
-        GroupingSpec{1, false}, GroupingSpec{1, true}};
+        GroupingSpec{0, false, false, 0}, GroupingSpec{0, true, false, 0},
+        GroupingSpec{1, false, false, 0}, GroupingSpec{1, true, false, 0},
+        GroupingSpec{1, true, true, 2},   GroupingSpec{2, false, true, 3}};
     for (const auto& k : key_sets) {
         for (const JoinType j : all_join_kinds()) {
             for (const GroupingSpec& gr : groupings) {
@@ -145,6 +146,10 @@ struct Precondition {
     bool nested_loop_only = false;         // can serve a correlated right input
     // -1: no restriction. 0: only UNION ALL. 1: anything BUT union all.
     int set_op_restriction = -1;
+    // -1: not an aggregate, so the question does not arise. 0: computes ONE key
+    // combination, so a GROUPING SETS node is not its job. 1: computes several,
+    // so a plain GROUP BY is not.
+    int grouping_sets_restriction = -1;
 };
 
 const std::vector<Precondition>& declared_preconditions() {
@@ -158,8 +163,9 @@ const std::vector<Precondition>& declared_preconditions() {
         {PhysicalOp::Sort},
         {PhysicalOp::FormatConvert},
         {PhysicalOp::Limit},
-        {PhysicalOp::HashAggregate},
-        {PhysicalOp::StreamingAggregate, false, true, false, -1},
+        {PhysicalOp::HashAggregate, false, false, false, -1, 0},
+        {PhysicalOp::StreamingAggregate, false, true, false, -1, 0},
+        {PhysicalOp::HashGroupingSets, false, false, false, -1, 1},
         {PhysicalOp::Window},
         {PhysicalOp::HashDistinct},
         {PhysicalOp::StreamingDistinct},
@@ -198,6 +204,8 @@ static void test_the_code_agrees_with_the_declared_preconditions() {
             if (join_is_lateral(c.join_kind) && !p.nested_loop_only) want = false;
             if (p.set_op_restriction == 0 && c.set_op != SetOp::UnionAll) want = false;
             if (p.set_op_restriction == 1 && c.set_op == SetOp::UnionAll) want = false;
+            if (p.grouping_sets_restriction == 0 && c.grouping.has_grouping_sets) want = false;
+            if (p.grouping_sets_restriction == 1 && !c.grouping.has_grouping_sets) want = false;
 
             const bool got = is_applicable(p.op, c.keys, c.join_kind, c.grouping, c.set_op);
             if (got != want) {

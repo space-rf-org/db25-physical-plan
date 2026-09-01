@@ -228,6 +228,7 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             out += "]";
             break;
         }
+        case PhysicalOp::HashGroupingSets:
         case PhysicalOp::HashAggregate:
         case PhysicalOp::StreamingAggregate: {
             out += " keys=[";
@@ -241,6 +242,27 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
                 out += render_expr(n.aggregates[i]);
             }
             out += "]";
+            // The grouping sets, as the key indices active in each. Rendered
+            // because they are WHAT IS COMPUTED: GROUP BY ROLLUP(a, b) and GROUP
+            // BY CUBE(a, b) share every key and every aggregate and differ only
+            // here, so a plan omitting them renders the two identically while they
+            // return different rows.
+            if (!n.grouping_sets.empty()) {
+                out += " sets=[";
+                for (std::size_t i = 0; i < n.grouping_sets.size(); ++i) {
+                    if (i != 0) out += " ";
+                    out += "(";
+                    bool first = true;
+                    for (std::uint32_t k = 0; k < 64; ++k) {
+                        if ((n.grouping_sets[i] & (std::uint64_t{1} << k)) == 0) continue;
+                        if (!first) out += " ";
+                        out += std::to_string(k);
+                        first = false;
+                    }
+                    out += ")";
+                }
+                out += "]";
+            }
             break;
         }
         case PhysicalOp::UnionAll:

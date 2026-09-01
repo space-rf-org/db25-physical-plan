@@ -43,6 +43,7 @@ void GroupKey::finish() noexcept {
     h = mix64(h, static_cast<std::uint64_t>(limits.has_offset));
     h = mix64(h, static_cast<std::uint64_t>(limits.offset));
     h = mix64(h, op_split);
+    for (const std::uint64_t s : grouping_sets) h = mix64(h, s);
     h = mix64(h, static_cast<std::uint64_t>(set_op));
     hash = h;
 }
@@ -79,6 +80,7 @@ bool GroupKey::equals(const GroupKey& o) const noexcept {
         if (!expr_structurally_equal(residual[i], o.residual[i])) return false;
     }
     if (op_split != o.op_split) return false;
+    if (grouping_sets != o.grouping_sets) return false;
     if (set_op != o.set_op) return false;
     if (op_exprs.size() != o.op_exprs.size()) return false;
     for (std::size_t i = 0; i < op_exprs.size(); ++i) {
@@ -205,7 +207,8 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
 
     auto node = std::make_unique<PhysicalNode>(ge.op);
     if (g.output != nullptr) node->output = *g.output;
-    node->table_name = g.table_name;
+    if (g.table_name != nullptr) node->table_name = *g.table_name;
+    node->grouping_sets = g.grouping_sets;
     node->scan_format = ge.scan_format;
     node->scan_freshness = ge.scan_freshness;
     node->predicate = g.predicate;
@@ -218,7 +221,10 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     } else if (ge.op == PhysicalOp::ValuesScan) {
         node->values = g.op_exprs;
         node->values_columns = g.op_split;
-    } else if (ge.op == PhysicalOp::HashAggregate || ge.op == PhysicalOp::StreamingAggregate) {
+    } else if (is_aggregate_family(ge.op)) {
+        // is_aggregate_family, not a list of two operator names. Listing them left
+        // HashGroupingSets out when it arrived, and it extracted with no keys and
+        // no aggregates - a plan that rendered plausibly and computed nothing.
         node->group_keys.assign(g.op_exprs.begin(), g.op_exprs.begin() + g.op_split);
         node->aggregates.assign(g.op_exprs.begin() + g.op_split, g.op_exprs.end());
     } else {

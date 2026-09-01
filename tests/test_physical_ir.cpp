@@ -98,25 +98,35 @@ static GroupExpr group_expr(PhysicalOp op) {
     ge.cost = 0.0;
     return ge;
 }
+// `table` is BORROWED, matching Group::table_name - the caller must keep the
+// string alive for as long as the memo. Passing a temporary here is a
+// use-after-free that ASan catches on the first run.
 static void set_payload(Memo& m, GroupId g, std::vector<GroupId> inputs,
-                        std::string table = {}, const Expr* pred = nullptr,
+                        const std::string* table = nullptr, const Expr* pred = nullptr,
                         std::vector<const Expr*> projections = {},
                         std::vector<HashKey> keys = {}) {
     Group& grp = m.group(g);
     grp.inputs = inputs;
-    grp.table_name = std::move(table);
+    grp.table_name = table;
     grp.predicate = pred;
     grp.op_exprs = std::move(projections);
     grp.hash_keys = std::move(keys);
 }
 static void add_candidate(Memo& m, GroupId g, PhysicalOp op, std::vector<GroupId> inputs,
-                          std::string table = {}, const Expr* pred = nullptr,
+                          const std::string* table = nullptr, const Expr* pred = nullptr,
                           std::vector<const Expr*> projections = {},
                           std::vector<HashKey> keys = {}) {
-    set_payload(m, g, std::move(inputs), std::move(table), pred, std::move(projections),
+    set_payload(m, g, std::move(inputs), table, pred, std::move(projections),
                 std::move(keys));
     m.add_expr(g, group_expr(op));
 }
+
+// Borrowed by the memo, so they live as long as the program rather than as long
+// as the call. A string literal cannot be passed: `const char*` does not convert,
+// which is the type system enforcing the lifetime contract rather than ASan
+// discovering it later.
+static const std::string kTableA = "a";
+static const std::string kTableB = "b";
 
 static Schema a_schema() {
     return {{"id", DataType::Integer, false}, {"x", DataType::Integer, true}};
@@ -191,27 +201,27 @@ static void test_memo_extracts_to_same_render() {
     Memo m;
     const Schema sch_a = a_schema();
     const GroupId g_a = m.add_group(sch_a);
-    add_candidate(m, g_a, PhysicalOp::SeqScan, {}, "a");
+    add_candidate(m, g_a, PhysicalOp::SeqScan, {}, &kTableA);
     win(m, g_a, 0);
 
     const Schema sch_b = b_schema();
     const GroupId g_b = m.add_group(sch_b);
-    add_candidate(m, g_b, PhysicalOp::SeqScan, {}, "b");
+    add_candidate(m, g_b, PhysicalOp::SeqScan, {}, &kTableB);
     win(m, g_b, 0);
 
     const Schema sch_join = join_schema();
     const GroupId g_join = m.add_group(sch_join);
-    add_candidate(m, g_join, PhysicalOp::HashJoin, {g_a, g_b}, "", nullptr, {}, {{0, 0}});
+    add_candidate(m, g_join, PhysicalOp::HashJoin, {g_a, g_b}, nullptr, nullptr, {}, {{0, 0}});
     win(m, g_join, 0);
 
     const Schema sch_filter = join_schema();
     const GroupId g_filter = m.add_group(sch_filter);
-    add_candidate(m, g_filter, PhysicalOp::Filter, {g_join}, "", pred);
+    add_candidate(m, g_filter, PhysicalOp::Filter, {g_join}, nullptr, pred);
     win(m, g_filter, 0);
 
     const Schema sch_proj = proj_schema();
     const GroupId g_proj = m.add_group(sch_proj);
-    add_candidate(m, g_proj, PhysicalOp::Project, {g_filter}, "", nullptr, {px, py});
+    add_candidate(m, g_proj, PhysicalOp::Project, {g_filter}, nullptr, nullptr, {px, py});
     win(m, g_proj, 0);
     m.set_root(g_proj);
 
@@ -229,7 +239,7 @@ static void test_extract_without_winner_fails() {
     Memo m;
     const Schema sch = a_schema();  // borrowed by the memo: must outlive it
     const GroupId g = m.add_group(sch);
-    add_candidate(m, g, PhysicalOp::SeqScan, {}, "a");
+    add_candidate(m, g, PhysicalOp::SeqScan, {}, &kTableA);
     // No winner set.
     m.set_root(g);
     CHECK(m.extract_winner() == nullptr);
