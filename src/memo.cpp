@@ -225,6 +225,7 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
         node->projections = g.op_exprs;
     }
     node->set_op = g.set_op;
+    node->build_right = ge.build_right;
     node->hash_keys = g.hash_keys;
     node->join_kind = g.join_kind;
     node->sort_keys = g.sort_keys;

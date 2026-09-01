@@ -136,7 +136,7 @@ static void test_lowers_the_increment0_query() {
     const std::string s = physical_to_sexpr(*r.plan);
     CHECK(contains(s, "(Project "));
     CHECK(contains(s, "(Filter "));
-    CHECK(contains(s, "(HashJoin kind=inner keys=[(L#0 R#0)]"));  // a.id=b.id -> key pair
+    CHECK(contains(s, "(HashJoin kind=inner build=right keys=[(L#0 R#0)]"));  // a.id=b.id -> key pair
     CHECK(contains(s, "(SeqScan table=a"));
     CHECK(contains(s, "(SeqScan table=b"));
     CHECK(contains(s, "exprs=[(col #1) (col #3)]"));
@@ -1012,7 +1012,7 @@ static void test_nested_loop_never_wins_an_equi_join() {
     if (!r.plan) return;
     const std::string s = physical_to_sexpr(*r.plan);
     CHECK(!contains(s, "NestedLoopJoin"));  // considered, and correctly rejected
-    CHECK(contains(s, "HashJoin kind=inner keys=[(L#0 R#0)]"));
+    CHECK(contains(s, "HashJoin kind=inner build=right keys=[(L#0 R#0)]"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,6 +1988,91 @@ static void test_semi_and_anti_cardinality_are_complements_bounded_by_the_left()
     CHECK(rows(PhysicalOp::HashJoin) > in[0]);
 }
 
+// ---------------------------------------------------------------------------
+// Increment 3.6: which side of a hash join builds.
+//
+// A hash join materializes one input into a table and streams the other past it.
+// Building the SMALLER side is what makes it cheap - and which side is smaller is
+// not knowable until cardinalities are, so it is a costed candidate rather than a
+// rule. Before this the build side was hard-wired to the right input, which is
+// exactly wrong whenever the right input is the larger one.
+static void test_the_hash_join_builds_the_smaller_side() {
+    std::printf("test_the_hash_join_builds_the_smaller_side\n");
+    auto render = [](double a_rows, double b_rows) {
+        auto logical = build_logical();          // a JOIN b ON a.id = b.id
+        db25::physical::CardinalityModel card;
+        card.base_rows["a"] = a_rows;
+        card.base_rows["b"] = b_rows;
+        LoweringContext ctx;
+        ctx.cardinality = &card;
+        const LoweringResult r = lower(*logical, ctx);
+        CHECK(r.ok);
+        return r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    };
+    // `a` is the left input. When `b` is the smaller it builds; when `a` is, the
+    // choice flips. A plan that says "build=right" in both cases has not chosen.
+    //
+    // The cardinalities are 2:1, not 10000:1, and that is deliberate. At extreme
+    // ratios the NESTED LOOP wins this join outright and there is no hash join to
+    // observe: `nested_loop_pair` (0.05) prices 100000x10 = one million pair
+    // comparisons at 50000, below a hash join's 100000 probes at 0.8 = 80000. A
+    // real engine would not agree, so that ratio is a cost-model calibration
+    // question - recorded as its own item, not silently fixed here by moving a
+    // coefficient that would shift every golden.
+    const std::string big_left = render(2000.0, 1000.0);
+    const std::string big_right = render(1000.0, 2000.0);
+    CHECK(contains(big_left, "build=right"));
+    CHECK(contains(big_right, "build=left"));
+    CHECK(big_left != big_right);
+
+    // The keys are UNCHANGED by the swap. `build` says which input is
+    // materialized; it does not renumber the columns, and a plan whose keys moved
+    // with the build side would be joining on the wrong ones.
+    CHECK(contains(big_left, "keys=[(L#0 R#0)]"));
+    CHECK(contains(big_right, "keys=[(L#0 R#0)]"));
+    // And so is the output schema - the group's schema fixes it, not the build
+    // side. This is the property that makes the choice sound at all.
+    const auto out_of = [](const std::string& s) {
+        const std::size_t i = s.find("HashJoin");
+        const std::size_t j = s.find("out=[", i);
+        return s.substr(j, s.find(']', j) - j);
+    };
+    CHECK(out_of(big_left) == out_of(big_right));
+}
+
+// The choice is offered ONLY where swapping computes the same relation. An outer
+// join must keep unmatched rows of a particular input; a semi or anti join probes
+// the left against a set built from the right; EXCEPT is not symmetric. Offering a
+// swapped candidate there would not be a cheaper plan, it would be a different
+// query - and since it is sometimes CHEAPER, the cost model would take it.
+static void test_the_build_side_is_only_chosen_where_it_is_sound() {
+    std::printf("test_the_build_side_is_only_chosen_where_it_is_sound\n");
+    using db25::physical::PhysicalOp;
+    using db25::ast::JoinType;
+    CHECK(db25::physical::is_build_side_choosable(PhysicalOp::HashJoin, JoinType::Inner));
+    CHECK(db25::physical::is_build_side_choosable(PhysicalOp::HashJoin, JoinType::Cross));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::HashJoin, JoinType::Left));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::HashJoin, JoinType::Right));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::HashJoin, JoinType::Full));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::HashJoin, JoinType::LeftLateral));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::HashSemiJoin, JoinType::Inner));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::HashAntiJoin, JoinType::Inner));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::HashSetOp, JoinType::Inner));
+    CHECK(!db25::physical::is_build_side_choosable(PhysicalOp::MergeJoin, JoinType::Inner));
+
+    // End to end: a LEFT join keeps the fixed build side however lopsided the
+    // inputs are, where an inner join over the same shape would have flipped.
+    auto logical = build_logical(nullptr, JoinType::Left);
+    db25::physical::CardinalityModel card;
+    card.base_rows["a"] = 1000.0;
+    card.base_rows["b"] = 2000.0;
+    LoweringContext ctx;
+    ctx.cardinality = &card;
+    const LoweringResult r = lower(*logical, ctx);
+    CHECK(r.ok);
+    if (r.plan) CHECK(contains(physical_to_sexpr(*r.plan), "kind=left build=right"));
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -2040,6 +2125,8 @@ int main() {
     test_semi_and_anti_joins_lower();
     test_a_keyless_semi_join_is_a_nested_loop();
     test_semi_and_anti_cardinality_are_complements_bounded_by_the_left();
+    test_the_hash_join_builds_the_smaller_side();
+    test_the_build_side_is_only_chosen_where_it_is_sound();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

@@ -168,7 +168,8 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
 }
 
 double operator_cost(PhysicalOp op, std::span<const double> input_rows, double out_rows,
-                     const CalibrationProfile& cal, StorageFormat scan_format) {
+                     const CalibrationProfile& cal, StorageFormat scan_format,
+                     bool build_right) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan:
@@ -180,9 +181,15 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return in(0) * cal.filter_row;  // the predicate runs on every INPUT row
         case PhysicalOp::Project:
             return in(0) * cal.project_row;
-        case PhysicalOp::HashJoin:
-            // input 0 probes, input 1 builds.
-            return in(1) * cal.hash_build_row + in(0) * cal.hash_probe_row;
+        case PhysicalOp::HashJoin: {
+            // One side is materialized into the hash table, the other streams past
+            // it. WHICH is the candidate's own choice rather than a fixed rule:
+            // building the smaller side is what makes a hash join cheap, and this
+            // is where that shows up.
+            const double build = build_right ? in(1) : in(0);
+            const double probe = build_right ? in(0) : in(1);
+            return build * cal.hash_build_row + probe * cal.hash_probe_row;
+        }
         case PhysicalOp::MergeJoin:
             // One linear pass over each already-sorted input - cheaper per row
             // than hashing, which is why it wins when the order comes for free
@@ -274,7 +281,8 @@ double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
         child_cost += cost_of(*c, cal, card);
         input_rows.push_back(card.rows(*c));
     }
-    return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal, node.scan_format);
+    return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal,
+                                      node.scan_format, node.build_right);
 }
 
 }  // namespace db25::physical

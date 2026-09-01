@@ -169,6 +169,13 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             // render byte-identical goldens.
             out += " kind=";
             out += join_kind_to_string(n.join_kind);
+            // Which side is materialized. Printed only for the operator that
+            // actually hashes - a merge join and a nested loop build nothing, and
+            // a field meaningless for two of the three operators sharing this case
+            // would be noise rather than information.
+            if (n.op == PhysicalOp::HashJoin) {
+                out += n.build_right ? " build=right" : " build=left";
+            }
             out += " keys=[";
             for (std::size_t i = 0; i < n.hash_keys.size(); ++i) {
                 if (i != 0) out += " ";
