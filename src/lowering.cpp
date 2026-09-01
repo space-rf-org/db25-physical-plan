@@ -37,6 +37,8 @@ const char* logical_op_name(plan::LogicalOp op) {
         case plan::LogicalOp::Distinct: return "Distinct";
         case plan::LogicalOp::SetOp:   return "SetOp";
         case plan::LogicalOp::Values:  return "Values";
+        case plan::LogicalOp::SemiJoin: return "SemiJoin";
+        case plan::LogicalOp::AntiJoin: return "AntiJoin";
         default:                       return nullptr;
     }
 }
@@ -65,6 +67,10 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
     // UNION ALL admits only the concatenation, everything else only the hash.
     static constexpr PhysicalOp kSetOp[]{PhysicalOp::UnionAll, PhysicalOp::HashSetOp};
     static constexpr PhysicalOp kValues[]{PhysicalOp::ValuesScan};
+    static constexpr PhysicalOp kSemi[]{PhysicalOp::HashSemiJoin,
+                                        PhysicalOp::NestedLoopSemiJoin};
+    static constexpr PhysicalOp kAnti[]{PhysicalOp::HashAntiJoin,
+                                        PhysicalOp::NestedLoopAntiJoin};
     switch (op) {
         case plan::LogicalOp::Scan:    return kScan;
         case plan::LogicalOp::Filter:  return kFilter;
@@ -77,6 +83,8 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
         case plan::LogicalOp::Distinct: return kDistinct;
         case plan::LogicalOp::SetOp:   return kSetOp;
         case plan::LogicalOp::Values:  return kValues;
+        case plan::LogicalOp::SemiJoin: return kSemi;
+        case plan::LogicalOp::AntiJoin: return kAnti;
         default:                       return {};
     }
 }
@@ -212,6 +220,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         case plan::LogicalOp::Project:
             for (const auto& e : n.exprs) payload.op_exprs.push_back(e.get());
             break;
+        case plan::LogicalOp::SemiJoin:
+        case plan::LogicalOp::AntiJoin:
         case plan::LogicalOp::Join: {
             // WHICH join this is. Everything below chooses an ALGORITHM; this
             // records the relational operator that algorithm has to implement.

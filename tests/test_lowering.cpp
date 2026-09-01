@@ -1893,6 +1893,101 @@ static void test_setop_kind_and_values_width_are_part_of_group_identity() {
     CHECK(!make_values(1).equals(make_values(2)));
 }
 
+// ---------------------------------------------------------------------------
+// Increment 3.5: semi and anti joins (EXISTS / IN, NOT EXISTS).
+//
+// No staged fixture in the umbrella exercised either before this unit, so the
+// corpus could not say whether they lowered - it never asked. They did not.
+static plan::LogicalNodePtr build_semi(plan::LogicalOp op, bool equi = true) {
+    auto l = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    l->table_name = "a";
+    l->output = a_schema();
+    auto r = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    r->table_name = "b";
+    r->output = b_schema();
+    auto j = std::make_unique<plan::LogicalNode>(op);
+    j->output = a_schema();   // the LEFT schema only - that is the whole point
+    j->predicate = equi
+        ? binop(BinaryOp::Equal, col(0, DataType::Integer), col(2, DataType::Integer))
+        : binop(BinaryOp::GreaterThan, col(1, DataType::Integer), col(2, DataType::Integer));
+    j->add_child(std::move(l));
+    j->add_child(std::move(r));
+    return j;
+}
+
+static void test_semi_and_anti_joins_lower() {
+    std::printf("test_semi_and_anti_joins_lower\n");
+    auto semi = build_semi(plan::LogicalOp::SemiJoin);
+    const LoweringResult rs = lower(*semi);
+    CHECK(rs.ok);
+    const std::string ss = rs.plan ? physical_to_sexpr(*rs.plan) : std::string{};
+    CHECK(contains(ss, "HashSemiJoin keys=[(L#0 R#0)]"));
+
+    auto anti = build_semi(plan::LogicalOp::AntiJoin);
+    const LoweringResult ra = lower(*anti);
+    CHECK(ra.ok);
+    const std::string sa = ra.plan ? physical_to_sexpr(*ra.plan) : std::string{};
+    CHECK(contains(sa, "HashAntiJoin keys=[(L#0 R#0)]"));
+
+    // Semi and anti are EXACT COMPLEMENTS - the rows one keeps are the rows the
+    // other drops - so producing the same plan for both would be as wrong as a
+    // LEFT join rendering like an INNER one.
+    CHECK(ss != sa);
+    // Neither carries a join kind: the outer-join kinds do not apply, and the
+    // operator name already says which of the two it is.
+    CHECK(!contains(ss, "kind="));
+
+    // The output is the LEFT schema only. A join would be four columns wide here.
+    CHECK(contains(ss, "out=[id:Integer x:Integer?]"));
+}
+
+// The keyless fallback, exactly as for a join: with no equi-key there is nothing
+// to hash on, so only the nested-loop form is applicable - and it must be, or an
+// EXISTS with a non-equi condition would have no legal plan at all.
+static void test_a_keyless_semi_join_is_a_nested_loop() {
+    std::printf("test_a_keyless_semi_join_is_a_nested_loop\n");
+    auto semi = build_semi(plan::LogicalOp::SemiJoin, /*equi=*/false);
+    const LoweringResult r = lower(*semi);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "NestedLoopSemiJoin keys=[]"));
+    CHECK(!contains(s, "HashSemiJoin"));
+    CHECK(contains(s, "residual=[(> (col #1) (col #2))]"));
+
+    using db25::physical::PhysicalOp;
+    CHECK(!db25::physical::is_applicable(PhysicalOp::HashSemiJoin, {}));
+    CHECK(!db25::physical::is_applicable(PhysicalOp::HashAntiJoin, {}));
+    CHECK(db25::physical::is_applicable(PhysicalOp::NestedLoopSemiJoin, {}));
+    CHECK(db25::physical::is_applicable(PhysicalOp::NestedLoopAntiJoin, {}));
+    // And the keyed forms are applicable once there IS a key, or an equi EXISTS
+    // would be stuck on the quadratic plan.
+    CHECK(db25::physical::is_applicable(PhysicalOp::HashSemiJoin, {{0, 0}}));
+}
+
+// A semi join emits each qualifying LEFT row once, so its cardinality can never
+// exceed its left input - unlike a join, whose output is the product times a
+// selectivity. Getting this wrong would make every operator above it overestimate.
+// The anti join is the exact complement over the same inputs.
+static void test_semi_and_anti_cardinality_are_complements_bounded_by_the_left() {
+    std::printf("test_semi_and_anti_cardinality_are_complements_bounded_by_the_left\n");
+    const db25::physical::CardinalityModel card;
+    const double in[2] = {1000.0, 500.0};
+    using db25::physical::PhysicalOp;
+    const auto rows = [&](PhysicalOp op) {
+        return operator_rows(op, std::span<const double>{in, 2}, "", card);
+    };
+    const double semi = rows(PhysicalOp::HashSemiJoin);
+    const double anti = rows(PhysicalOp::HashAntiJoin);
+    CHECK(semi <= in[0]);
+    CHECK(anti <= in[0]);
+    CHECK(semi + anti == in[0]);          // exact complements
+    CHECK(semi == rows(PhysicalOp::NestedLoopSemiJoin));  // algorithm cannot change the count
+    CHECK(anti == rows(PhysicalOp::NestedLoopAntiJoin));
+    // A JOIN over the same inputs is the product - far more than the left input.
+    CHECK(rows(PhysicalOp::HashJoin) > in[0]);
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -1942,6 +2037,9 @@ int main() {
     test_set_operations_pick_by_applicability_not_cost();
     test_values_lowers_including_the_from_less_select();
     test_setop_kind_and_values_width_are_part_of_group_identity();
+    test_semi_and_anti_joins_lower();
+    test_a_keyless_semi_join_is_a_nested_loop();
+    test_semi_and_anti_cardinality_are_complements_bounded_by_the_left();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

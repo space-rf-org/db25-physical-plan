@@ -52,6 +52,15 @@
     (operator (name HashSetOp)          (arity 2) (kind pipeline-breaker))
     ; A literal row set, and the synthetic single row of a FROM-less SELECT.
     (operator (name ValuesScan)         (arity 0) (kind access-path))
+    ; Semi and anti joins (EXISTS / IN, NOT EXISTS). Both emit the LEFT schema
+    ; only and emit each qualifying left row ONCE however many right rows match,
+    ; which is why they are their own operators rather than a join plus a distinct.
+    ; Four rather than two with a mode flag: they are exact complements, and an
+    ; operator that does not say which it is reads the same as the other.
+    (operator (name HashSemiJoin)       (arity 2) (kind pipeline-breaker))
+    (operator (name HashAntiJoin)       (arity 2) (kind pipeline-breaker))
+    (operator (name NestedLoopSemiJoin) (arity 2) (kind pipeline-breaker))
+    (operator (name NestedLoopAntiJoin) (arity 2) (kind pipeline-breaker))
     ; Sort is BOTH the implementation of a logical Sort (ORDER BY) and the
     ; enforcer inserted to establish a required order - one operator, because they
     ; are one operation; only who asked for it differs.
@@ -88,7 +97,11 @@
     (rule (logical Distinct)  (physical StreamingDistinct))
     (rule (logical SetOp)     (physical UnionAll))
     (rule (logical SetOp)     (physical HashSetOp))
-    (rule (logical Values)    (physical ValuesScan)))
+    (rule (logical Values)    (physical ValuesScan))
+    (rule (logical SemiJoin)  (physical HashSemiJoin))
+    (rule (logical SemiJoin)  (physical NestedLoopSemiJoin))
+    (rule (logical AntiJoin)  (physical HashAntiJoin))
+    (rule (logical AntiJoin)  (physical NestedLoopAntiJoin)))
 
   ; Where exhaustive search stops being affordable (design D5). Past this many
   ; joins the planner falls back to a bounded enumeration - a worse plan chosen by
@@ -108,4 +121,5 @@
     (name reference)
     (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
               Sort FormatConvert Limit HashAggregate StreamingAggregate Window
-              HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan)))
+              HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan
+              HashSemiJoin HashAntiJoin NestedLoopSemiJoin NestedLoopAntiJoin)))
