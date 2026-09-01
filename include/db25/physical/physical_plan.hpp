@@ -52,6 +52,19 @@ enum class PhysicalOp : std::uint8_t {
                     // on the output. Cheaper per row than hashing - and dearer
                     // once a Sort has to be enforced to feed it, which is exactly
                     // the trade the search exists to make.
+    HashDistinct,   // SELECT DISTINCT via a hash table on every output column:
+                    // indifferent to input order, and produces none.
+    StreamingDistinct, // SELECT DISTINCT over an input already sorted on every
+                    // output column: adjacent duplicates collapse in one pass, and
+                    // the order survives. The same trade as the two aggregates.
+    UnionAll,       // concatenate two inputs, keeping duplicates. No comparison
+                    // at all, so it is the one set operation that needs neither a
+                    // hash table nor sorted input.
+    HashSetOp,      // UNION / INTERSECT / EXCEPT (and the ALL variants of the
+                    // latter two): builds a hash table on the RIGHT input and
+                    // probes it with the left. `set_op` says which.
+    ValuesScan,     // a literal row set - VALUES (..), (..) - and the synthetic
+                    // single empty row a FROM-less SELECT is evaluated over.
     Window,         // window functions (RANK / SUM(..) OVER (...)): consumes its
                     // input sorted by (PARTITION BY ++ ORDER BY), appends one
                     // column per window function, and emits in that same order.
@@ -70,11 +83,13 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 12> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 17> kAllPhysicalOps = {
     PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
     PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
     PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
-    PhysicalOp::HashAggregate,  PhysicalOp::StreamingAggregate, PhysicalOp::Window};
+    PhysicalOp::HashAggregate,  PhysicalOp::StreamingAggregate, PhysicalOp::Window,
+    PhysicalOp::HashDistinct,   PhysicalOp::StreamingDistinct, PhysicalOp::UnionAll,
+    PhysicalOp::HashSetOp,      PhysicalOp::ValuesScan};
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
@@ -175,6 +190,14 @@ using PhysicalNodePtr = std::unique_ptr<PhysicalNode>;
 // correlated right input is not merely slower - it is not executable.
 [[nodiscard]] bool join_is_lateral(ast::JoinType k) noexcept;
 
+// Render a set operation, and say whether it de-duplicates. UNION removes
+// duplicates; UNION ALL keeps them; INTERSECT ALL and EXCEPT ALL are the multiset
+// forms of their un-suffixed counterparts. Carried and rendered rather than
+// inferred, for the reason the join kind is: an operator that does not say which
+// set operation it computes is indistinguishable from one that computes another.
+[[nodiscard]] const char* set_op_to_string(ast::SetOp op) noexcept;
+[[nodiscard]] bool set_op_deduplicates(ast::SetOp op) noexcept;
+
 // One equi-join key pair for a HashJoin: positional column indices into the left
 // and right input schemas respectively.
 struct HashKey {
@@ -213,6 +236,7 @@ struct PhysicalNode {
     // `output` are inherited from the logical schema and describe the RESULT, not
     // the operator's obligation, so they cannot stand in for this.
     ast::JoinType join_kind = ast::JoinType::Inner;
+    ast::SetOp set_op = ast::SetOp::Union;               // HashSetOp: which one
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
     Freshness scan_freshness = Freshness::Fresh;         // SeqScan: does this copy lag?
@@ -226,6 +250,10 @@ struct PhysicalNode {
     // Window: the window-function calls, one per appended output column. Each
     // carries its own OVER clause inside the borrowed expression.
     std::vector<const Expr*> window_functions;
+    // ValuesScan: the literal rows, flattened row-major, `values_columns` wide.
+    // A FROM-less SELECT is one row of zero columns.
+    std::vector<const Expr*> values;
+    std::uint32_t values_columns = 0;
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}
 };

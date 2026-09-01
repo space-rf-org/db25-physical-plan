@@ -96,7 +96,8 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
 
 double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                      const std::string& table_name, const CardinalityModel& card,
-                     LimitSpec limits, GroupingSpec grouping) {
+                     LimitSpec limits, GroupingSpec grouping, ast::SetOp set_op,
+                     double values_rows) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan: {
@@ -125,6 +126,30 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             return grouping.key_count == 0 ? 1.0 : in(0) * card.group_selectivity;
         case PhysicalOp::Window:
             return in(0);  // appends columns; never adds or drops a row
+        case PhysicalOp::HashDistinct:
+        case PhysicalOp::StreamingDistinct:
+            return in(0) * card.distinct_selectivity;
+        case PhysicalOp::UnionAll:
+            return in(0) + in(1);  // every row of both, duplicates kept
+        case PhysicalOp::HashSetOp:
+            switch (set_op) {
+                case ast::SetOp::Union:
+                    return (in(0) + in(1)) * card.distinct_selectivity;
+                case ast::SetOp::UnionAll:
+                    return in(0) + in(1);
+                case ast::SetOp::Intersect:
+                    // At most the smaller side, then de-duplicated.
+                    return (in(0) < in(1) ? in(0) : in(1)) * card.distinct_selectivity;
+                case ast::SetOp::IntersectAll:
+                    return in(0) < in(1) ? in(0) : in(1);
+                case ast::SetOp::Except:
+                    return in(0) * card.distinct_selectivity;
+                case ast::SetOp::ExceptAll:
+                    return in(0);
+            }
+            return in(0);
+        case PhysicalOp::ValuesScan:
+            return values_rows;
         case PhysicalOp::Limit:
             return limits.rows_out(in(0));
     }
@@ -167,6 +192,17 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return in(0) * cal.streaming_aggregate_row;
         case PhysicalOp::Window:
             return in(0) * cal.window_row;
+        case PhysicalOp::HashDistinct:
+            return in(0) * cal.hash_distinct_row;
+        case PhysicalOp::StreamingDistinct:
+            return in(0) * cal.streaming_distinct_row;
+        case PhysicalOp::UnionAll:
+            return (in(0) + in(1)) * cal.union_all_row;
+        case PhysicalOp::HashSetOp:
+            // Build from the right, probe with the left - both sides are touched.
+            return (in(0) + in(1)) * cal.set_op_row;
+        case PhysicalOp::ValuesScan:
+            return out_rows * cal.values_row;
         case PhysicalOp::Limit:
             return out_rows * cal.limit_row;
     }
@@ -204,7 +240,11 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
     for (const auto& c : node.children) input_rows.push_back(rows(*c));
     return operator_rows(node.op, input_rows, node.table_name, *this, node.limits,
                          GroupingSpec{static_cast<std::uint32_t>(node.group_keys.size()),
-                                      node.group_keys.size() == node.sort_keys.size()});
+                                      node.group_keys.size() == node.sort_keys.size()},
+                         node.set_op,
+                         node.values_columns != 0
+                             ? static_cast<double>(node.values.size() / node.values_columns)
+                             : (node.op == PhysicalOp::ValuesScan ? 1.0 : 0.0));
 }
 
 double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,

@@ -136,6 +136,30 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             // set this operator works in.
             return PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, StorageFormat::Row,
                                       in(0).freshness};
+        case PhysicalOp::HashDistinct:
+            // A hash table on every output column: emits in bucket order.
+            return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
+        case PhysicalOp::StreamingDistinct:
+            // Collapses adjacent duplicates in one pass, so the input's order -
+            // which it REQUIRED - survives.
+            return in(0);
+        case PhysicalOp::UnionAll:
+        case PhysicalOp::HashSetOp: {
+            // Two streams meeting produce no single order, even when both inputs
+            // happened to be sorted: a concatenation interleaves nothing and a
+            // hash probe emits in probe order at best. Claiming an order here
+            // would be claiming a property of an execution strategy.
+            Freshness f = Freshness::Fresh;
+            for (const PhysicalProperties& p : input_props) {
+                if (p.freshness == Freshness::Stale) f = Freshness::Stale;
+            }
+            return PhysicalProperties{{}, StorageFormat::Row, f};
+        }
+        case PhysicalOp::ValuesScan:
+            // Literal rows: in the order written, but that is not an order over
+            // any COLUMN, so there is no sort property to claim. Always fresh -
+            // there is no stored copy that could lag.
+            return PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
         case PhysicalOp::Window:
             // Appends columns to rows it emits in the order it received them, so
             // everything its input provided survives. Its input is REQUIRED sorted
@@ -153,7 +177,7 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
 }
 
 bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinType join_kind,
-                   GroupingSpec grouping) {
+                   GroupingSpec grouping, ast::SetOp set_op) {
     // A LATERAL join's right input is CORRELATED: its subtree reads the current
     // left row through an OuterRef, so it has no meaning evaluated on its own.
     // Only a nested-loop join re-evaluates the right input per left row; a hash
@@ -179,6 +203,15 @@ bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinTyp
     // CHEAPER of the two per row, so left to the cost model it would win and emit
     // a plan whose stated input requirement does not describe what it needs.
     if (op == PhysicalOp::StreamingAggregate && !grouping.orderable) return false;
+
+    // The two set-operation implementations are not alternatives - they compute
+    // different things - so applicability, not cost, decides between them.
+    // UnionAll concatenates and compares nothing, which is right for UNION ALL and
+    // wrong for everything else; HashSetOp compares, which is needed by everything
+    // else and pure waste for UNION ALL. Left to the cost model, UnionAll is the
+    // cheaper of the two and would win an INTERSECT.
+    if (op == PhysicalOp::UnionAll && set_op != ast::SetOp::UnionAll) return false;
+    if (op == PhysicalOp::HashSetOp && set_op == ast::SetOp::UnionAll) return false;
 
     // Both keyed joins need at least one equi-key: a merge join has nothing to
     // merge on without one, and a hash join has nothing to hash on. Note this
@@ -243,7 +276,9 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
     // group accumulator - so they take the same row-format requirement.
     if (op == PhysicalOp::HashJoin || op == PhysicalOp::MergeJoin ||
         op == PhysicalOp::NestedLoopJoin || op == PhysicalOp::HashAggregate ||
-        op == PhysicalOp::StreamingAggregate || op == PhysicalOp::Window) {
+        op == PhysicalOp::StreamingAggregate || op == PhysicalOp::Window ||
+        op == PhysicalOp::HashDistinct || op == PhysicalOp::StreamingDistinct ||
+        op == PhysicalOp::UnionAll || op == PhysicalOp::HashSetOp) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
     }
 
@@ -263,6 +298,14 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
     // aggregate's grouping order: in both cases it is the ordered key set the
     // operator consumes.
     if (op == PhysicalOp::Window && !reqs.empty()) {
+        reqs[0].sort.assign(group_sort.begin(), group_sort.end());
+        reqs[0].format = StorageFormat::Row;
+    }
+
+    // A streaming DISTINCT needs its input sorted on every output column, so that
+    // duplicates are adjacent. `group_sort` carries that key list - the third use
+    // of the same idea: the ordered key set the operator consumes.
+    if (op == PhysicalOp::StreamingDistinct && !reqs.empty()) {
         reqs[0].sort.assign(group_sort.begin(), group_sort.end());
         reqs[0].format = StorageFormat::Row;
     }
