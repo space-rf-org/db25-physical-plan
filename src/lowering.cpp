@@ -163,10 +163,12 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     key.residual = base.residual;
     key.projections = base.projections;
     key.hash_keys = base.hash_keys;
-    key.finish();
-    if (const std::optional<GroupId> existing = memo.find_group(key)) {
-        ++shared;
-        return *existing;
+    if (ctx.dedup) {
+        key.finish();
+        if (const std::optional<GroupId> existing = memo.find_group(key)) {
+            ++shared;
+            return *existing;
+        }
     }
 
     const GroupId g = memo.add_group(n.output);
@@ -220,7 +222,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 (ln ? ln : "?") + "'";
         return kInvalidGroup;
     }
-    memo.index_group(key, g);
+    if (ctx.dedup) memo.index_group(key, g);
     return g;
 }
 

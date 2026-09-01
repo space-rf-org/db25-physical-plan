@@ -59,6 +59,18 @@ struct LoweringContext {
     // both ways and asserts the rendered plans are identical - pruning that
     // changes a plan is a bug, not a speedup.
     bool prune = true;
+    // Structural memo dedup (unit 2.4). Complete, tested and falsifiable - and
+    // OFF by default, because it does not currently pay for itself. It collapses
+    // repeated logical subtrees, and no query in the corpus repeats one: every
+    // join is over two distinct tables. Meanwhile building a structural key per
+    // group costs ~3.9us of T6 on the reference query, roughly doubling the
+    // stage, to find nothing.
+    //
+    // Its premise is rule application - join reordering above all - which
+    // generates equivalent group-expressions across groups and is what makes
+    // re-derivation exponential. Turn this on with that, or for a workload with
+    // genuinely repeated subtrees; the mechanism is ready either way.
+    bool dedup = false;
     const RuntimeProfile* runtime = nullptr;
 };
 

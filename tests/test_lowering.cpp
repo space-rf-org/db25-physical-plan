@@ -403,8 +403,12 @@ static plan::LogicalNodePtr twin_scan_join(bool same_schema) {
 
 static void test_identical_subtrees_share_a_group() {
     std::printf("test_identical_subtrees_share_a_group\n");
+    // Dedup is off by default (it does not pay for itself yet - see
+    // LoweringContext::dedup); these tests exercise the mechanism explicitly.
     auto logical = twin_scan_join(true);
-    const LoweringResult r = lower(*logical);
+    LoweringContext ctx;
+    ctx.dedup = true;
+    const LoweringResult r = lower(*logical, ctx);
     CHECK(r.ok);
     if (!r.plan) return;
     CHECK(r.groups_shared == 1);   // the second scan reused the first group
@@ -431,7 +435,9 @@ static void test_non_equivalent_subtrees_never_share() {
     //     that distinguishes them.
     {
         auto logical = twin_scan_join(false);
-        const LoweringResult r = lower(*logical);
+        LoweringContext ctx;
+        ctx.dedup = true;
+        const LoweringResult r = lower(*logical, ctx);
         CHECK(r.ok);
         CHECK(r.groups_shared == 0);
         CHECK(r.memo_groups == 3);
@@ -456,7 +462,9 @@ static void test_non_equivalent_subtrees_never_share() {
                                 col(2, DataType::Integer));
         join->add_child(mk(10));
         join->add_child(mk(20));   // differs only in the literal
-        const LoweringResult r = lower(*join);
+        LoweringContext ctx;
+        ctx.dedup = true;
+        const LoweringResult r = lower(*join, ctx);
         CHECK(r.ok);
         // The two SCANS underneath are identical and legitimately share; the two
         // FILTERS are not equivalent and must not.
