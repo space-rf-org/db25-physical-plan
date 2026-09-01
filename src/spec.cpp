@@ -93,6 +93,16 @@ std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& err
         }
     }
 
+    if (const SNode* b = root.child("search-budget")) {
+        if (const SNode* n = b->child("max-join-count")) {
+            const std::string v = value_of(*n);
+            unsigned long parsed = spec.budget.max_join_count;
+            if (std::from_chars(v.data(), v.data() + v.size(), parsed).ec == std::errc{}) {
+                spec.budget.max_join_count = static_cast<std::uint32_t>(parsed);
+            }
+        }
+    }
+
     return spec;
 }
 
