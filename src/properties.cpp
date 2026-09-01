@@ -136,6 +136,17 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             // set this operator works in.
             return PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, StorageFormat::Row,
                                       in(0).freshness};
+        case PhysicalOp::HashSemiJoin:
+        case PhysicalOp::HashAntiJoin:
+        case PhysicalOp::NestedLoopSemiJoin:
+        case PhysicalOp::NestedLoopAntiJoin:
+            // Emit a subset of the LEFT input's rows, unchanged. That subset IS in
+            // the left input's order for every implementation here - but so is a
+            // nested loop join's output, and this planner deliberately claims
+            // neither, because both are properties of an execution strategy the
+            // engine has not yet promised. Consistency matters more than the one
+            // Sort it might save.
+            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
         case PhysicalOp::HashDistinct:
             // A hash table on every output column: emits in bucket order.
             return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
@@ -192,7 +203,7 @@ bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinTyp
     // ON true` has no equi-key, so it fell to NestedLoopJoin anyway and looked
     // correct; add an equi-condition to the ON clause and the same query lowered
     // to a HashJoin over a correlated right input, with lower() reporting ok.
-    if (join_is_lateral(join_kind) && op != PhysicalOp::NestedLoopJoin) return false;
+    if (join_is_lateral(join_kind) && !is_nested_loop(op)) return false;
 
     // A streaming aggregate needs its input sorted on the grouping keys, and a
     // sort requirement is POSITIONAL - so if any grouping key is not a plain
@@ -223,7 +234,7 @@ bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinTyp
     // A keyless join is not unplannable: it is a NestedLoopJoin, the one join
     // that needs no key. Guarding only MergeJoin (as this did originally) did not
     // close the class - it moved the same unexecutable plan onto HashJoin.
-    if (op == PhysicalOp::MergeJoin || op == PhysicalOp::HashJoin) return !keys.empty();
+    if (needs_equi_key(op)) return !keys.empty();
     return true;
 }
 
@@ -278,7 +289,9 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
         op == PhysicalOp::NestedLoopJoin || op == PhysicalOp::HashAggregate ||
         op == PhysicalOp::StreamingAggregate || op == PhysicalOp::Window ||
         op == PhysicalOp::HashDistinct || op == PhysicalOp::StreamingDistinct ||
-        op == PhysicalOp::UnionAll || op == PhysicalOp::HashSetOp) {
+        op == PhysicalOp::UnionAll || op == PhysicalOp::HashSetOp ||
+        op == PhysicalOp::HashSemiJoin || op == PhysicalOp::HashAntiJoin ||
+        op == PhysicalOp::NestedLoopSemiJoin || op == PhysicalOp::NestedLoopAntiJoin) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
     }
 

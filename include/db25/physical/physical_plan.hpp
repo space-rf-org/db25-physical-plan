@@ -52,6 +52,16 @@ enum class PhysicalOp : std::uint8_t {
                     // on the output. Cheaper per row than hashing - and dearer
                     // once a Sort has to be enforced to feed it, which is exactly
                     // the trade the search exists to make.
+    // Semi and anti joins, from EXISTS / IN and NOT EXISTS. Both emit the LEFT
+    // schema only, and emit each qualifying left row ONCE however many right rows
+    // match - which is why they are their own operators rather than a join
+    // followed by a distinct. Four of them rather than two with a mode flag: an
+    // operator that does not say which of semi and anti it is reads the same as
+    // the other, and they are exact complements.
+    HashSemiJoin,       // left rows that HAVE a match; hash table on the right
+    HashAntiJoin,       // left rows with NO match; hash table on the right
+    NestedLoopSemiJoin, // the keyless fallback, as NestedLoopJoin is for a join
+    NestedLoopAntiJoin,
     HashDistinct,   // SELECT DISTINCT via a hash table on every output column:
                     // indifferent to input order, and produces none.
     StreamingDistinct, // SELECT DISTINCT over an input already sorted on every
@@ -83,13 +93,23 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 17> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 21> kAllPhysicalOps = {
     PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
     PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
     PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
     PhysicalOp::HashAggregate,  PhysicalOp::StreamingAggregate, PhysicalOp::Window,
     PhysicalOp::HashDistinct,   PhysicalOp::StreamingDistinct, PhysicalOp::UnionAll,
-    PhysicalOp::HashSetOp,      PhysicalOp::ValuesScan};
+    PhysicalOp::HashSetOp,      PhysicalOp::ValuesScan,
+    PhysicalOp::HashSemiJoin,   PhysicalOp::HashAntiJoin,
+    PhysicalOp::NestedLoopSemiJoin, PhysicalOp::NestedLoopAntiJoin};
+
+// Is `op` a nested-loop family member - the implementations that re-evaluate
+// their right input per left row, and so are the only ones that can serve a
+// correlated (LATERAL) right side or a join with no equi-key?
+[[nodiscard]] bool is_nested_loop(PhysicalOp op) noexcept;
+// Does `op` build a hash table on its right input, and therefore need at least
+// one equi-key to hash on?
+[[nodiscard]] bool needs_equi_key(PhysicalOp op) noexcept;
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or

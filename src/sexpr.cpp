@@ -186,6 +186,28 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             }
             break;
         }
+        case PhysicalOp::HashSemiJoin:
+        case PhysicalOp::HashAntiJoin:
+        case PhysicalOp::NestedLoopSemiJoin:
+        case PhysicalOp::NestedLoopAntiJoin:
+            // No kind= here: semi and anti are named by the OPERATOR, and the
+            // outer-join kinds do not apply to them.
+            out += " keys=[";
+            for (std::size_t i = 0; i < n.hash_keys.size(); ++i) {
+                if (i != 0) out += " ";
+                out += "(L#" + std::to_string(n.hash_keys[i].left_index) + " R#" +
+                       std::to_string(n.hash_keys[i].right_index) + ")";
+            }
+            out += "]";
+            if (!n.residual.empty()) {
+                out += " residual=[";
+                for (std::size_t i = 0; i < n.residual.size(); ++i) {
+                    if (i != 0) out += " ";
+                    out += render_expr(n.residual[i]);
+                }
+                out += "]";
+            }
+            break;
         case PhysicalOp::Sort: {
             out += " by=[";
             for (std::size_t i = 0; i < n.sort_keys.size(); ++i) {

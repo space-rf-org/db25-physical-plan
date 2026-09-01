@@ -21,6 +21,10 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::UnionAll:      return "UnionAll";
         case PhysicalOp::HashSetOp:     return "HashSetOp";
         case PhysicalOp::ValuesScan:    return "ValuesScan";
+        case PhysicalOp::HashSemiJoin:  return "HashSemiJoin";
+        case PhysicalOp::HashAntiJoin:  return "HashAntiJoin";
+        case PhysicalOp::NestedLoopSemiJoin: return "NestedLoopSemiJoin";
+        case PhysicalOp::NestedLoopAntiJoin: return "NestedLoopAntiJoin";
         case PhysicalOp::HashAggregate: return "HashAggregate";
         case PhysicalOp::StreamingAggregate: return "StreamingAggregate";
     }
@@ -55,6 +59,19 @@ bool join_null_extends_left(ast::JoinType k) noexcept {
 bool join_null_extends_right(ast::JoinType k) noexcept {
     return k == ast::JoinType::Left || k == ast::JoinType::Full ||
            k == ast::JoinType::LeftLateral;
+}
+
+bool is_nested_loop(PhysicalOp op) noexcept {
+    return op == PhysicalOp::NestedLoopJoin || op == PhysicalOp::NestedLoopSemiJoin ||
+           op == PhysicalOp::NestedLoopAntiJoin;
+}
+
+bool needs_equi_key(PhysicalOp op) noexcept {
+    // A merge join has nothing to merge on without a key; the three hash-building
+    // operators have nothing to hash on. Grouped here rather than listed at each
+    // call site so a new hash operator cannot be added without meeting this.
+    return op == PhysicalOp::MergeJoin || op == PhysicalOp::HashJoin ||
+           op == PhysicalOp::HashSemiJoin || op == PhysicalOp::HashAntiJoin;
 }
 
 const char* set_op_to_string(ast::SetOp op) noexcept {
@@ -113,6 +130,10 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::UnionAll:      return 2;
         case PhysicalOp::HashSetOp:     return 2;
         case PhysicalOp::ValuesScan:    return 0;
+        case PhysicalOp::HashSemiJoin:  return 2;
+        case PhysicalOp::HashAntiJoin:  return 2;
+        case PhysicalOp::NestedLoopSemiJoin: return 2;
+        case PhysicalOp::NestedLoopAntiJoin: return 2;
         case PhysicalOp::HashAggregate: return 1;
         case PhysicalOp::StreamingAggregate: return 1;
     }

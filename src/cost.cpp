@@ -126,6 +126,17 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             return grouping.key_count == 0 ? 1.0 : in(0) * card.group_selectivity;
         case PhysicalOp::Window:
             return in(0);  // appends columns; never adds or drops a row
+        case PhysicalOp::HashSemiJoin:
+        case PhysicalOp::NestedLoopSemiJoin:
+            // A SUBSET of the left input, and each qualifying left row exactly
+            // once however many right rows match - so unlike a join this can never
+            // exceed in(0), and multiplying the two cardinalities would be wrong
+            // rather than merely pessimistic.
+            return in(0) * card.join_selectivity;
+        case PhysicalOp::HashAntiJoin:
+        case PhysicalOp::NestedLoopAntiJoin:
+            // The exact complement of the semi join over the same inputs.
+            return in(0) * (1.0 - card.join_selectivity);
         case PhysicalOp::HashDistinct:
         case PhysicalOp::StreamingDistinct:
             return in(0) * card.distinct_selectivity;
@@ -192,6 +203,13 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return in(0) * cal.streaming_aggregate_row;
         case PhysicalOp::Window:
             return in(0) * cal.window_row;
+        case PhysicalOp::HashSemiJoin:
+        case PhysicalOp::HashAntiJoin:
+            // Same shape as a hash join: build from the right, probe with the left.
+            return in(1) * cal.hash_build_row + in(0) * cal.hash_probe_row;
+        case PhysicalOp::NestedLoopSemiJoin:
+        case PhysicalOp::NestedLoopAntiJoin:
+            return in(0) * in(1) * cal.nested_loop_pair;
         case PhysicalOp::HashDistinct:
             return in(0) * cal.hash_distinct_row;
         case PhysicalOp::StreamingDistinct:
