@@ -147,6 +147,9 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             // engine has not yet promised. Consistency matters more than the one
             // Sort it might save.
             return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
+        case PhysicalOp::HashGroupingSets:
+            // One hash table per grouping set, emitted set by set: no order.
+            return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
         case PhysicalOp::HashDistinct:
             // A hash table on every output column: emits in bucket order.
             return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
@@ -214,6 +217,16 @@ bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinTyp
     // CHEAPER of the two per row, so left to the cost model it would win and emit
     // a plan whose stated input requirement does not describe what it needs.
     if (op == PhysicalOp::StreamingAggregate && !grouping.orderable) return false;
+
+    // A GROUPING SETS node computes SEVERAL key combinations; a plain aggregate
+    // computes exactly one. Offering a plain aggregate for the former would return
+    // the wrong ROWS while reporting success, and offering the grouping-sets
+    // operator for a plain GROUP BY would compute a redundant set. Applicability
+    // again, and again because the wrong one is the cheaper: the plain aggregates
+    // hash once where this hashes once per set.
+    if (is_aggregate_family(op) && computes_grouping_sets(op) != grouping.has_grouping_sets) {
+        return false;
+    }
 
     // The two set-operation implementations are not alternatives - they compute
     // different things - so applicability, not cost, decides between them.
@@ -291,7 +304,8 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
         op == PhysicalOp::HashDistinct || op == PhysicalOp::StreamingDistinct ||
         op == PhysicalOp::UnionAll || op == PhysicalOp::HashSetOp ||
         op == PhysicalOp::HashSemiJoin || op == PhysicalOp::HashAntiJoin ||
-        op == PhysicalOp::NestedLoopSemiJoin || op == PhysicalOp::NestedLoopAntiJoin) {
+        op == PhysicalOp::NestedLoopSemiJoin || op == PhysicalOp::NestedLoopAntiJoin ||
+        op == PhysicalOp::HashGroupingSets) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
     }
 

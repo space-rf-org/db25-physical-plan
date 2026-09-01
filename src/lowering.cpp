@@ -58,7 +58,8 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
     // Two candidates, like a join: hashing works on any input, streaming needs a
     // sorted one and is cheaper when it gets it. The search costs both.
     static constexpr PhysicalOp kAggregate[]{PhysicalOp::HashAggregate,
-                                             PhysicalOp::StreamingAggregate};
+                                             PhysicalOp::StreamingAggregate,
+                                             PhysicalOp::HashGroupingSets};
     static constexpr PhysicalOp kWindow[]{PhysicalOp::Window};
     static constexpr PhysicalOp kDistinct[]{PhysicalOp::HashDistinct,
                                             PhysicalOp::StreamingDistinct};
@@ -173,8 +174,18 @@ double values_rows_of(const Group& g) {
     return static_cast<double>(g.op_exprs.size() / g.op_split);
 }
 
+// A group's table name, or the empty string. `table_name` is a BORROWED pointer
+// and null for every operator but a scan, so every reader needs this - returning a
+// reference to a static empty string rather than constructing one per call.
+const std::string& table_name_of(const Group& g) {
+    static const std::string empty;
+    return g.table_name != nullptr ? *g.table_name : empty;
+}
+
 GroupingSpec grouping_of(const Group& g) {
-    return GroupingSpec{g.op_split, g.op_split == g.sort_keys.size()};
+    return GroupingSpec{g.op_split, g.op_split == g.sort_keys.size(),
+                        !g.grouping_sets.empty(),
+                        static_cast<std::uint32_t>(g.grouping_sets.size())};
 }
 
 // ---- phase 1: exploration -------------------------------------------------
@@ -212,7 +223,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     payload.inputs = inputs;
     switch (n.op) {
         case plan::LogicalOp::Scan:
-            payload.table_name = n.table_name;
+            payload.table_name = &n.table_name;   // borrowed; the logical node outlives us
             break;
         case plan::LogicalOp::Filter:
             payload.predicate = n.predicate.get();  // borrowed
@@ -264,10 +275,28 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             // combinations at once. Neither operator here computes that, and
             // treating it as a plain GROUP BY would return the wrong ROWS while
             // reporting success - so it fails, and says which construct it is.
+            // GROUPING SETS / ROLLUP / CUBE. Each set is a BITMASK over the
+            // grouping keys; a key absent from a set is NULL in that set's output
+            // rows. More than 64 grouping keys cannot be expressed - and 64 keys
+            // under CUBE is 2^64 sets, so the query is unplannable long before the
+            // representation is.
             if (!n.grouping_sets.empty()) {
-                error = "grouping sets (ROLLUP / CUBE / GROUPING SETS) are not yet "
-                        "implemented in physical lowering";
-                return kInvalidGroup;
+                if (n.group_keys.size() > 64) {
+                    error = "more than 64 grouping keys with GROUPING SETS in lowering";
+                    return kInvalidGroup;
+                }
+                payload.grouping_sets.reserve(n.grouping_sets.size());
+                for (const auto& set : n.grouping_sets) {
+                    std::uint64_t mask = 0;
+                    for (const std::uint32_t k : set) {
+                        if (k >= n.group_keys.size()) {
+                            error = "grouping set names a key that does not exist in lowering";
+                            return kInvalidGroup;
+                        }
+                        mask |= (std::uint64_t{1} << k);
+                    }
+                    payload.grouping_sets.push_back(mask);
+                }
             }
             payload.op_exprs.reserve(n.group_keys.size() + n.aggregates.size());
             for (const auto& e : n.group_keys) payload.op_exprs.push_back(e.get());
@@ -407,6 +436,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.residual = payload.residual;
         key.op_exprs = payload.op_exprs;
         key.op_split = payload.op_split;
+        key.grouping_sets = payload.grouping_sets;
         key.set_op = payload.set_op;
         key.hash_keys = payload.hash_keys;
         key.join_kind = payload.join_kind;
@@ -423,11 +453,12 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     {
         Group& grp = memo.group(g);
         grp.inputs = payload.inputs;
-        grp.table_name = std::move(payload.table_name);
+        grp.table_name = payload.table_name;
         grp.predicate = payload.predicate;
         grp.residual = std::move(payload.residual);
         grp.op_exprs = std::move(payload.op_exprs);
         grp.op_split = payload.op_split;
+        grp.grouping_sets = std::move(payload.grouping_sets);
         grp.set_op = payload.set_op;
         grp.hash_keys = std::move(payload.hash_keys);
         grp.join_kind = payload.join_kind;
@@ -441,7 +472,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     std::size_t n_in = 0;
     for (const GroupId in : inputs) { if (n_in == 2) break; in_rows_buf[n_in++] = memo.group(in).rows; }
     memo.set_rows(g, operator_rows(cands.front(), std::span<const double>{in_rows_buf, n_in},
-                                   memo.group(g).table_name, card, memo.group(g).limits,
+                                   table_name_of(memo.group(g)), card, memo.group(g).limits,
                                    grouping_of(memo.group(g)), memo.group(g).set_op,
                                    values_rows_of(memo.group(g))));
 
@@ -449,7 +480,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     // other operator has a single (irrelevant) format slot.
     std::vector<FormatAvailability> scan_formats{FormatAvailability{StorageFormat::Row}};
     if (n.op == plan::LogicalOp::Scan) {
-        scan_formats = storage.formats_for(memo.group(g).table_name);
+        scan_formats = storage.formats_for(table_name_of(memo.group(g)));
         // A correctness constraint, not a cost one: drop the copies that cannot
         // answer this query at all. No enforcer could rescue them, so they must
         // not reach the cost comparison in the first place.
@@ -459,7 +490,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 if (fa.freshness == Freshness::Fresh) eligible.push_back(fa);
             }
             if (eligible.empty()) {
-                error = "table '" + memo.group(g).table_name +
+                error = "table '" + table_name_of(memo.group(g)) +
                         "' has no copy fresh enough for this query";
                 return kInvalidGroup;
             }
@@ -630,7 +661,8 @@ struct Optimizer {
             const std::span<const double> in_rows{in_rows_buf, n_in};
             const ArityVec<PhysicalProperties>& op_reqs = ge.input_reqs;
             const double own_cost =
-                operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format, ge.build_right);
+                operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format, ge.build_right,
+                              static_cast<std::uint32_t>(grp.grouping_sets.size()));
 
             // The operator's own work alone already costs at least the bound, so
             // no arrangement of its inputs can rescue it.

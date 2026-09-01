@@ -62,6 +62,11 @@ enum class PhysicalOp : std::uint8_t {
     HashAntiJoin,       // left rows with NO match; hash table on the right
     NestedLoopSemiJoin, // the keyless fallback, as NestedLoopJoin is for a join
     NestedLoopAntiJoin,
+    HashGroupingSets, // GROUP BY GROUPING SETS / ROLLUP / CUBE: one pass computing
+                    // SEVERAL grouping-key combinations at once, hashing on each
+                    // set's active subset. There is no streaming counterpart -
+                    // different sets want different input orderings, and no single
+                    // sort serves them all.
     HashDistinct,   // SELECT DISTINCT via a hash table on every output column:
                     // indifferent to input order, and produces none.
     StreamingDistinct, // SELECT DISTINCT over an input already sorted on every
@@ -93,7 +98,7 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 21> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 22> kAllPhysicalOps = {
     PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
     PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
     PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
@@ -101,7 +106,8 @@ inline constexpr std::array<PhysicalOp, 21> kAllPhysicalOps = {
     PhysicalOp::HashDistinct,   PhysicalOp::StreamingDistinct, PhysicalOp::UnionAll,
     PhysicalOp::HashSetOp,      PhysicalOp::ValuesScan,
     PhysicalOp::HashSemiJoin,   PhysicalOp::HashAntiJoin,
-    PhysicalOp::NestedLoopSemiJoin, PhysicalOp::NestedLoopAntiJoin};
+    PhysicalOp::NestedLoopSemiJoin, PhysicalOp::NestedLoopAntiJoin,
+    PhysicalOp::HashGroupingSets};
 
 // Is `op` a nested-loop family member - the implementations that re-evaluate
 // their right input per left row, and so are the only ones that can serve a
@@ -123,6 +129,17 @@ inline constexpr std::array<PhysicalOp, 21> kAllPhysicalOps = {
 // relation; EXCEPT is not symmetric at all. The choice is offered exactly where
 // it is sound.
 [[nodiscard]] bool is_build_side_choosable(PhysicalOp op, ast::JoinType join_kind) noexcept;
+
+// Does `op` compute several grouping-key combinations at once? The plain
+// aggregates compute exactly one, so offering them for a GROUPING SETS node - or
+// this one for a plain GROUP BY - would return the wrong ROWS while reporting
+// success. Applicability, not cost: the plain aggregates are the cheaper.
+[[nodiscard]] bool computes_grouping_sets(PhysicalOp op) noexcept;
+// The three aggregate implementations. The grouping-sets question only applies to
+// them: asking whether a Filter computes several key combinations is meaningless,
+// and answering "no, so it is inapplicable" would make every operator in the
+// planner inapplicable to an aggregate group.
+[[nodiscard]] bool is_aggregate_family(PhysicalOp op) noexcept;
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
@@ -176,6 +193,11 @@ struct LimitSpec {
 struct GroupingSpec {
     std::uint32_t key_count = 0;  // 0 is a scalar aggregate: exactly one output row
     bool orderable = false;       // every grouping key is a plain column reference
+    // GROUPING SETS / ROLLUP / CUBE. `set_count` is how many combinations are
+    // computed - an aggregate over N sets emits roughly N times the rows of one,
+    // and estimating it as one would understate every operator above it.
+    bool has_grouping_sets = false;
+    std::uint32_t set_count = 0;
 };
 
 // One key of a sort order: a positional column index and its direction, plus
@@ -290,6 +312,8 @@ struct PhysicalNode {
     // A FROM-less SELECT is one row of zero columns.
     std::vector<const Expr*> values;
     std::uint32_t values_columns = 0;
+    // HashGroupingSets: one bitmask per grouping set over `group_keys`.
+    std::vector<std::uint64_t> grouping_sets;
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}
 };

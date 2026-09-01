@@ -25,6 +25,7 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::HashAntiJoin:  return "HashAntiJoin";
         case PhysicalOp::NestedLoopSemiJoin: return "NestedLoopSemiJoin";
         case PhysicalOp::NestedLoopAntiJoin: return "NestedLoopAntiJoin";
+        case PhysicalOp::HashGroupingSets: return "HashGroupingSets";
         case PhysicalOp::HashAggregate: return "HashAggregate";
         case PhysicalOp::StreamingAggregate: return "StreamingAggregate";
     }
@@ -64,6 +65,15 @@ bool join_null_extends_right(ast::JoinType k) noexcept {
 bool is_nested_loop(PhysicalOp op) noexcept {
     return op == PhysicalOp::NestedLoopJoin || op == PhysicalOp::NestedLoopSemiJoin ||
            op == PhysicalOp::NestedLoopAntiJoin;
+}
+
+bool computes_grouping_sets(PhysicalOp op) noexcept {
+    return op == PhysicalOp::HashGroupingSets;
+}
+
+bool is_aggregate_family(PhysicalOp op) noexcept {
+    return op == PhysicalOp::HashAggregate || op == PhysicalOp::StreamingAggregate ||
+           op == PhysicalOp::HashGroupingSets;
 }
 
 bool is_build_side_choosable(PhysicalOp op, ast::JoinType join_kind) noexcept {
@@ -139,6 +149,7 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::HashAntiJoin:  return 2;
         case PhysicalOp::NestedLoopSemiJoin: return 2;
         case PhysicalOp::NestedLoopAntiJoin: return 2;
+        case PhysicalOp::HashGroupingSets: return 1;
         case PhysicalOp::HashAggregate: return 1;
         case PhysicalOp::StreamingAggregate: return 1;
     }
