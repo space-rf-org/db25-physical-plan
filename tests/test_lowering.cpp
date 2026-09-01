@@ -1602,6 +1602,127 @@ static void test_aggregate_modifiers_are_rendered() {
     CHECK(s.find("(COUNT)") == std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// Increment 3.3: window functions lower - the last operator the reference query
+// needs. A Window consumes its input sorted by (PARTITION BY ++ ORDER BY),
+// appends one column per function, and emits in that same order.
+static plan::ExprPtr win_fn(const char* name, std::uint32_t part, std::uint32_t ord,
+                            bool desc = false, const char* frame = nullptr) {
+    auto e = std::make_unique<plan::Expr>(plan::ExprKind::WindowFunction);
+    e->func_name = name;
+    e->type = DataType::BigInt;
+    e->window.partition_by.push_back(col(part, DataType::Integer));
+    plan::SortKeyIR k;
+    k.expr = col(ord, DataType::Integer);
+    k.descending = desc;
+    e->window.order_by.push_back(std::move(k));
+    if (frame != nullptr) { e->window.frame.present = true; e->window.frame.spec = frame; }
+    return e;
+}
+
+static plan::LogicalNodePtr build_window(std::vector<plan::ExprPtr> fns) {
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+    auto w = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Window);
+    w->output = a_schema();
+    for (auto& f : fns) w->window_functions.push_back(std::move(f));
+    w->add_child(std::move(scan));
+    return w;
+}
+
+static void test_window_lowers_and_requires_its_order() {
+    std::printf("test_window_lowers_and_requires_its_order\n");
+    std::vector<plan::ExprPtr> fns;
+    fns.push_back(win_fn("RANK", 0, 1, /*desc=*/true));
+    auto logical = build_window(std::move(fns));
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "(Window fns=[(RANK :over [:partition [(col #0)] :order [(col #1) desc]])]"));
+    // A Sort must be enforced BELOW it - a bare scan provides no order, and the
+    // operator cannot compute a window over unordered rows.
+    CHECK(contains(s, "Sort"));
+    CHECK(s.find("Window") < s.find("Sort"));
+    // PARTITION BY first, then ORDER BY, with the direction carried.
+    CHECK(contains(s, "by=[#0 asc #1 desc]"));
+    // And the Window advertises the order it emits, so a consumer asking for it
+    // does not get a second Sort stacked on top.
+    CHECK(satisfies(derive(*r.plan),
+                    PhysicalProperties{{SortKey{0, false, false, false},
+                                        SortKey{1, true, false, false}},
+                                       StorageFormat::Any, Freshness::Any}));
+}
+
+// Two window functions with DIFFERENT OVER clauses cannot share one operator: it
+// states ONE input sort requirement, and serving one function's ordering while
+// computing the other would emit a plan whose stated requirement does not describe
+// what it needs. Splitting the node into two Windows fed by two Sorts is a
+// transformation rule the memo does not have, so this fails and says so.
+static void test_differing_over_clauses_fail_rather_than_pick_one() {
+    std::printf("test_differing_over_clauses_fail_rather_than_pick_one\n");
+    {
+        std::vector<plan::ExprPtr> fns;
+        fns.push_back(win_fn("RANK", 0, 1));
+        fns.push_back(win_fn("ROW_NUMBER", 1, 0));   // different partition AND order
+        // A NAMED local, not a temporary: the physical plan BORROWS expressions
+        // from the logical one, so a temporary would be freed before the plan is
+        // read. ASan catches it immediately, which is how this comment got here.
+        auto logical = build_window(std::move(fns));
+        const LoweringResult r = lower(*logical);
+        CHECK(!r.ok);
+        CHECK(r.plan == nullptr);
+        CHECK(contains(r.error, "different OVER clauses"));
+    }
+    // Same OVER clause twice is fine - one sort serves both.
+    {
+        std::vector<plan::ExprPtr> fns;
+        fns.push_back(win_fn("RANK", 0, 1));
+        fns.push_back(win_fn("DENSE_RANK", 0, 1));
+        auto logical = build_window(std::move(fns));
+        const LoweringResult r = lower(*logical);
+        CHECK(r.ok);
+        if (r.plan) CHECK(contains(physical_to_sexpr(*r.plan), "DENSE_RANK"));
+    }
+    // Differing only in the FRAME is also fine: the frame does not change what
+    // ordering the operator needs, and it is carried inside each expression.
+    {
+        std::vector<plan::ExprPtr> fns;
+        fns.push_back(win_fn("SUM", 0, 1, false, "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW"));
+        fns.push_back(win_fn("SUM", 0, 1, false, "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"));
+        auto logical = build_window(std::move(fns));
+        const LoweringResult r = lower(*logical);
+        CHECK(r.ok);
+        if (!r.plan) return;
+        const std::string s = physical_to_sexpr(*r.plan);
+        // Both frames are RENDERED. A plan that silently forgot ROWS BETWEEN would
+        // compute a different answer, and two frames must not look alike.
+        CHECK(contains(s, ":frame \"ROWS BETWEEN 1 PRECEDING AND CURRENT ROW\""));
+        CHECK(contains(s, ":frame \"ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\""));
+    }
+}
+
+// A PARTITION BY or window ORDER BY key that is not a plain column reference has
+// no positional index to be. Unlike an aggregate there is no order-free
+// alternative to fall back to, so this fails honestly rather than sorting by
+// whatever column that index happened to name.
+static void test_a_computed_window_key_fails_honestly() {
+    std::printf("test_a_computed_window_key_fails_honestly\n");
+    auto e = std::make_unique<plan::Expr>(plan::ExprKind::WindowFunction);
+    e->func_name = "RANK";
+    e->type = DataType::BigInt;
+    e->window.partition_by.push_back(
+        binop(BinaryOp::Add, col(0, DataType::Integer), col(1, DataType::Integer)));
+    std::vector<plan::ExprPtr> fns;
+    fns.push_back(std::move(e));
+    auto logical = build_window(std::move(fns));
+    const LoweringResult r = lower(*logical);
+    CHECK(!r.ok);
+    CHECK(r.plan == nullptr);
+    CHECK(contains(r.error, "PARTITION BY"));
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -1644,6 +1765,9 @@ int main() {
     test_a_scalar_aggregate_estimates_one_row();
     test_grouping_sets_fail_rather_than_silently_flatten();
     test_aggregate_modifiers_are_rendered();
+    test_window_lowers_and_requires_its_order();
+    test_differing_over_clauses_fail_rather_than_pick_one();
+    test_a_computed_window_key_fails_honestly();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

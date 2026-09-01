@@ -123,6 +123,8 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             // than merely imprecise. The ALGORITHM does not change the count, so
             // both aggregates answer identically, as both joins do.
             return grouping.key_count == 0 ? 1.0 : in(0) * card.group_selectivity;
+        case PhysicalOp::Window:
+            return in(0);  // appends columns; never adds or drops a row
         case PhysicalOp::Limit:
             return limits.rows_out(in(0));
     }
@@ -163,6 +165,8 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return in(0) * cal.hash_aggregate_row;   // every INPUT row is hashed
         case PhysicalOp::StreamingAggregate:
             return in(0) * cal.streaming_aggregate_row;
+        case PhysicalOp::Window:
+            return in(0) * cal.window_row;
         case PhysicalOp::Limit:
             return out_rows * cal.limit_row;
     }

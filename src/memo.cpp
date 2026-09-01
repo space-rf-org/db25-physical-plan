@@ -211,7 +211,9 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     // A Project's expressions and an Aggregate's payload share one vector on the
     // group; they are separate fields on the extracted NODE, which is not in a
     // deque and so is not size-critical.
-    if (ge.op == PhysicalOp::HashAggregate || ge.op == PhysicalOp::StreamingAggregate) {
+    if (ge.op == PhysicalOp::Window) {
+        node->window_functions = g.op_exprs;
+    } else if (ge.op == PhysicalOp::HashAggregate || ge.op == PhysicalOp::StreamingAggregate) {
         node->group_keys.assign(g.op_exprs.begin(), g.op_exprs.begin() + g.group_key_count);
         node->aggregates.assign(g.op_exprs.begin() + g.group_key_count, g.op_exprs.end());
     } else {

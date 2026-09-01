@@ -33,6 +33,7 @@ const char* logical_op_name(plan::LogicalOp op) {
         case plan::LogicalOp::Sort:    return "Sort";
         case plan::LogicalOp::Limit:   return "Limit";
         case plan::LogicalOp::Aggregate: return "Aggregate";
+        case plan::LogicalOp::Window:  return "Window";
         default:                       return nullptr;
     }
 }
@@ -53,6 +54,7 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
     // sorted one and is cheaper when it gets it. The search costs both.
     static constexpr PhysicalOp kAggregate[]{PhysicalOp::HashAggregate,
                                              PhysicalOp::StreamingAggregate};
+    static constexpr PhysicalOp kWindow[]{PhysicalOp::Window};
     switch (op) {
         case plan::LogicalOp::Scan:    return kScan;
         case plan::LogicalOp::Filter:  return kFilter;
@@ -61,6 +63,7 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
         case plan::LogicalOp::Sort:    return kSort;
         case plan::LogicalOp::Limit:   return kLimit;
         case plan::LogicalOp::Aggregate: return kAggregate;
+        case plan::LogicalOp::Window:  return kWindow;
         default:                       return {};
     }
 }
@@ -107,6 +110,33 @@ void split_join_predicate(const plan::Expr* e, std::uint32_t left_width,
         if (j < left_width && i >= left_width) { keys.push_back({j, i - left_width}); return; }
     }
     residual.push_back(e);
+}
+
+// Do two OVER clauses partition and order identically? Compared structurally, on
+// the expressions themselves: two window functions may share a node only if one
+// input ordering serves both, and that is exactly what this asks.
+bool same_window_spec(const plan::WindowSpecIR& a, const plan::WindowSpecIR& b) {
+    if (a.partition_by.size() != b.partition_by.size()) return false;
+    for (std::size_t i = 0; i < a.partition_by.size(); ++i) {
+        if (!expr_structurally_equal(a.partition_by[i].get(), b.partition_by[i].get())) return false;
+    }
+    if (a.order_by.size() != b.order_by.size()) return false;
+    for (std::size_t i = 0; i < a.order_by.size(); ++i) {
+        if (a.order_by[i].descending != b.order_by[i].descending) return false;
+        if (a.order_by[i].nulls_order_explicit != b.order_by[i].nulls_order_explicit) return false;
+        if (a.order_by[i].nulls_order_explicit &&
+            a.order_by[i].nulls_first != b.order_by[i].nulls_first) {
+            return false;
+        }
+        if (!expr_structurally_equal(a.order_by[i].expr.get(), b.order_by[i].expr.get())) {
+            return false;
+        }
+    }
+    // The FRAME is deliberately NOT compared. Two functions differing only in
+    // their frame want the same input ordering, so one Window operator serves
+    // both; the frame is carried inside each borrowed expression and consumed by
+    // the executor, not by the sort requirement.
+    return true;
 }
 
 // A group's grouping information, derived from the payload it already carries.
@@ -231,6 +261,57 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                     payload.sort_keys.push_back(SortKey{e->input_index, false, false, false});
                 }
             }
+            break;
+        }
+        case plan::LogicalOp::Window: {
+            if (n.window_functions.empty()) {
+                error = "window node with no window functions in lowering";
+                return kInvalidGroup;
+            }
+            // Every window function on ONE node must share an OVER clause, because
+            // the operator states ONE input sort requirement. Two functions with
+            // different PARTITION BY / ORDER BY need two Window operators fed by
+            // two sorts; declaring one requirement and computing both would emit a
+            // plan whose stated requirement does not describe what it needs - the
+            // defect this planner keeps finding. Splitting the node is a
+            // transformation rule, not a line here, so for now it fails and says
+            // so.
+            const plan::WindowSpecIR* spec = nullptr;
+            for (const auto& e : n.window_functions) {
+                if (e == nullptr) {
+                    error = "null window function in lowering";
+                    return kInvalidGroup;
+                }
+                if (spec == nullptr) { spec = &e->window; continue; }
+                if (!same_window_spec(*spec, e->window)) {
+                    error = "window functions with different OVER clauses on one "
+                            "node are not yet implemented in physical lowering";
+                    return kInvalidGroup;
+                }
+            }
+            // PARTITION BY then ORDER BY, as one positional key list. A key that
+            // is not a plain column reference cannot BE a positional sort key, and
+            // unlike an aggregate there is no order-free alternative to fall back
+            // to - so this fails rather than inventing an index.
+            for (const auto& e : spec->partition_by) {
+                if (e == nullptr || e->kind != plan::ExprKind::ColumnRef) {
+                    error = "unsupported PARTITION BY expression in lowering "
+                            "(only a plain column reference is a positional sort key)";
+                    return kInvalidGroup;
+                }
+                payload.sort_keys.push_back(SortKey{e->input_index, false, false, false});
+            }
+            for (const plan::SortKeyIR& k : spec->order_by) {
+                if (k.expr == nullptr || k.expr->kind != plan::ExprKind::ColumnRef) {
+                    error = "unsupported window ORDER BY expression in lowering "
+                            "(only a plain column reference is a positional sort key)";
+                    return kInvalidGroup;
+                }
+                payload.sort_keys.push_back(SortKey{k.expr->input_index, k.descending,
+                                                   k.nulls_order_explicit, k.nulls_first});
+            }
+            payload.op_exprs.reserve(n.window_functions.size());
+            for (const auto& e : n.window_functions) payload.op_exprs.push_back(e.get());
             break;
         }
         case plan::LogicalOp::Limit:

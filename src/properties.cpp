@@ -136,6 +136,12 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             // set this operator works in.
             return PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, StorageFormat::Row,
                                       in(0).freshness};
+        case PhysicalOp::Window:
+            // Appends columns to rows it emits in the order it received them, so
+            // everything its input provided survives. Its input is REQUIRED sorted
+            // by (partition ++ order), so that order is what survives - stating it
+            // as `in(0)` rather than restating the keys keeps one source of truth.
+            return in(0);
         case PhysicalOp::Limit:
             // Takes a contiguous window of its input's rows, so everything about
             // them is preserved: still in the same order, same format, same
@@ -237,7 +243,7 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
     // group accumulator - so they take the same row-format requirement.
     if (op == PhysicalOp::HashJoin || op == PhysicalOp::MergeJoin ||
         op == PhysicalOp::NestedLoopJoin || op == PhysicalOp::HashAggregate ||
-        op == PhysicalOp::StreamingAggregate) {
+        op == PhysicalOp::StreamingAggregate || op == PhysicalOp::Window) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
     }
 
@@ -247,6 +253,16 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
     // same trade as MergeJoin against HashJoin, and settled the same way, by
     // costing both routes rather than by a rule.
     if (op == PhysicalOp::StreamingAggregate && !reqs.empty()) {
+        reqs[0].sort.assign(group_sort.begin(), group_sort.end());
+        reqs[0].format = StorageFormat::Row;
+    }
+
+    // A window operator needs its input sorted by PARTITION BY then ORDER BY -
+    // partitions contiguous, and ordered within each. `group_sort` carries that
+    // combined key list, on the same footing as it carries a streaming
+    // aggregate's grouping order: in both cases it is the ordered key set the
+    // operator consumes.
+    if (op == PhysicalOp::Window && !reqs.empty()) {
         reqs[0].sort.assign(group_sort.begin(), group_sort.end());
         reqs[0].format = StorageFormat::Row;
     }

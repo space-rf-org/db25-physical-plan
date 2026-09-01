@@ -15,6 +15,7 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::Sort:          return "Sort";
         case PhysicalOp::FormatConvert: return "FormatConvert";
         case PhysicalOp::Limit:         return "Limit";
+        case PhysicalOp::Window:        return "Window";
         case PhysicalOp::HashAggregate: return "HashAggregate";
         case PhysicalOp::StreamingAggregate: return "StreamingAggregate";
     }
@@ -84,6 +85,7 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::Sort:          return 1;
         case PhysicalOp::FormatConvert: return 1;
         case PhysicalOp::Limit:         return 1;
+        case PhysicalOp::Window:        return 1;
         case PhysicalOp::HashAggregate: return 1;
         case PhysicalOp::StreamingAggregate: return 1;
     }

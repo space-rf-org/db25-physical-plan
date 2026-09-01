@@ -49,6 +49,10 @@ struct CalibrationProfile {
     // below hash_aggregate_row the streaming variant could never win, and the
     // choice the search makes here would be decorative.
     double streaming_aggregate_row = 0.5;
+    // Evaluate the window functions over one input row. Dearer than a projection
+    // because the operator maintains per-partition state and, for a frame, looks
+    // at neighbours - but linear, because its input arrives already ordered.
+    double window_row = 0.7;
     // Hardware facts (informational today; richer costing consumes them later).
     std::uint32_t simd_width = 8;
     std::uint32_t cache_line = 64;

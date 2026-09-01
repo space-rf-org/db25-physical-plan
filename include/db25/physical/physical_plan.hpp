@@ -52,6 +52,9 @@ enum class PhysicalOp : std::uint8_t {
                     // on the output. Cheaper per row than hashing - and dearer
                     // once a Sort has to be enforced to feed it, which is exactly
                     // the trade the search exists to make.
+    Window,         // window functions (RANK / SUM(..) OVER (...)): consumes its
+                    // input sorted by (PARTITION BY ++ ORDER BY), appends one
+                    // column per window function, and emits in that same order.
     Limit,          // LIMIT / OFFSET: pass at most `limit` rows through, after
                     // discarding the first `offset`. Order-SENSITIVE - which
                     // rows survive depends entirely on the order of its input.
@@ -67,11 +70,11 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 11> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 12> kAllPhysicalOps = {
     PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
     PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
     PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
-    PhysicalOp::HashAggregate,  PhysicalOp::StreamingAggregate};
+    PhysicalOp::HashAggregate,  PhysicalOp::StreamingAggregate, PhysicalOp::Window};
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
@@ -220,6 +223,9 @@ struct PhysicalNode {
     // schema is [keys..., aggregates...], which the logical node already computed.
     std::vector<const Expr*> group_keys;
     std::vector<const Expr*> aggregates;
+    // Window: the window-function calls, one per appended output column. Each
+    // carries its own OVER clause inside the borrowed expression.
+    std::vector<const Expr*> window_functions;
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}
 };
