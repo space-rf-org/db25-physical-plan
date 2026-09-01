@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <span>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -178,10 +180,11 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 
     // Cardinality belongs to the GROUP: the candidates are equivalent, so any of
     // them yields the same estimate, and it does not depend on any requirement.
-    std::vector<double> input_rows;
-    input_rows.reserve(inputs.size());
-    for (const GroupId in : inputs) input_rows.push_back(memo.group(in).rows);
-    memo.set_rows(g, operator_rows(cands.front(), input_rows, base.table_name, card));
+    double in_rows_buf[2] = {};
+    std::size_t n_in = 0;
+    for (const GroupId in : inputs) { if (n_in == 2) break; in_rows_buf[n_in++] = memo.group(in).rows; }
+    memo.set_rows(g, operator_rows(cands.front(), std::span<const double>{in_rows_buf, n_in},
+                                   base.table_name, card));
 
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot.
@@ -252,18 +255,27 @@ struct Optimizer {
     std::size_t pruned = 0;
 
     static constexpr double kNoBound = std::numeric_limits<double>::infinity();
+    // Every operator in the IR is a leaf, unary, or binary. expected_arity() is
+    // the authority; this is the compile-time bound the scratch buffers use, and
+    // a static_assert in lowering.cpp keeps the two from drifting apart.
+    static constexpr std::size_t kMaxArity = 2;
 
     // Optimize each input under `reqs`, accumulating cost and what they provide.
     // Returns false when an input cannot meet its requirement at any price, OR
     // when the running total has already exceeded `budget` - at which point the
     // candidate that asked for these inputs cannot win and the remaining inputs
     // need not be optimized at all.
+    // `provided_out` is a caller-owned fixed array, not a vector: arity is at most
+    // kMaxArity, so the search has no reason to reach the heap once per candidate
+    // per goal. This is the allocation the search MULTIPLIES - every other one is
+    // bounded by plan size rather than by how hard the search works.
     bool optimize_inputs(const std::vector<GroupId>& inputs,
                          const std::vector<PhysicalProperties>& reqs, double budget,
-                         double& cost_out, std::vector<PhysicalProperties>& provided_out) {
+                         double& cost_out, PhysicalProperties* provided_out,
+                         std::size_t& provided_count) {
         cost_out = 0.0;
-        provided_out.clear();
-        for (std::size_t i = 0; i < inputs.size(); ++i) {
+        provided_count = 0;
+        for (std::size_t i = 0; i < inputs.size() && i < kMaxArity; ++i) {
             const PhysicalProperties& r =
                 i < reqs.size() ? reqs[i] : Group::unconstrained();
             const std::optional<std::uint32_t> w =
@@ -272,7 +284,7 @@ struct Optimizer {
             const WinnerEntry& e = memo.group(inputs[i]).winners[*w];
             cost_out += e.cost;
             if (prune && cost_out >= budget) return false;  // cannot win; stop here
-            provided_out.push_back(e.provided);
+            provided_out[provided_count++] = e.provided;
         }
         return true;
     }
@@ -310,9 +322,13 @@ struct Optimizer {
             // unit ever applies rules DURING search, this is the line that has to
             // change - copying it back cost five allocations per candidate.
             const GroupExpr& ge = memo.group(g).exprs[i];
-            std::vector<double> in_rows;
-            in_rows.reserve(ge.inputs.size());
-            for (const GroupId in : ge.inputs) in_rows.push_back(memo.group(in).rows);
+            double in_rows_buf[kMaxArity] = {};
+            std::size_t n_in = 0;
+            for (const GroupId in : ge.inputs) {
+                if (n_in == kMaxArity) break;
+                in_rows_buf[n_in++] = memo.group(in).rows;
+            }
+            const std::span<const double> in_rows{in_rows_buf, n_in};
             const std::vector<PhysicalProperties>& op_reqs = ge.input_reqs;
             const double own_cost =
                 operator_cost(ge.op, in_rows, out_rows, cal, ge.scan_format);
@@ -323,11 +339,14 @@ struct Optimizer {
 
             // --- route 1: satisfy the operator's own needs, enforce on top ---
             double child_cost = 0.0;
-            std::vector<PhysicalProperties> child_props;
+            PhysicalProperties child_props[kMaxArity];
+            std::size_t n_child = 0;
             if (optimize_inputs(ge.inputs, op_reqs, bound - own_cost, child_cost,
-                                child_props)) {
-                const PhysicalProperties provided = derive_op(
-                    ge.op, ge.hash_keys, ge.scan_format, child_props, ge.scan_freshness);
+                                child_props, n_child)) {
+                const PhysicalProperties provided =
+                    derive_op(ge.op, ge.hash_keys, ge.scan_format,
+                              std::span<const PhysicalProperties>{child_props, n_child},
+                              ge.scan_freshness);
                 const double top = enforcement_cost(provided, required, out_rows, cal);
                 const double total = child_cost + own_cost + top;
                 if (total < best_cost) {
@@ -358,12 +377,14 @@ struct Optimizer {
                     pushed[0] = combined;
 
                     double pd_cost = 0.0;
-                    std::vector<PhysicalProperties> pd_props;
+                    PhysicalProperties pd_props[kMaxArity];
+                    std::size_t n_pd = 0;
                     if (optimize_inputs(ge.inputs, pushed, bound - own_cost, pd_cost,
-                                        pd_props)) {
-                        const PhysicalProperties provided =
-                            derive_op(ge.op, ge.hash_keys, ge.scan_format, pd_props,
-                                      ge.scan_freshness);
+                                        pd_props, n_pd)) {
+                        const PhysicalProperties provided = derive_op(
+                            ge.op, ge.hash_keys, ge.scan_format,
+                            std::span<const PhysicalProperties>{pd_props, n_pd},
+                            ge.scan_freshness);
                         const double top =
                             enforcement_cost(provided, required, out_rows, cal);
                         const double total = pd_cost + own_cost + top;

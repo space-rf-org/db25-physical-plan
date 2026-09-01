@@ -1,6 +1,7 @@
 #include "db25/physical/properties.hpp"
 
 #include <cstddef>
+#include <span>
 #include <utility>
 
 namespace db25::physical {
@@ -52,7 +53,7 @@ bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& req
 
 PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
                              StorageFormat scan_format,
-                             const std::vector<PhysicalProperties>& input_props,
+                             std::span<const PhysicalProperties> input_props,
                              Freshness scan_freshness) {
     const auto in = [&](std::size_t i) {
         return i < input_props.size() ? input_props[i] : PhysicalProperties{};

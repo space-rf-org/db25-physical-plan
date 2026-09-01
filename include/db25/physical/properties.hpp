@@ -11,6 +11,7 @@
 #include "db25/physical/physical_plan.hpp"
 
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace db25::physical {
@@ -44,7 +45,7 @@ struct PhysicalProperties {
 // form below and the memo form - where inputs are GROUPS - derive identically.
 [[nodiscard]] PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
                                            StorageFormat scan_format,
-                                           const std::vector<PhysicalProperties>& input_props,
+                                           std::span<const PhysicalProperties> input_props,
                                            Freshness scan_freshness = Freshness::Fresh);
 
 // Is `op` a legal implementation for a join with these equi-keys? A MergeJoin

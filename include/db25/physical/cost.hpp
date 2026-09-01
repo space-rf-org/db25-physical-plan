@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -87,9 +88,12 @@ struct CardinalityModel {
 // however it is currently represented - the "one cost model" invariant (D3) made
 // structural rather than merely intended. `input_rows` are the estimated output
 // rows of each input, in operand order.
-[[nodiscard]] double operator_rows(PhysicalOp op, const std::vector<double>& input_rows,
+// `input_rows` is a SPAN, not a vector: every operator in the IR has arity <= 2,
+// so the caller can hold these on the stack. Taking a vector forced the search to
+// heap-allocate a one- or two-element array for every candidate of every goal.
+[[nodiscard]] double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                                    const std::string& table_name, const CardinalityModel& card);
-[[nodiscard]] double operator_cost(PhysicalOp op, const std::vector<double>& input_rows,
+[[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
                                    StorageFormat scan_format = StorageFormat::Row);
 
