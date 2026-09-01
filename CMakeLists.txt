@@ -54,7 +54,8 @@ add_library(db25physicalplan STATIC
     src/spec.cpp
     src/cost.cpp
     src/properties.cpp
-    src/lowering.cpp)
+    src/lowering.cpp
+    src/structural_key.cpp)
 target_include_directories(db25physicalplan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(db25physicalplan PUBLIC db25logicalplan)

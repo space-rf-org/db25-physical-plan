@@ -17,6 +17,9 @@
 
 #include <cstdint>
 #include <deque>
+#include <string>
+#include <unordered_map>
+#include <utility>
 #include <limits>
 #include <optional>
 #include <vector>
@@ -147,11 +150,41 @@ struct Group {
     }
 };
 
+// The structural identity of a group, as exploration knows it: the logical
+// operator, the schema it produces, the groups it consumes, and its own payload.
+// Two groups with equal keys are interchangeable, so only one need exist.
+// `comparable` is false when any payload expression is one the structural
+// comparison does not exhaustively cover - such a group is never shared.
+struct GroupKey {
+    int logical_op = -1;
+    std::string table_name;
+    Schema output;
+    std::vector<GroupId> inputs;
+    const Expr* predicate = nullptr;
+    std::vector<const Expr*> residual;
+    std::vector<const Expr*> projections;
+    std::vector<HashKey> hash_keys;
+    bool comparable = false;
+    std::uint64_t hash = 0;
+
+    [[nodiscard]] bool equals(const GroupKey& o) const noexcept;
+    void finish() noexcept;  // compute `hash` and `comparable`
+};
+
 // The memo. Owns its groups; group ids are stable indices into that storage.
 class Memo {
 public:
     // Create an empty group with the given output schema; returns its id.
     GroupId add_group(Schema output);
+
+    // The id of an existing group structurally identical to `key`, if there is
+    // one. Buckets by hash and then VERIFIES field by field: a hash collision
+    // that merged two different subtrees would plan one query as another.
+    [[nodiscard]] std::optional<GroupId> find_group(const GroupKey& key) const;
+
+    // Record `key` as the identity of group `id`, so later structurally identical
+    // subtrees find it. A key marked not-comparable is not indexed at all.
+    void index_group(const GroupKey& key, GroupId id);
 
     // Append a group-expression to a group; returns its index within the group.
     std::uint32_t add_expr(GroupId group, GroupExpr expr);
@@ -206,6 +239,9 @@ private:
     // all of them. It also makes Group references stable, which the search relies
     // on while recursing.
     std::deque<Group> groups_;
+    // Structural index: hash bucket -> the groups carrying that hash, with their
+    // keys kept for exact verification.
+    std::unordered_map<std::uint64_t, std::vector<std::pair<GroupKey, GroupId>>> index_;
     GroupId root_ = kInvalidGroup;
 };
 

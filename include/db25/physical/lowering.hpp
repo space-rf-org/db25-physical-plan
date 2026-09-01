@@ -78,6 +78,10 @@ struct LoweringResult {
     // exceeded the best plan found for the same goal. Evidence that pruning is
     // doing something; zero on a query with nothing to prune.
     std::size_t candidates_pruned = 0;
+    // Logical subtrees that turned out to be structurally identical to one
+    // already explored, and so shared its memo group instead of building a
+    // second. Zero on a query with no repeated subtree - which is most of them.
+    std::size_t groups_shared = 0;
 };
 
 // Lower a logical plan to a physical plan. The physical plan borrows expression
