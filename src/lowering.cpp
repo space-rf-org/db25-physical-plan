@@ -150,20 +150,23 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     // share its group rather than build a second copy. Children are explored (and
     // shared) first, so by the time this runs the input GroupIds are themselves
     // canonical - which is what makes a shallow key sufficient.
+    //
+    // The key is built ONLY when dedup is on. Building it unconditionally and
+    // testing the flag afterwards still copied four vectors per group, which cost
+    // most of the feature's price on queries that had opted out of it.
     GroupKey key;
-    key.logical_op = static_cast<int>(n.op);
-    // Borrowed from the LOGICAL NODE, not from the local GroupExpr: the index
-    // outlives this call, and pointing at a local was a stack-use-after-return
-    // (ASan caught it on the first run). Only a Scan carries a table name, which
-    // is exactly when base.table_name was set.
-    key.table_name = n.op == plan::LogicalOp::Scan ? &n.table_name : nullptr;
-    key.output = &n.output;
-    key.inputs = inputs;
-    key.predicate = base.predicate;
-    key.residual = base.residual;
-    key.projections = base.projections;
-    key.hash_keys = base.hash_keys;
     if (ctx.dedup) {
+        key.logical_op = static_cast<int>(n.op);
+        // Borrowed from the LOGICAL NODE, not from the local GroupExpr: the index
+        // outlives this call, and pointing at a local was a stack-use-after-return
+        // (ASan caught it on the first run). Only a Scan carries a table name.
+        key.table_name = n.op == plan::LogicalOp::Scan ? &n.table_name : nullptr;
+        key.output = &n.output;
+        key.inputs = inputs;
+        key.predicate = base.predicate;
+        key.residual = base.residual;
+        key.projections = base.projections;
+        key.hash_keys = base.hash_keys;
         key.finish();
         if (const std::optional<GroupId> existing = memo.find_group(key)) {
             ++shared;
