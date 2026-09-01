@@ -43,6 +43,12 @@ struct CalibrationProfile {
     // looking at them, so it is priced on its OUTPUT rows, not its input - the
     // only operator here for which that is the honest shape.
     double limit_row = 0.1;
+    double hash_aggregate_row = 1.1;   // hash one input row into its group
+    // One pass, no hash table: cheaper per row than hashing, which is the whole
+    // reason to want a sorted input. The ratio is what matters - if this were not
+    // below hash_aggregate_row the streaming variant could never win, and the
+    // choice the search makes here would be decorative.
+    double streaming_aggregate_row = 0.5;
     // Hardware facts (informational today; richer costing consumes them later).
     std::uint32_t simd_width = 8;
     std::uint32_t cache_line = 64;
@@ -80,6 +86,12 @@ struct CardinalityModel {
     double default_base = 1000.0;      // an unseeded base table
     double filter_selectivity = 0.1;   // default WHERE selectivity
     double join_selectivity = 0.1;     // default equi-join selectivity, per key
+    // Fraction of input rows that survive a GROUP BY - i.e. how many distinct
+    // groups there are. Without per-column distinct counts this is a flat guess,
+    // and it is a guess this model states rather than hides: a real estimate
+    // needs statistics, which arrive with the catalog's histograms. A SCALAR
+    // aggregate (no grouping keys) is not a guess at all - it is exactly one row.
+    double group_selectivity = 0.1;
 
     // Estimated output rows of the plan rooted at `node`.
     [[nodiscard]] double rows(const PhysicalNode& node) const;
@@ -99,9 +111,11 @@ struct CardinalityModel {
 // `table_name` is the scan's: a Limit's output cardinality is not a function of
 // its input's alone, and estimating it as the input's would over-count every
 // operator above it and skew their choices.
+// `grouping` is the Aggregate's, for the same reason: an aggregate's output is
+// one row per GROUP, which is not a function of its input's cardinality alone.
 [[nodiscard]] double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                                    const std::string& table_name, const CardinalityModel& card,
-                                   LimitSpec limits = {});
+                                   LimitSpec limits = {}, GroupingSpec grouping = {});
 [[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
                                    StorageFormat scan_format = StorageFormat::Row);

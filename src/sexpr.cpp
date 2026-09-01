@@ -138,6 +138,21 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             out += "]";
             break;
         }
+        case PhysicalOp::HashAggregate:
+        case PhysicalOp::StreamingAggregate: {
+            out += " keys=[";
+            for (std::size_t i = 0; i < n.group_keys.size(); ++i) {
+                if (i != 0) out += " ";
+                out += render_expr(n.group_keys[i]);
+            }
+            out += "] aggs=[";
+            for (std::size_t i = 0; i < n.aggregates.size(); ++i) {
+                if (i != 0) out += " ";
+                out += render_expr(n.aggregates[i]);
+            }
+            out += "]";
+            break;
+        }
         case PhysicalOp::Limit: {
             if (n.limits.has_limit) out += " limit=" + std::to_string(n.limits.limit);
             if (n.limits.has_offset) out += " offset=" + std::to_string(n.limits.offset);

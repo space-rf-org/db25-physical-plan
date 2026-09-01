@@ -96,7 +96,7 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
 
 double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                      const std::string& table_name, const CardinalityModel& card,
-                     LimitSpec limits) {
+                     LimitSpec limits, GroupingSpec grouping) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan: {
@@ -115,6 +115,14 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
         case PhysicalOp::Sort:
         case PhysicalOp::FormatConvert:
             return in(0);  // both pass every input row through unchanged
+        case PhysicalOp::HashAggregate:
+        case PhysicalOp::StreamingAggregate:
+            // One row per group. With no grouping keys that is exactly one row -
+            // `SELECT COUNT(*) FROM t` returns a single row however large t is,
+            // and estimating it as a fraction of the input would be wrong rather
+            // than merely imprecise. The ALGORITHM does not change the count, so
+            // both aggregates answer identically, as both joins do.
+            return grouping.key_count == 0 ? 1.0 : in(0) * card.group_selectivity;
         case PhysicalOp::Limit:
             return limits.rows_out(in(0));
     }
@@ -151,6 +159,10 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)
         case PhysicalOp::FormatConvert:
             return in(0) * cal.convert_row;
+        case PhysicalOp::HashAggregate:
+            return in(0) * cal.hash_aggregate_row;   // every INPUT row is hashed
+        case PhysicalOp::StreamingAggregate:
+            return in(0) * cal.streaming_aggregate_row;
         case PhysicalOp::Limit:
             return out_rows * cal.limit_row;
     }
@@ -186,7 +198,9 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
     std::vector<double> input_rows;
     input_rows.reserve(node.children.size());
     for (const auto& c : node.children) input_rows.push_back(rows(*c));
-    return operator_rows(node.op, input_rows, node.table_name, *this, node.limits);
+    return operator_rows(node.op, input_rows, node.table_name, *this, node.limits,
+                         GroupingSpec{static_cast<std::uint32_t>(node.group_keys.size()),
+                                      node.group_keys.size() == node.sort_keys.size()});
 }
 
 double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,

@@ -34,6 +34,11 @@
     ; input arrives in, which is why the planner may not push an order
     ; requirement through it.
     (operator (name Limit)         (arity 1) (kind pipeline))
+    ; Two implementations of GROUP BY. HashAggregate works on any input and
+    ; produces no order; StreamingAggregate needs its input already sorted on the
+    ; grouping keys, is cheaper per row, and keeps that order on its output.
+    (operator (name HashAggregate)      (arity 1) (kind pipeline-breaker))
+    (operator (name StreamingAggregate) (arity 1) (kind pipeline))
     ; Sort is BOTH the implementation of a logical Sort (ORDER BY) and the
     ; enforcer inserted to establish a required order - one operator, because they
     ; are one operation; only who asked for it differs.
@@ -62,7 +67,9 @@
     ; memo is still one group per logical node. Adding TopN as an implementation
     ; rule for either node alone would be wrong.
     (rule (logical Sort)    (physical Sort))
-    (rule (logical Limit)   (physical Limit)))
+    (rule (logical Limit)   (physical Limit))
+    (rule (logical Aggregate) (physical HashAggregate))
+    (rule (logical Aggregate) (physical StreamingAggregate)))
 
   ; Where exhaustive search stops being affordable (design D5). Past this many
   ; joins the planner falls back to a bounded enumeration - a worse plan chosen by
@@ -81,4 +88,4 @@
   (capability-profile
     (name reference)
     (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
-              Sort FormatConvert Limit)))
+              Sort FormatConvert Limit HashAggregate StreamingAggregate)))

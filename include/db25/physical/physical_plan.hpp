@@ -45,6 +45,13 @@ enum class PhysicalOp : std::uint8_t {
                     // satisfy a required order. One operator, because they are
                     // the same operation; what differs is only who asked for it.
     FormatConvert,  // enforcer: converts the storage format (row <-> column)
+    HashAggregate,  // GROUP BY via a hash table on the grouping keys: indifferent
+                    // to input order, and produces none.
+    StreamingAggregate, // GROUP BY over an input already sorted on the grouping
+                    // keys: one pass, no hash table, and the group order survives
+                    // on the output. Cheaper per row than hashing - and dearer
+                    // once a Sort has to be enforced to feed it, which is exactly
+                    // the trade the search exists to make.
     Limit,          // LIMIT / OFFSET: pass at most `limit` rows through, after
                     // discarding the first `offset`. Order-SENSITIVE - which
                     // rows survive depends entirely on the order of its input.
@@ -60,10 +67,11 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 9> kAllPhysicalOps = {
-    PhysicalOp::SeqScan,       PhysicalOp::Filter,    PhysicalOp::Project,
-    PhysicalOp::HashJoin,      PhysicalOp::MergeJoin, PhysicalOp::NestedLoopJoin,
-    PhysicalOp::Sort,          PhysicalOp::FormatConvert, PhysicalOp::Limit};
+inline constexpr std::array<PhysicalOp, 11> kAllPhysicalOps = {
+    PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
+    PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
+    PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
+    PhysicalOp::HashAggregate,  PhysicalOp::StreamingAggregate};
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
@@ -103,6 +111,20 @@ struct LimitSpec {
                                             ? n : static_cast<double>(limit);
         return n;
     }
+};
+
+// What the planner needs to know about an Aggregate's grouping beyond the key
+// expressions themselves.
+//
+// `orderable` is the interesting one. A streaming aggregate asks for its input
+// pre-sorted on the grouping keys, and a sort requirement is positional - so a
+// grouping key that is not a plain column reference (`GROUP BY a + b`) cannot be
+// expressed as one. Rather than fail the query, that makes STREAMING inapplicable
+// and leaves hashing, which needs no order and can hash any expression. A
+// capability the planner lacks costs a plan alternative here, not an answer.
+struct GroupingSpec {
+    std::uint32_t key_count = 0;  // 0 is a scalar aggregate: exactly one output row
+    bool orderable = false;       // every grouping key is a plain column reference
 };
 
 // One key of a sort order: a positional column index and its direction, plus
@@ -193,6 +215,11 @@ struct PhysicalNode {
     Freshness scan_freshness = Freshness::Fresh;         // SeqScan: does this copy lag?
     StorageFormat target_format = StorageFormat::Any;    // FormatConvert: the format it produces
     LimitSpec limits;                                    // Limit: LIMIT / OFFSET
+    // Aggregate: the GROUP BY key expressions and the aggregate calls, borrowed
+    // from the logical plan like every other expression payload. The output
+    // schema is [keys..., aggregates...], which the logical node already computed.
+    std::vector<const Expr*> group_keys;
+    std::vector<const Expr*> aggregates;
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}
 };
