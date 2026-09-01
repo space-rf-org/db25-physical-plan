@@ -10,6 +10,7 @@
 // Increment 0 admits four operators (scan / filter / project / one join). The
 // Cascades memo (memo.hpp) is where the many transient candidates live during
 // search; a PhysicalNode is the concrete plan the memo's winner extracts to.
+#include "db25/ast/node_types.hpp"    // ast::JoinType
 #include "db25/plan/expr_ir.hpp"       // complete db25::plan::Expr (borrowed payloads)
 #include "db25/plan/logical_plan.hpp"  // Schema, ColumnSchema
 
@@ -91,6 +92,26 @@ struct SortKey {
 struct PhysicalNode;
 using PhysicalNodePtr = std::unique_ptr<PhysicalNode>;
 
+// Render a join kind for the s-expr writer and for diagnostics. The physical IR
+// reuses the LOGICAL join kind rather than defining a parallel enum: a physical
+// join implements exactly the relational operator the logical join named, and a
+// second vocabulary would only create a mapping that can drift.
+[[nodiscard]] const char* join_kind_to_string(ast::JoinType k) noexcept;
+
+// Whether a join kind null-extends unmatched rows of an input. A physical join
+// that does not record its kind is indistinguishable from an inner join, which
+// is why `PhysicalNode::join_kind` exists.
+[[nodiscard]] bool join_null_extends_left(ast::JoinType k) noexcept;
+[[nodiscard]] bool join_null_extends_right(ast::JoinType k) noexcept;
+
+// Whether the right input is CORRELATED with the left - a LATERAL derived table,
+// whose subtree may reference the left row through an OuterRef. Such a right
+// input cannot be evaluated independently of the left, so the only admissible
+// implementation is a nested-loop join that re-evaluates it per left row. A hash
+// or merge join would build or scan the right side once, standalone, which for a
+// correlated right input is not merely slower - it is not executable.
+[[nodiscard]] bool join_is_lateral(ast::JoinType k) noexcept;
+
 // One equi-join key pair for a HashJoin: positional column indices into the left
 // and right input schemas respectively.
 struct HashKey {
@@ -122,6 +143,13 @@ struct PhysicalNode {
     std::vector<const Expr*> residual;
     std::vector<const Expr*> projections;  // Project: one borrowed expr per output column
     std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin: equi-join key pairs
+    // Join: WHICH relational join this physical operator implements. Without it a
+    // physical LEFT JOIN and a physical INNER JOIN are the same node - the plan
+    // says "HashJoin" and nothing more, and an executor reading it has no way to
+    // know it must null-extend unmatched left rows. The nullability flags in
+    // `output` are inherited from the logical schema and describe the RESULT, not
+    // the operator's obligation, so they cannot stand in for this.
+    ast::JoinType join_kind = ast::JoinType::Inner;
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
     Freshness scan_freshness = Freshness::Fresh;         // SeqScan: does this copy lag?

@@ -25,6 +25,33 @@ std::optional<PhysicalOp> physical_op_from_name(const std::string& name) noexcep
     return std::nullopt;
 }
 
+const char* join_kind_to_string(ast::JoinType k) noexcept {
+    switch (k) {
+        case ast::JoinType::Inner:       return "inner";
+        case ast::JoinType::Left:        return "left";
+        case ast::JoinType::Right:       return "right";
+        case ast::JoinType::Full:        return "full";
+        case ast::JoinType::Cross:       return "cross";
+        case ast::JoinType::Lateral:     return "lateral";
+        case ast::JoinType::LeftLateral: return "leftlateral";
+    }
+    return "?";
+}
+
+bool join_null_extends_left(ast::JoinType k) noexcept {
+    // The LEFT input is null-extended when unmatched RIGHT rows must be kept.
+    return k == ast::JoinType::Right || k == ast::JoinType::Full;
+}
+
+bool join_null_extends_right(ast::JoinType k) noexcept {
+    return k == ast::JoinType::Left || k == ast::JoinType::Full ||
+           k == ast::JoinType::LeftLateral;
+}
+
+bool join_is_lateral(ast::JoinType k) noexcept {
+    return k == ast::JoinType::Lateral || k == ast::JoinType::LeftLateral;
+}
+
 const char* freshness_to_string(Freshness f) noexcept {
     switch (f) {
         case Freshness::Any:   return "any";

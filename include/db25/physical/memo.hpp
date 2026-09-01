@@ -91,6 +91,10 @@ struct Group {
     std::vector<const Expr*> residual;     // Join: non-key conjuncts to re-check
     std::vector<const Expr*> projections;  // Project
     std::vector<HashKey> hash_keys;        // equi-join keys
+    // Join: the relational join being implemented. Part of the GROUP payload, not
+    // of a candidate: every group-expression in a group implements the SAME
+    // logical operator, and an inner join is not equivalent to a left join.
+    ast::JoinType join_kind = ast::JoinType::Inner;
 
     // BORROWED, on the same contract as every expression payload in this planner:
     // the logical plan outlives the physical plan. Copying it here meant one full
@@ -186,6 +190,11 @@ struct GroupKey {
     std::vector<const Expr*> residual;
     std::vector<const Expr*> projections;
     std::vector<HashKey> hash_keys;
+    // Part of the key. Two joins over the same inputs with the same keys and the
+    // same predicate are NOT the same group if one is inner and the other left:
+    // deduplicating them would let one query's join silently reuse another's
+    // winner. `logical_op` cannot cover this - both are LogicalOp::Join.
+    ast::JoinType join_kind = ast::JoinType::Inner;
     bool comparable = false;
     std::uint64_t hash = 0;
 

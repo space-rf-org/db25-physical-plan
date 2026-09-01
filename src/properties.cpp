@@ -108,7 +108,23 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
     return PhysicalProperties{};
 }
 
-bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys) {
+bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinType join_kind) {
+    // A LATERAL join's right input is CORRELATED: its subtree reads the current
+    // left row through an OuterRef, so it has no meaning evaluated on its own.
+    // Only a nested-loop join re-evaluates the right input per left row; a hash
+    // join builds its table from the right input once, standalone, and a merge
+    // join scans it once in sorted order. Neither is executable here.
+    //
+    // This is not a cost question, so it cannot be left to the cost model: the
+    // hash join is CHEAPER, and would win. It has to be ruled out on
+    // applicability, exactly like the keyless MergeJoin below it.
+    //
+    // The bug this closes was silent and shape-dependent. `LEFT JOIN LATERAL (..)
+    // ON true` has no equi-key, so it fell to NestedLoopJoin anyway and looked
+    // correct; add an equi-condition to the ON clause and the same query lowered
+    // to a HashJoin over a correlated right input, with lower() reporting ok.
+    if (join_is_lateral(join_kind) && op != PhysicalOp::NestedLoopJoin) return false;
+
     // Both keyed joins need at least one equi-key: a merge join has nothing to
     // merge on without one, and a hash join has nothing to hash on. Note this
     // cannot be left to costing - with no keys a merge join also requires no

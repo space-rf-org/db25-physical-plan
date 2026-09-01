@@ -100,6 +100,14 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
         case PhysicalOp::HashJoin:
         case PhysicalOp::MergeJoin:
         case PhysicalOp::NestedLoopJoin: {
+            // The join kind comes FIRST, and is always printed - including for an
+            // inner join. A physical join that does not say which relational join
+            // it implements is ambiguous to any reader, and a field that is only
+            // printed when it differs from a default trains readers to assume the
+            // default is what silence means. Silence is what let INNER and LEFT
+            // render byte-identical goldens.
+            out += " kind=";
+            out += join_kind_to_string(n.join_kind);
             out += " keys=[";
             for (std::size_t i = 0; i < n.hash_keys.size(); ++i) {
                 if (i != 0) out += " ";

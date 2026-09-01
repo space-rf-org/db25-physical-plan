@@ -31,12 +31,14 @@ void GroupKey::finish() noexcept {
     for (const Expr* e : residual) h = mix64(h, expr_structural_hash(e));
     for (const Expr* e : projections) h = mix64(h, expr_structural_hash(e));
     for (const HashKey& k : hash_keys) { h = mix64(h, k.left_index); h = mix64(h, k.right_index); }
+    h = mix64(h, static_cast<std::uint64_t>(join_kind));
     hash = h;
 }
 
 bool GroupKey::equals(const GroupKey& o) const noexcept {
     if (!comparable || !o.comparable) return false;  // never share an unknown payload
     if (logical_op != o.logical_op) return false;
+    if (join_kind != o.join_kind) return false;
     const std::string empty;
     if ((table_name ? *table_name : empty) != (o.table_name ? *o.table_name : empty)) return false;
     if (inputs != o.inputs) return false;
@@ -186,6 +188,7 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     node->residual = g.residual;
     node->projections = g.projections;
     node->hash_keys = g.hash_keys;
+    node->join_kind = g.join_kind;
 
     // Recurse on the SAME goals the winner was costed against, not on each
     // child's unconstrained winner: a child optimized for "sorted on k" is a
