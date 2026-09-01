@@ -141,6 +141,9 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             for (const auto& e : n.exprs) payload.projections.push_back(e.get());
             break;
         case plan::LogicalOp::Join: {
+            // WHICH join this is. Everything below chooses an ALGORITHM; this
+            // records the relational operator that algorithm has to implement.
+            payload.join_kind = n.join_type;
             const std::uint32_t left_width =
                 n.child(0) != nullptr ? static_cast<std::uint32_t>(n.child(0)->output.size()) : 0;
             // Keys and residual are independent outputs: a join may have both
@@ -174,6 +177,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.residual = payload.residual;
         key.projections = payload.projections;
         key.hash_keys = payload.hash_keys;
+        key.join_kind = payload.join_kind;
         key.finish();
         if (const std::optional<GroupId> existing = memo.find_group(key)) {
             ++shared;
@@ -190,6 +194,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         grp.residual = std::move(payload.residual);
         grp.projections = std::move(payload.projections);
         grp.hash_keys = std::move(payload.hash_keys);
+        grp.join_kind = payload.join_kind;
     }
 
     // Cardinality belongs to the GROUP: the candidates are equivalent, so any of
@@ -223,13 +228,14 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     }
 
     const std::vector<HashKey>& keys = memo.group(g).hash_keys;
+    const ast::JoinType payload_join_kind = memo.group(g).join_kind;
     // The candidate count is known before the loop, so the vector never has to
     // grow and re-move what it already holds.
     memo.group(g).exprs.reserve(cands.size() * scan_formats.size());
     for (const PhysicalOp cand : cands) {
         // A candidate whose precondition does not hold is not a cheaper option, it
         // is not an option at all.
-        if (!is_applicable(cand, keys)) continue;
+        if (!is_applicable(cand, keys, payload_join_kind)) continue;
         for (const FormatAvailability& fa : scan_formats) {
             GroupExpr ge;
             ge.op = cand;

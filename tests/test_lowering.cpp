@@ -9,6 +9,7 @@
 #include "db25/physical/lowering.hpp"
 #include "db25/physical/sexpr.hpp"
 #include "db25/physical/spec.hpp"
+#include "db25/physical/memo.hpp"
 #include "db25/physical/properties.hpp"
 #include "db25/physical/storage_catalog.hpp"
 
@@ -90,7 +91,8 @@ static plan::Schema join_schema() {
 
 // Build the Increment-0 query as a logical plan. `join_pred` lets a test swap in
 // a non-equi predicate; nullptr keeps the equi-join a.id = b.id.
-static plan::LogicalNodePtr build_logical(plan::ExprPtr join_pred = nullptr) {
+static plan::LogicalNodePtr build_logical(plan::ExprPtr join_pred = nullptr,
+                                          db25::ast::JoinType kind = db25::ast::JoinType::Inner) {
     auto scan_a = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
     scan_a->table_name = "a";
     scan_a->output = a_schema();
@@ -100,7 +102,7 @@ static plan::LogicalNodePtr build_logical(plan::ExprPtr join_pred = nullptr) {
     scan_b->output = b_schema();
 
     auto join = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Join);
-    join->join_type = db25::ast::JoinType::Inner;
+    join->join_type = kind;
     join->output = join_schema();
     join->predicate = join_pred ? std::move(join_pred)
                                 : binop(BinaryOp::Equal, col(0, DataType::Integer),
@@ -133,7 +135,7 @@ static void test_lowers_the_increment0_query() {
     const std::string s = physical_to_sexpr(*r.plan);
     CHECK(contains(s, "(Project "));
     CHECK(contains(s, "(Filter "));
-    CHECK(contains(s, "(HashJoin keys=[(L#0 R#0)]"));  // a.id=b.id -> key pair
+    CHECK(contains(s, "(HashJoin kind=inner keys=[(L#0 R#0)]"));  // a.id=b.id -> key pair
     CHECK(contains(s, "(SeqScan table=a"));
     CHECK(contains(s, "(SeqScan table=b"));
     CHECK(contains(s, "exprs=[(col #1) (col #3)]"));
@@ -989,7 +991,7 @@ static void test_non_equi_join_is_a_nested_loop() {
     CHECK(r.ok);
     if (!r.plan) return;
     const std::string s = physical_to_sexpr(*r.plan);
-    CHECK(contains(s, "NestedLoopJoin keys=[]"));
+    CHECK(contains(s, "NestedLoopJoin kind=inner keys=[]"));
     CHECK(contains(s, "residual=[(> (col #1) (col #2))]"));
 }
 
@@ -1004,7 +1006,142 @@ static void test_nested_loop_never_wins_an_equi_join() {
     if (!r.plan) return;
     const std::string s = physical_to_sexpr(*r.plan);
     CHECK(!contains(s, "NestedLoopJoin"));  // considered, and correctly rejected
-    CHECK(contains(s, "HashJoin keys=[(L#0 R#0)]"));
+    CHECK(contains(s, "HashJoin kind=inner keys=[(L#0 R#0)]"));
+}
+
+// ---------------------------------------------------------------------------
+// The join kind must survive lowering.
+//
+// It did not. `lower()` switched on LogicalOp::Join and never read `join_type`,
+// so an INNER and a LEFT join over the same inputs with the same predicate came
+// out as BYTE-IDENTICAL physical plans - the same HashJoin node, the same keys,
+// the same rendering. The only trace of "LEFT" anywhere was a nullability flag
+// in the output schema, which the logical plan had already computed and which
+// describes the RESULT, not the operator's obligation. An executor handed that
+// plan has nothing to tell it to null-extend unmatched left rows.
+//
+// The failure mode is the dangerous one: `lower()` returned ok, the plan looked
+// entirely reasonable, and the goldens blessed it.
+static void test_join_kind_reaches_the_physical_plan() {
+    std::printf("test_join_kind_reaches_the_physical_plan\n");
+
+    auto render = [](db25::ast::JoinType kind) {
+        auto logical = build_logical(nullptr, kind);
+        const LoweringResult r = lower(*logical);
+        CHECK(r.ok);
+        return r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    };
+
+    const std::string inner = render(db25::ast::JoinType::Inner);
+    const std::string left  = render(db25::ast::JoinType::Left);
+    const std::string right = render(db25::ast::JoinType::Right);
+    const std::string full  = render(db25::ast::JoinType::Full);
+
+    CHECK(contains(inner, "HashJoin kind=inner"));
+    CHECK(contains(left,  "HashJoin kind=left"));
+    CHECK(contains(right, "HashJoin kind=right"));
+    CHECK(contains(full,  "HashJoin kind=full"));
+
+    // The point of the test, stated as the thing that was false before: four
+    // different relational joins must not produce one plan.
+    CHECK(inner != left);
+    CHECK(left != right);
+    CHECK(right != full);
+
+    // The semantics an executor reads off the kind. These are the whole reason
+    // the field exists, so they are pinned rather than left to be re-derived.
+    using db25::ast::JoinType;
+    using db25::physical::join_is_lateral;
+    using db25::physical::join_null_extends_left;
+    using db25::physical::join_null_extends_right;
+    CHECK(!join_null_extends_left(JoinType::Inner));
+    CHECK(!join_null_extends_right(JoinType::Inner));
+    CHECK(join_null_extends_right(JoinType::Left));
+    CHECK(!join_null_extends_left(JoinType::Left));
+    CHECK(join_null_extends_left(JoinType::Right));
+    CHECK(!join_null_extends_right(JoinType::Right));
+    CHECK(join_null_extends_left(JoinType::Full));
+    CHECK(join_null_extends_right(JoinType::Full));
+    // A LEFT JOIN LATERAL null-extends its right side too - it is an outer join
+    // that also happens to be correlated, and losing either half is a bug.
+    CHECK(join_null_extends_right(JoinType::LeftLateral));
+    CHECK(join_is_lateral(JoinType::LeftLateral));
+    CHECK(join_is_lateral(JoinType::Lateral));
+    CHECK(!join_is_lateral(JoinType::Left));
+}
+
+// Two joins that differ ONLY in kind are not equivalent, so memo dedup must not
+// merge them. `logical_op` cannot separate them - both are LogicalOp::Join - so
+// without the kind in the group key, one query's LEFT join could be answered by
+// another's INNER join winner. This checks the key directly, because arranging
+// two differently-keyed joins over identical inputs inside one plan is exactly
+// the situation dedup exists to collapse.
+static void test_inner_and_left_are_not_the_same_group() {
+    std::printf("test_inner_and_left_are_not_the_same_group\n");
+    const db25::plan::Schema out = join_schema();
+    const std::string table = "a";
+    auto pred = binop(BinaryOp::Equal, col(0, DataType::Integer), col(2, DataType::Integer));
+
+    auto make = [&](db25::ast::JoinType kind) {
+        db25::physical::GroupKey k;
+        k.logical_op = static_cast<int>(plan::LogicalOp::Join);
+        k.table_name = nullptr;
+        k.output = &out;
+        k.predicate = nullptr;
+        k.hash_keys = {{0, 0}};
+        k.join_kind = kind;
+        k.finish();
+        return k;
+    };
+    const db25::physical::GroupKey inner = make(db25::ast::JoinType::Inner);
+    const db25::physical::GroupKey left  = make(db25::ast::JoinType::Left);
+    const db25::physical::GroupKey inner2 = make(db25::ast::JoinType::Inner);
+
+    CHECK(!inner.equals(left));       // the whole point
+    CHECK(inner.equals(inner2));      // and it still shares what it should
+    CHECK(inner.hash != left.hash);   // separated by the hash too, not only by equals
+}
+
+// A LATERAL join's right input is correlated: its subtree reads the current left
+// row through an OuterRef. Only a nested loop can evaluate that. A hash join
+// builds its table from the right input ONCE, standalone - which for a
+// correlated right input is not slower, it is not executable.
+//
+// The bug was shape-dependent, which is why it survived: `LEFT JOIN LATERAL (..)
+// ON true` yields no equi-key, so it fell to NestedLoopJoin anyway and the
+// golden looked right. Give the ON clause an equality and the identical query
+// lowered to a HashJoin over a correlated right input, with lower() ok. This
+// test therefore uses an equi predicate deliberately - without one it would pass
+// against the broken code and prove nothing.
+static void test_lateral_join_is_never_a_hash_join() {
+    std::printf("test_lateral_join_is_never_a_hash_join\n");
+    for (const db25::ast::JoinType kind :
+         {db25::ast::JoinType::Lateral, db25::ast::JoinType::LeftLateral}) {
+        auto logical = build_logical(nullptr, kind);  // predicate is a.id = b.id
+        const LoweringResult r = lower(*logical);
+        CHECK(r.ok);
+        if (!r.plan) continue;
+        const std::string s = physical_to_sexpr(*r.plan);
+        CHECK(contains(s, "NestedLoopJoin"));
+        CHECK(!contains(s, "HashJoin"));   // the equi-key must NOT buy a hash join
+        CHECK(!contains(s, "MergeJoin"));
+        // The keys are still recorded - the nested loop uses them as a per-row
+        // match condition. Dropping them would be a different bug.
+        CHECK(contains(s, "keys=[(L#0 R#0)]"));
+    }
+
+    // And directly on the predicate, so the guard is pinned independently of
+    // whatever the cost model happens to prefer today.
+    using db25::physical::PhysicalOp;
+    CHECK(!db25::physical::is_applicable(PhysicalOp::HashJoin, {{0, 0}},
+                                         db25::ast::JoinType::LeftLateral));
+    CHECK(!db25::physical::is_applicable(PhysicalOp::MergeJoin, {{0, 0}},
+                                         db25::ast::JoinType::Lateral));
+    CHECK(db25::physical::is_applicable(PhysicalOp::NestedLoopJoin, {{0, 0}},
+                                        db25::ast::JoinType::LeftLateral));
+    // A non-lateral join is untouched by the guard.
+    CHECK(db25::physical::is_applicable(PhysicalOp::HashJoin, {{0, 0}},
+                                        db25::ast::JoinType::Left));
 }
 
 int main() {
@@ -1033,6 +1170,9 @@ int main() {
     test_guard_changes_what_the_search_finds();
     test_guarded_search_is_deterministic();
     test_unsupported_operator_is_an_error();
+    test_join_kind_reaches_the_physical_plan();
+    test_inner_and_left_are_not_the_same_group();
+    test_lateral_join_is_never_a_hash_join();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

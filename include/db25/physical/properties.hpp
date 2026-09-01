@@ -52,7 +52,8 @@ struct PhysicalProperties {
 // merges two sorted streams ON THE JOIN KEYS, so with no keys there is nothing to
 // merge on and it is not a valid way to compute the (cross) product - regardless
 // of what it would cost. Every other operator is unconditionally applicable.
-[[nodiscard]] bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys);
+[[nodiscard]] bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys,
+                                 ast::JoinType join_kind = ast::JoinType::Inner);
 
 // The part of a consumer's requirement an operator can discharge by REQUIRING IT
 // OF ITS INPUT instead of having an enforcer placed above it - nullopt when it
