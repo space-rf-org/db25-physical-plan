@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -1144,6 +1145,233 @@ static void test_lateral_join_is_never_a_hash_join() {
                                         db25::ast::JoinType::Left));
 }
 
+// ---------------------------------------------------------------------------
+// Increment 3.1: ORDER BY and LIMIT lower.
+//
+// Before this, LogicalOp::Sort and LogicalOp::Limit had no implementation rule,
+// so any query with an ORDER BY or a LIMIT failed lowering outright - 18 of the
+// umbrella's 37 staged fixtures could not reach a physical plan at all, and the
+// reference query was one of them.
+static plan::LogicalNodePtr build_sort_limit(bool with_limit, bool descending = false,
+                                             bool nulls_specified = false,
+                                             bool nulls_first = false) {
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+
+    auto sort = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Sort);
+    sort->output = a_schema();
+    plan::SortKeyIR k;
+    k.expr = col(1, DataType::Integer);   // ORDER BY a.x
+    k.descending = descending;
+    k.nulls_order_explicit = nulls_specified;
+    k.nulls_first = nulls_first;
+    sort->sort_keys.push_back(std::move(k));
+    sort->add_child(std::move(scan));
+    if (!with_limit) return sort;
+
+    auto limit = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Limit);
+    limit->output = a_schema();
+    limit->has_limit = true;
+    limit->limit = 10;
+    limit->has_offset = true;
+    limit->offset = 5;
+    limit->add_child(std::move(sort));
+    return limit;
+}
+
+static void test_order_by_and_limit_lower() {
+    std::printf("test_order_by_and_limit_lower\n");
+    auto logical = build_sort_limit(/*with_limit=*/true);
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "(Limit limit=10 offset=5"));
+    CHECK(contains(s, "(Sort by=[#1 asc]"));
+    CHECK(contains(s, "(SeqScan table=a"));
+
+    // The Limit is ABOVE the Sort, matching the logical plan. Inverting them
+    // would keep a different set of rows entirely.
+    CHECK(s.find("Limit") < s.find("Sort"));
+
+    // Descending is carried, not flattened to the default.
+    auto desc = build_sort_limit(false, /*descending=*/true);
+    const LoweringResult rd = lower(*desc);
+    CHECK(rd.ok);
+    if (rd.plan) CHECK(contains(physical_to_sexpr(*rd.plan), "(Sort by=[#1 desc]"));
+}
+
+// NULLS FIRST / NULLS LAST changes which rows come out first, so a Sort that
+// dropped it would answer a different query - the same shape of defect as a join
+// that forgot it was an outer join. The rendering distinguishes all three states:
+// unspecified (nothing printed), explicit FIRST, explicit LAST.
+static void test_nulls_ordering_survives_lowering() {
+    std::printf("test_nulls_ordering_survives_lowering\n");
+    auto render = [](bool specified, bool first) {
+        auto l = build_sort_limit(false, false, specified, first);
+        const LoweringResult r = lower(*l);
+        CHECK(r.ok);
+        return r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    };
+    const std::string none  = render(false, false);
+    const std::string first = render(true, true);
+    const std::string last  = render(true, false);
+
+    CHECK(contains(none,  "by=[#1 asc]"));
+    CHECK(contains(first, "by=[#1 asc nulls-first]"));
+    CHECK(contains(last,  "by=[#1 asc nulls-last]"));
+    CHECK(none != first);
+    CHECK(first != last);
+    CHECK(none != last);
+
+    // And the satisfaction rule that makes the field meaningful: a requirement
+    // with no opinion about NULLs is met by any placement, while an explicit one
+    // is met only by itself. Ignoring the field would make all four of these
+    // true; requiring an exact match unconditionally would make all four false.
+    using db25::physical::PhysicalProperties;
+    const SortKey any_nulls{1, false, false, false};
+    const SortKey nulls_first_key{1, false, true, true};
+    const SortKey nulls_last_key{1, false, true, false};
+    const auto sat = [](SortKey provided, SortKey required) {
+        return satisfies(PhysicalProperties{{provided}, StorageFormat::Any, Freshness::Any},
+                         PhysicalProperties{{required}, StorageFormat::Any, Freshness::Any});
+    };
+    CHECK(sat(nulls_first_key, any_nulls));        // no opinion: satisfied
+    CHECK(sat(nulls_first_key, nulls_first_key));  // exact: satisfied
+    CHECK(!sat(nulls_first_key, nulls_last_key));  // opposite: NOT satisfied
+    CHECK(!sat(any_nulls, nulls_first_key));       // unknown cannot serve explicit
+}
+
+// A Sort must ADVERTISE the order it establishes, or the search cannot see that
+// an ORDER BY already satisfies a consumer's requirement and will stack a second
+// Sort on top of the first. derive_op is the single place that answers this, for
+// both the memo form and the tree form.
+static void test_a_lowered_sort_provides_its_order() {
+    std::printf("test_a_lowered_sort_provides_its_order\n");
+    auto logical = build_sort_limit(/*with_limit=*/false);
+    LoweringContext ctx;
+    ctx.required_output.sort = {SortKey{1, false, false, false}};  // the order it already has
+    const LoweringResult r = lower(*logical, ctx);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const std::string s = physical_to_sexpr(*r.plan);
+    // Exactly one Sort: the one the query asked for. A second would mean the
+    // search could not tell that the first had already established the order.
+    std::size_t sorts = 0;
+    for (std::size_t i = s.find("(Sort "); i != std::string::npos; i = s.find("(Sort ", i + 1)) {
+        ++sorts;
+    }
+    CHECK(sorts == 1);
+    CHECK(satisfies(derive(*r.plan), ctx.required_output));
+}
+
+// A Limit is ORDER-SENSITIVE: which rows survive depends on the order its input
+// arrives in. So the planner must not discharge a consumer's order requirement by
+// pushing it INTO the Limit's input - that changes the result set, not just the
+// plan. Sort_x(Limit_10(c)) takes ten rows in c's own order then sorts those ten;
+// Limit_10(Sort_x(c)) takes the ten smallest by x. Different answers.
+static void test_limit_never_pushes_an_order_requirement_down() {
+    std::printf("test_limit_never_pushes_an_order_requirement_down\n");
+    using db25::physical::PhysicalOp;
+    PhysicalProperties want;
+    want.sort = {SortKey{0, false, false, false}};
+    CHECK(!pushdown_requirement(PhysicalOp::Limit, want).has_value());
+    // The order-preserving pipeline operators still do push down - the guard is
+    // specific to Limit, not a blanket refusal that would cost every plan.
+    CHECK(pushdown_requirement(PhysicalOp::Filter, want).has_value());
+    CHECK(pushdown_requirement(PhysicalOp::Project, want).has_value());
+}
+
+// A Limit's OUTPUT cardinality is not its input's. Estimating it as the input's
+// would over-count every operator above it and skew their cost comparisons.
+static void test_limit_bounds_the_row_estimate() {
+    std::printf("test_limit_bounds_the_row_estimate\n");
+    const db25::physical::LimitSpec l10{true, false, 10, 0};
+    const db25::physical::LimitSpec off5{false, true, -1, 5};
+    const db25::physical::LimitSpec both{true, true, 10, 5};
+    CHECK(l10.rows_out(1000.0) == 10.0);
+    CHECK(l10.rows_out(3.0) == 3.0);           // a limit is a cap, not a promise
+    CHECK(off5.rows_out(1000.0) == 995.0);
+    CHECK(off5.rows_out(2.0) == 0.0);          // an offset past the end leaves none
+    // OFFSET applies FIRST, then LIMIT caps the remainder. The other order would
+    // report 10 here rather than the correct 10 (of the 995 that remain) - and
+    // would report 5 for an input of 12.
+    CHECK(both.rows_out(1000.0) == 10.0);
+    CHECK(both.rows_out(12.0) == 7.0);
+
+    // And that the cost model actually CONSULTS it. Testing rows_out alone left
+    // the wiring untested: replacing operator_rows' Limit case with `return
+    // in(0)` - the exact over-estimate this exists to prevent - kept every
+    // assertion above green.
+    const db25::physical::CardinalityModel card;
+    const double in_rows[1] = {1000.0};
+    CHECK(operator_rows(db25::physical::PhysicalOp::Limit,
+                        std::span<const double>{in_rows, 1}, "", card, both) == 10.0);
+    CHECK(operator_rows(db25::physical::PhysicalOp::Limit,
+                        std::span<const double>{in_rows, 1}, "", card, {}) == 1000.0);
+
+    // End to end, through a real lowered plan: the estimate at the root of
+    // `ORDER BY x LIMIT 10 OFFSET 5` is bounded by the limit, whatever the base
+    // table's cardinality is.
+    auto logical = build_sort_limit(/*with_limit=*/true);
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (r.plan) CHECK(card.rows(*r.plan) == 10.0);
+}
+
+// A sort key must be a positional column index, so a key that is not a plain
+// column reference has no index to be. Inventing one would sort by whatever
+// column that index happened to name - a wrong answer reported as success. Fail
+// honestly instead, with an error that says why.
+static void test_a_computed_sort_key_fails_honestly() {
+    std::printf("test_a_computed_sort_key_fails_honestly\n");
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+    auto sort = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Sort);
+    sort->output = a_schema();
+    plan::SortKeyIR k;
+    k.expr = binop(BinaryOp::Add, col(0, DataType::Integer), col(1, DataType::Integer));
+    sort->sort_keys.push_back(std::move(k));
+    sort->add_child(std::move(scan));
+
+    const LoweringResult r = lower(*sort);
+    CHECK(!r.ok);
+    CHECK(r.plan == nullptr);
+    CHECK(contains(r.error, "sort key"));
+}
+
+// Two Sorts differing only in their keys, or two Limits differing only in their
+// bounds, are different operators sharing one LogicalOp - so memo dedup must not
+// merge them, exactly as for the join kind.
+static void test_sorts_and_limits_are_not_interchangeable_groups() {
+    std::printf("test_sorts_and_limits_are_not_interchangeable_groups\n");
+    const db25::plan::Schema out = a_schema();
+    auto make_sort = [&](std::uint32_t column, bool descending) {
+        db25::physical::GroupKey k;
+        k.logical_op = static_cast<int>(plan::LogicalOp::Sort);
+        k.output = &out;
+        k.sort_keys = {SortKey{column, descending, false, false}};
+        k.finish();
+        return k;
+    };
+    CHECK(!make_sort(0, false).equals(make_sort(1, false)));  // different column
+    CHECK(!make_sort(0, false).equals(make_sort(0, true)));   // different direction
+    CHECK(make_sort(0, false).equals(make_sort(0, false)));   // and still shares
+
+    auto make_limit = [&](std::int64_t n) {
+        db25::physical::GroupKey k;
+        k.logical_op = static_cast<int>(plan::LogicalOp::Limit);
+        k.output = &out;
+        k.limits = db25::physical::LimitSpec{true, false, n, 0};
+        k.finish();
+        return k;
+    };
+    CHECK(!make_limit(10).equals(make_limit(20)));
+    CHECK(make_limit(10).equals(make_limit(10)));
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -1173,6 +1401,13 @@ int main() {
     test_join_kind_reaches_the_physical_plan();
     test_inner_and_left_are_not_the_same_group();
     test_lateral_join_is_never_a_hash_join();
+    test_order_by_and_limit_lower();
+    test_nulls_ordering_survives_lowering();
+    test_a_lowered_sort_provides_its_order();
+    test_limit_never_pushes_an_order_requirement_down();
+    test_limit_bounds_the_row_estimate();
+    test_a_computed_sort_key_fails_honestly();
+    test_sorts_and_limits_are_not_interchangeable_groups();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

@@ -29,8 +29,16 @@
     ; implementation of a cross product or a purely non-equi join - and its cost
     ; is quadratic in the inputs, so it never wins where a keyed join applies.
     (operator (name NestedLoopJoin) (arity 2) (kind pipeline-breaker))
-    ; Enforcers: inserted to establish a required physical property.
+    ; Limit passes at most `limit` rows through after discarding `offset` of
+    ; them. Order-SENSITIVE: which rows survive depends entirely on the order its
+    ; input arrives in, which is why the planner may not push an order
+    ; requirement through it.
+    (operator (name Limit)         (arity 1) (kind pipeline))
+    ; Sort is BOTH the implementation of a logical Sort (ORDER BY) and the
+    ; enforcer inserted to establish a required order - one operator, because they
+    ; are one operation; only who asked for it differs.
     (operator (name Sort)          (arity 1) (kind pipeline-breaker))
+    ; A pure enforcer: inserted to establish a required storage format.
     (operator (name FormatConvert) (arity 1) (kind pipeline)))
 
   ; Implementation rules: the physical operator each logical operator lowers to.
@@ -47,7 +55,14 @@
     (rule (logical Join)    (physical MergeJoin))
     ; The keyless fallback. Applicability (not cost) is what selects it: the two
     ; keyed joins are not applicable without an equi-key.
-    (rule (logical Join)    (physical NestedLoopJoin)))
+    (rule (logical Join)    (physical NestedLoopJoin))
+    ; Single-candidate for now. A TopN that fuses a Limit over a Sort is the
+    ; obvious second candidate and is deliberately absent: it fuses TWO logical
+    ; nodes into one physical operator, which needs a transformation rule, and the
+    ; memo is still one group per logical node. Adding TopN as an implementation
+    ; rule for either node alone would be wrong.
+    (rule (logical Sort)    (physical Sort))
+    (rule (logical Limit)   (physical Limit)))
 
   ; Where exhaustive search stops being affordable (design D5). Past this many
   ; joins the planner falls back to a bounded enumeration - a worse plan chosen by
@@ -66,4 +81,4 @@
   (capability-profile
     (name reference)
     (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
-              Sort FormatConvert)))
+              Sort FormatConvert Limit)))

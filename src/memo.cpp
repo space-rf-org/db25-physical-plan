@@ -32,6 +32,16 @@ void GroupKey::finish() noexcept {
     for (const Expr* e : projections) h = mix64(h, expr_structural_hash(e));
     for (const HashKey& k : hash_keys) { h = mix64(h, k.left_index); h = mix64(h, k.right_index); }
     h = mix64(h, static_cast<std::uint64_t>(join_kind));
+    for (const SortKey& k : sort_keys) {
+        h = mix64(h, k.column);
+        h = mix64(h, static_cast<std::uint64_t>(k.descending));
+        h = mix64(h, static_cast<std::uint64_t>(k.nulls_specified));
+        h = mix64(h, static_cast<std::uint64_t>(k.nulls_first));
+    }
+    h = mix64(h, static_cast<std::uint64_t>(limits.has_limit));
+    h = mix64(h, static_cast<std::uint64_t>(limits.limit));
+    h = mix64(h, static_cast<std::uint64_t>(limits.has_offset));
+    h = mix64(h, static_cast<std::uint64_t>(limits.offset));
     hash = h;
 }
 
@@ -39,6 +49,16 @@ bool GroupKey::equals(const GroupKey& o) const noexcept {
     if (!comparable || !o.comparable) return false;  // never share an unknown payload
     if (logical_op != o.logical_op) return false;
     if (join_kind != o.join_kind) return false;
+    if (sort_keys.size() != o.sort_keys.size()) return false;
+    for (std::size_t i = 0; i < sort_keys.size(); ++i) {
+        if (!(sort_keys[i] == o.sort_keys[i])) return false;
+    }
+    if (limits.has_limit != o.limits.has_limit ||
+        limits.has_offset != o.limits.has_offset ||
+        (limits.has_limit && limits.limit != o.limits.limit) ||
+        (limits.has_offset && limits.offset != o.limits.offset)) {
+        return false;
+    }
     const std::string empty;
     if ((table_name ? *table_name : empty) != (o.table_name ? *o.table_name : empty)) return false;
     if (inputs != o.inputs) return false;
@@ -189,6 +209,8 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     node->projections = g.projections;
     node->hash_keys = g.hash_keys;
     node->join_kind = g.join_kind;
+    node->sort_keys = g.sort_keys;
+    node->limits = g.limits;
 
     // Recurse on the SAME goals the winner was costed against, not on each
     // child's unconstrained winner: a child optimized for "sorted on k" is a

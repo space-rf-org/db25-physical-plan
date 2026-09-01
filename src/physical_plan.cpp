@@ -14,6 +14,7 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::NestedLoopJoin: return "NestedLoopJoin";
         case PhysicalOp::Sort:          return "Sort";
         case PhysicalOp::FormatConvert: return "FormatConvert";
+        case PhysicalOp::Limit:         return "Limit";
     }
     return "?";
 }
@@ -80,6 +81,7 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::NestedLoopJoin: return 2;
         case PhysicalOp::Sort:          return 1;
         case PhysicalOp::FormatConvert: return 1;
+        case PhysicalOp::Limit:         return 1;
     }
     return 0;
 }
@@ -147,6 +149,14 @@ PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::Sort);
     n->sort_keys = std::move(keys);
     n->output = input->output;  // a sort reorders rows, it does not reshape them
+    n->children.push_back(std::move(input));
+    return n;
+}
+
+PhysicalNodePtr make_limit(PhysicalNodePtr input, LimitSpec limits) {
+    auto n = std::make_unique<PhysicalNode>(PhysicalOp::Limit);
+    n->limits = limits;
+    n->output = input->output;  // a limit drops rows, it does not reshape them
     n->children.push_back(std::move(input));
     return n;
 }

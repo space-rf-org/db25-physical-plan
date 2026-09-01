@@ -7,34 +7,52 @@
 namespace db25::physical {
 namespace {
 
-bool same_key(const SortKey& a, const SortKey& b) {
-    return a.column == b.column && a.descending == b.descending;
+// Exact identity of two keys, every field. This is what memoization needs: a
+// requirement is the KEY a group's winners are stored under, so two requirements
+// that are not the same thing must not compare equal or one would silently
+// answer for the other.
+bool identical_key(const SortKey& a, const SortKey& b) {
+    return a.column == b.column && a.descending == b.descending &&
+           a.nulls_specified == b.nulls_specified &&
+           (!a.nulls_specified || a.nulls_first == b.nulls_first);
+}
+
+// Does a provided key SATISFY a required one? Asymmetric, like Freshness::Any
+// and StorageFormat::Any: a requirement that did not specify where NULLs go is
+// satisfied by any placement, while one that did needs exactly that placement.
+//
+// Getting this wrong in either direction is a real bug. Ignoring the nulls
+// ordering entirely (as this did while SortKey had no such field) lets a stream
+// sorted NULLS FIRST answer a query that asked for NULLS LAST. Requiring an
+// exact match unconditionally makes every enforcer-created key - which has no
+// opinion - fail to be satisfied by a scan that happens to have one.
+bool satisfies_key(const SortKey& provided, const SortKey& required) {
+    if (provided.column != required.column) return false;
+    if (provided.descending != required.descending) return false;
+    if (!required.nulls_specified) return true;
+    return provided.nulls_specified && provided.nulls_first == required.nulls_first;
 }
 
 // Is `required` a prefix of `provided`? (provided sorted at least as specifically)
 bool sort_prefix(const std::vector<SortKey>& provided, const std::vector<SortKey>& required) {
     if (required.size() > provided.size()) return false;
     for (std::size_t i = 0; i < required.size(); ++i) {
-        if (!same_key(provided[i], required[i])) return false;
+        if (!satisfies_key(provided[i], required[i])) return false;
     }
     return true;
-}
-
-const PhysicalNode* child0(const PhysicalNode& n) {
-    return n.children.empty() ? nullptr : n.children[0].get();
 }
 
 }  // namespace
 
 bool operator==(const SortKey& a, const SortKey& b) noexcept {
-    return same_key(a, b);
+    return identical_key(a, b);
 }
 
 bool operator==(const PhysicalProperties& a, const PhysicalProperties& b) noexcept {
     if (a.format != b.format || a.freshness != b.freshness) return false;
     if (a.sort.size() != b.sort.size()) return false;
     for (std::size_t i = 0; i < a.sort.size(); ++i) {
-        if (!same_key(a.sort[i], b.sort[i])) return false;
+        if (!identical_key(a.sort[i], b.sort[i])) return false;
     }
     return true;
 }
@@ -54,7 +72,7 @@ bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& req
 PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
                              StorageFormat scan_format,
                              std::span<const PhysicalProperties> input_props,
-                             Freshness scan_freshness) {
+                             Freshness scan_freshness, std::span<const SortKey> sort_keys) {
     const auto in = [&](std::size_t i) {
         return i < input_props.size() ? input_props[i] : PhysicalProperties{};
     };
@@ -98,12 +116,19 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             return p;
         }
         case PhysicalOp::Sort:
-            // Establishes its order (filled in by the caller from sort_keys);
-            // preserves the child's format.
-            return PhysicalProperties{{}, in(0).format, in(0).freshness};
+            // Establishes ITS order - the whole point of the operator - and
+            // preserves the child's format and freshness.
+            return PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, in(0).format,
+                                      in(0).freshness};
         case PhysicalOp::FormatConvert:
             // Changes the format to its target (filled in by the caller); preserves order.
             return PhysicalProperties{in(0).sort, StorageFormat::Any, in(0).freshness};
+        case PhysicalOp::Limit:
+            // Takes a contiguous window of its input's rows, so everything about
+            // them is preserved: still in the same order, same format, same
+            // freshness. What it does NOT preserve is WHICH rows - see
+            // pushdown_requirement.
+            return in(0);
     }
     return PhysicalProperties{};
 }
@@ -151,6 +176,17 @@ std::optional<PhysicalProperties> pushdown_requirement(PhysicalOp op,
     // the better half. Pushing a Sort BELOW a Filter sorts rows the Filter is
     // about to discard, so the search costs both routes and takes the cheaper -
     // it does not assume that earlier is better.
+    //
+    // A Limit is deliberately NOT in this list even though derive_op says it
+    // preserves order. Pushing an order requirement INTO a Limit's input changes
+    // which rows the Limit keeps: `Sort_x(Limit_10(child))` takes ten rows in the
+    // child's own order and then sorts those ten, while `Limit_10(Sort_x(child))`
+    // takes the ten smallest by x. Those are different result SETS, not two
+    // spellings of one plan. The order a Limit's input arrives in is fixed by
+    // whatever the logical plan put underneath it, and the search is not free to
+    // change it. Enforcing above the Limit is always correct; not pushing down is
+    // at worst a missed optimization, and there is no version of this that trades
+    // correctness for one.
     switch (op) {
         case PhysicalOp::Filter:
         case PhysicalOp::Project:
@@ -197,10 +233,10 @@ PhysicalProperties derive(const PhysicalNode& node) {
     input_props.reserve(node.children.size());
     for (const auto& c : node.children) input_props.push_back(derive(*c));
 
-    PhysicalProperties p =
-        derive_op(node.op, node.hash_keys, node.scan_format, input_props, node.scan_freshness);
-    // The two enforcers carry their established property in their own payload.
-    if (node.op == PhysicalOp::Sort) p.sort = node.sort_keys;
+    PhysicalProperties p = derive_op(node.op, node.hash_keys, node.scan_format, input_props,
+                                    node.scan_freshness, node.sort_keys);
+    // FormatConvert alone still carries its established property post-hoc; see the
+    // note on derive_op. It is never a memo group, so nothing else has to agree.
     if (node.op == PhysicalOp::FormatConvert) p.format = node.target_format;
     return p;
 }
