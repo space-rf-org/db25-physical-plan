@@ -22,8 +22,10 @@ void GroupKey::finish() noexcept {
     for (const Expr* e : projections) comparable = comparable && expr_is_comparable(e);
 
     std::uint64_t h = mix64(13, static_cast<std::uint64_t>(logical_op));
-    for (const char c : table_name) h = mix64(h, static_cast<unsigned char>(c));
-    h = mix64(h, schema_hash(output));
+    if (table_name != nullptr) {
+        for (const char c : *table_name) h = mix64(h, static_cast<unsigned char>(c));
+    }
+    if (output != nullptr) h = mix64(h, schema_hash(*output));
     for (const GroupId g : inputs) h = mix64(h, g);
     h = mix64(h, expr_structural_hash(predicate));
     for (const Expr* e : residual) h = mix64(h, expr_structural_hash(e));
@@ -34,7 +36,9 @@ void GroupKey::finish() noexcept {
 
 bool GroupKey::equals(const GroupKey& o) const noexcept {
     if (!comparable || !o.comparable) return false;  // never share an unknown payload
-    if (logical_op != o.logical_op || table_name != o.table_name) return false;
+    if (logical_op != o.logical_op) return false;
+    const std::string empty;
+    if ((table_name ? *table_name : empty) != (o.table_name ? *o.table_name : empty)) return false;
     if (inputs != o.inputs) return false;
     if (hash_keys.size() != o.hash_keys.size()) return false;
     for (std::size_t i = 0; i < hash_keys.size(); ++i) {
@@ -43,7 +47,8 @@ bool GroupKey::equals(const GroupKey& o) const noexcept {
             return false;
         }
     }
-    if (!schema_equal(output, o.output)) return false;
+    if ((output == nullptr) != (o.output == nullptr)) return false;
+    if (output != nullptr && !schema_equal(*output, *o.output)) return false;
     if (!expr_structurally_equal(predicate, o.predicate)) return false;
     if (residual.size() != o.residual.size()) return false;
     for (std::size_t i = 0; i < residual.size(); ++i) {

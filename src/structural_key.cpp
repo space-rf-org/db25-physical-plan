@@ -144,14 +144,17 @@ bool schema_equal(const plan::Schema& a, const plan::Schema& b) noexcept {
 
 std::uint64_t schema_hash(const plan::Schema& s) noexcept {
     std::uint64_t h = mix(11, s.size());
+    // Only cheap discriminators are hashed. Names and aliases are strings, and
+    // hashing one per column per group measured as a real cost; they remain part
+    // of schema_equal, which is what actually decides identity. A hash that
+    // discriminates less merely buckets more coarsely - it can never merge two
+    // schemas, because every apparent match is verified.
     for (const plan::ColumnSchema& c : s) {
-        h = mix(h, hash_str(c.name));
         h = mix(h, static_cast<std::uint64_t>(c.type));
         h = mix(h, c.nullable ? 1u : 0u);
         h = mix(h, c.table_id);
         h = mix(h, c.column_id);
-        h = mix(h, hash_str(c.alias));
-        h = mix(h, c.hidden ? 1u : 0u);
+        h = mix(h, (c.hidden ? 2u : 0u) + (c.alias.empty() ? 1u : 0u));
     }
     return h;
 }

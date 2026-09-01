@@ -157,8 +157,13 @@ struct Group {
 // comparison does not exhaustively cover - such a group is never shared.
 struct GroupKey {
     int logical_op = -1;
-    std::string table_name;
-    Schema output;
+    // BORROWED from the logical node, like every expression payload in this
+    // planner: the logical plan already has to outlive the physical plan. Copying
+    // the schema here instead cost two full vector-of-ColumnSchema copies per
+    // group (each column carries two std::strings) - one for the key and one for
+    // the index's stored copy - and measured as more than half of unit 2.4's cost.
+    const std::string* table_name = nullptr;
+    const Schema* output = nullptr;
     std::vector<GroupId> inputs;
     const Expr* predicate = nullptr;
     std::vector<const Expr*> residual;

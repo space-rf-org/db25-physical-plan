@@ -152,8 +152,12 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     // canonical - which is what makes a shallow key sufficient.
     GroupKey key;
     key.logical_op = static_cast<int>(n.op);
-    key.table_name = base.table_name;
-    key.output = n.output;
+    // Borrowed from the LOGICAL NODE, not from the local GroupExpr: the index
+    // outlives this call, and pointing at a local was a stack-use-after-return
+    // (ASan caught it on the first run). Only a Scan carries a table name, which
+    // is exactly when base.table_name was set.
+    key.table_name = n.op == plan::LogicalOp::Scan ? &n.table_name : nullptr;
+    key.output = &n.output;
     key.inputs = inputs;
     key.predicate = base.predicate;
     key.residual = base.residual;
