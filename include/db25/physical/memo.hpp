@@ -95,6 +95,8 @@ struct Group {
     // of a candidate: every group-expression in a group implements the SAME
     // logical operator, and an inner join is not equivalent to a left join.
     ast::JoinType join_kind = ast::JoinType::Inner;
+    std::vector<SortKey> sort_keys;        // Sort: the order it establishes
+    LimitSpec limits;                      // Limit: LIMIT / OFFSET
 
     // BORROWED, on the same contract as every expression payload in this planner:
     // the logical plan outlives the physical plan. Copying it here meant one full
@@ -195,6 +197,11 @@ struct GroupKey {
     // deduplicating them would let one query's join silently reuse another's
     // winner. `logical_op` cannot cover this - both are LogicalOp::Join.
     ast::JoinType join_kind = ast::JoinType::Inner;
+    // Both are part of the key for the same reason the join kind is: two Sorts
+    // differing only in their keys, or two Limits differing only in their bounds,
+    // are different operators sharing one LogicalOp.
+    std::vector<SortKey> sort_keys;
+    LimitSpec limits;
     bool comparable = false;
     std::uint64_t hash = 0;
 

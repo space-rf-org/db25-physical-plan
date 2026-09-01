@@ -30,6 +30,8 @@ const char* logical_op_name(plan::LogicalOp op) {
         case plan::LogicalOp::Filter:  return "Filter";
         case plan::LogicalOp::Project: return "Project";
         case plan::LogicalOp::Join:    return "Join";
+        case plan::LogicalOp::Sort:    return "Sort";
+        case plan::LogicalOp::Limit:   return "Limit";
         default:                       return nullptr;
     }
 }
@@ -44,11 +46,15 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
     static constexpr PhysicalOp kFilter[]{PhysicalOp::Filter};
     static constexpr PhysicalOp kProject[]{PhysicalOp::Project};
     static constexpr PhysicalOp kJoin[]{PhysicalOp::HashJoin, PhysicalOp::NestedLoopJoin};
+    static constexpr PhysicalOp kSort[]{PhysicalOp::Sort};
+    static constexpr PhysicalOp kLimit[]{PhysicalOp::Limit};
     switch (op) {
         case plan::LogicalOp::Scan:    return kScan;
         case plan::LogicalOp::Filter:  return kFilter;
         case plan::LogicalOp::Project: return kProject;
         case plan::LogicalOp::Join:    return kJoin;
+        case plan::LogicalOp::Sort:    return kSort;
+        case plan::LogicalOp::Limit:   return kLimit;
         default:                       return {};
     }
 }
@@ -152,6 +158,37 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                                  payload.residual);
             break;
         }
+        case plan::LogicalOp::Sort:
+            // ORDER BY. A key is a positional column index, so a key expression
+            // that is not a plain column reference has no index to be - and
+            // inventing one would sort by the wrong column. Fail honestly instead;
+            // `ORDER BY a + b` needs the sort to carry an expression, which is a
+            // change to the property system, not a line here.
+            payload.sort_keys.reserve(n.sort_keys.size());
+            for (const plan::SortKeyIR& k : n.sort_keys) {
+                if (k.expr == nullptr || k.expr->kind != plan::ExprKind::ColumnRef) {
+                    error = "unsupported sort key expression in lowering "
+                            "(only a plain column reference is a positional sort key)";
+                    return kInvalidGroup;
+                }
+                SortKey sk;
+                sk.column = k.expr->input_index;
+                sk.descending = k.descending;
+                // NULLS FIRST / NULLS LAST changes the result, so it is carried,
+                // not dropped. `nulls_specified` records whether the QUERY had an
+                // opinion, which is what separates an explicit request from the
+                // engine default and from an enforcer's indifference.
+                sk.nulls_specified = k.nulls_order_explicit;
+                sk.nulls_first = k.nulls_first;
+                payload.sort_keys.push_back(sk);
+            }
+            break;
+        case plan::LogicalOp::Limit:
+            payload.limits.has_limit = n.has_limit;
+            payload.limits.limit = n.limit;
+            payload.limits.has_offset = n.has_offset;
+            payload.limits.offset = n.offset;
+            break;
         default:
             break;
     }
@@ -178,6 +215,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.projections = payload.projections;
         key.hash_keys = payload.hash_keys;
         key.join_kind = payload.join_kind;
+        key.sort_keys = payload.sort_keys;
+        key.limits = payload.limits;
         key.finish();
         if (const std::optional<GroupId> existing = memo.find_group(key)) {
             ++shared;
@@ -195,6 +234,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         grp.projections = std::move(payload.projections);
         grp.hash_keys = std::move(payload.hash_keys);
         grp.join_kind = payload.join_kind;
+        grp.sort_keys = payload.sort_keys;
+        grp.limits = payload.limits;
     }
 
     // Cardinality belongs to the GROUP: the candidates are equivalent, so any of
@@ -203,7 +244,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     std::size_t n_in = 0;
     for (const GroupId in : inputs) { if (n_in == 2) break; in_rows_buf[n_in++] = memo.group(in).rows; }
     memo.set_rows(g, operator_rows(cands.front(), std::span<const double>{in_rows_buf, n_in},
-                                   memo.group(g).table_name, card));
+                                   memo.group(g).table_name, card, memo.group(g).limits));
 
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot.
@@ -378,7 +419,7 @@ struct Optimizer {
                 const PhysicalProperties provided =
                     derive_op(ge.op, grp.hash_keys, ge.scan_format,
                               std::span<const PhysicalProperties>{child_props, n_child},
-                              ge.scan_freshness);
+                              ge.scan_freshness, grp.sort_keys);
                 const double top = enforcement_cost(provided, required, out_rows, cal);
                 const double total = child_cost + own_cost + top;
                 if (total < best_cost) {
@@ -420,7 +461,7 @@ struct Optimizer {
                         const PhysicalProperties provided = derive_op(
                             ge.op, grp.hash_keys, ge.scan_format,
                             std::span<const PhysicalProperties>{pd_props, n_pd},
-                            ge.scan_freshness);
+                            ge.scan_freshness, grp.sort_keys);
                         const double top =
                             enforcement_cost(provided, required, out_rows, cal);
                         const double total = pd_cost + own_cost + top;

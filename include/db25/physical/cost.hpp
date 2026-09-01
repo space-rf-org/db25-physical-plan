@@ -39,6 +39,10 @@ struct CalibrationProfile {
     double nested_loop_pair = 0.05;
     double sort_row = 1.0;        // per-row coefficient of an n*log2(n) sort
     double convert_row = 0.6;     // convert one row between storage formats
+    // A limit copies through the rows it keeps and discards the rest without
+    // looking at them, so it is priced on its OUTPUT rows, not its input - the
+    // only operator here for which that is the honest shape.
+    double limit_row = 0.1;
     // Hardware facts (informational today; richer costing consumes them later).
     std::uint32_t simd_width = 8;
     std::uint32_t cache_line = 64;
@@ -91,8 +95,13 @@ struct CardinalityModel {
 // `input_rows` is a SPAN, not a vector: every operator in the IR has arity <= 2,
 // so the caller can hold these on the stack. Taking a vector forced the search to
 // heap-allocate a one- or two-element array for every candidate of every goal.
+// `limits` is the Limit operator's own payload, on the same footing as
+// `table_name` is the scan's: a Limit's output cardinality is not a function of
+// its input's alone, and estimating it as the input's would over-count every
+// operator above it and skew their choices.
 [[nodiscard]] double operator_rows(PhysicalOp op, std::span<const double> input_rows,
-                                   const std::string& table_name, const CardinalityModel& card);
+                                   const std::string& table_name, const CardinalityModel& card,
+                                   LimitSpec limits = {});
 [[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
                                    StorageFormat scan_format = StorageFormat::Row);

@@ -129,10 +129,18 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             out += " by=[";
             for (std::size_t i = 0; i < n.sort_keys.size(); ++i) {
                 if (i != 0) out += " ";
-                out += "#" + std::to_string(n.sort_keys[i].column) +
-                       (n.sort_keys[i].descending ? " desc" : " asc");
+                const SortKey& k = n.sort_keys[i];
+                out += "#" + std::to_string(k.column) + (k.descending ? " desc" : " asc");
+                // Printed only when the query asked, so an enforcer's key (which
+                // has no opinion) is visibly different from an explicit request.
+                if (k.nulls_specified) out += k.nulls_first ? " nulls-first" : " nulls-last";
             }
             out += "]";
+            break;
+        }
+        case PhysicalOp::Limit: {
+            if (n.limits.has_limit) out += " limit=" + std::to_string(n.limits.limit);
+            if (n.limits.has_offset) out += " offset=" + std::to_string(n.limits.offset);
             break;
         }
         case PhysicalOp::FormatConvert:

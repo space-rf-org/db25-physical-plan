@@ -40,8 +40,14 @@ enum class PhysicalOp : std::uint8_t {
     NestedLoopJoin, // nested-loop join: the only join that needs no equi-key, so
                     // the only legal implementation of a cross product or a
                     // purely non-equi join. Quadratic, and priced accordingly.
-    Sort,           // enforcer: establishes a required sort order
+    Sort,           // establishes a sort order - both the implementation of a
+                    // logical Sort (ORDER BY) and the ENFORCER inserted to
+                    // satisfy a required order. One operator, because they are
+                    // the same operation; what differs is only who asked for it.
     FormatConvert,  // enforcer: converts the storage format (row <-> column)
+    Limit,          // LIMIT / OFFSET: pass at most `limit` rows through, after
+                    // discarding the first `offset`. Order-SENSITIVE - which
+                    // rows survive depends entirely on the order of its input.
 };
 
 [[nodiscard]] const char* physical_op_to_string(PhysicalOp op) noexcept;
@@ -54,10 +60,10 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 8> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 9> kAllPhysicalOps = {
     PhysicalOp::SeqScan,       PhysicalOp::Filter,    PhysicalOp::Project,
     PhysicalOp::HashJoin,      PhysicalOp::MergeJoin, PhysicalOp::NestedLoopJoin,
-    PhysicalOp::Sort,          PhysicalOp::FormatConvert};
+    PhysicalOp::Sort,          PhysicalOp::FormatConvert, PhysicalOp::Limit};
 
 // The storage format of a relation's rows - the HTAP substrate a subplan reads
 // from or produces in. `Any` means "no requirement" (a required property) or
@@ -78,10 +84,42 @@ enum class Freshness : std::uint8_t {
 };
 [[nodiscard]] const char* freshness_to_string(Freshness f) noexcept;
 
-// One key of a sort order: a positional column index and its direction.
+// LIMIT / OFFSET, as a value. The two are independently optional, so a sentinel
+// row count would be indistinguishable from a real one - hence the flags.
+struct LimitSpec {
+    bool has_limit = false;
+    bool has_offset = false;
+    std::int64_t limit = -1;   // meaningful when has_limit
+    std::int64_t offset = 0;   // meaningful when has_offset
+
+    // How many of `in` rows survive. OFFSET discards from the front first, then
+    // LIMIT caps what remains - the order matters, and doing it the other way
+    // round over-counts whenever both are present.
+    [[nodiscard]] double rows_out(double in) const noexcept {
+        double n = in;
+        if (has_offset && offset > 0) n = n > static_cast<double>(offset)
+                                            ? n - static_cast<double>(offset) : 0.0;
+        if (has_limit && limit >= 0) n = n < static_cast<double>(limit)
+                                            ? n : static_cast<double>(limit);
+        return n;
+    }
+};
+
+// One key of a sort order: a positional column index and its direction, plus
+// where NULLs go.
+//
+// The nulls ordering is carried rather than dropped. SQL's NULLS FIRST / NULLS
+// LAST changes the result, so a physical Sort that forgot it would produce rows
+// in a different order than the query asked for, silently - the same shape of
+// defect as a physical join that forgot whether it was an outer join.
+// `nulls_specified` distinguishes "the query said where NULLs go" from "the
+// engine's default applies", so an enforcer-created key (which has no opinion)
+// is not confused with an explicit request.
 struct SortKey {
     std::uint32_t column = 0;
     bool descending = false;
+    bool nulls_specified = false;  // the query wrote NULLS FIRST / NULLS LAST
+    bool nulls_first = false;      // meaningful only when nulls_specified
 };
 
 // The input arity the IR expects of each operator (a SeqScan is a leaf; a Filter
@@ -154,6 +192,7 @@ struct PhysicalNode {
     StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
     Freshness scan_freshness = Freshness::Fresh;         // SeqScan: does this copy lag?
     StorageFormat target_format = StorageFormat::Any;    // FormatConvert: the format it produces
+    LimitSpec limits;                                    // Limit: LIMIT / OFFSET
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}
 };
@@ -172,7 +211,8 @@ struct PhysicalNode {
 [[nodiscard]] PhysicalNodePtr make_nested_loop_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                                     Schema output,
                                                     std::vector<const Expr*> residual = {});
-// Enforcers.
+[[nodiscard]] PhysicalNodePtr make_limit(PhysicalNodePtr input, LimitSpec limits);
+// Sort is both an operator and an enforcer; FormatConvert is only an enforcer.
 [[nodiscard]] PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys);
 [[nodiscard]] PhysicalNodePtr make_format_convert(PhysicalNodePtr input, StorageFormat target);
 

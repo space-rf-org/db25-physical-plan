@@ -95,7 +95,8 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
 // "one cost model" invariant (design D3) made structural.
 
 double operator_rows(PhysicalOp op, std::span<const double> input_rows,
-                     const std::string& table_name, const CardinalityModel& card) {
+                     const std::string& table_name, const CardinalityModel& card,
+                     LimitSpec limits) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan: {
@@ -113,7 +114,9 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             return in(0) * in(1) * card.join_selectivity;
         case PhysicalOp::Sort:
         case PhysicalOp::FormatConvert:
-            return in(0);  // enforcers pass every input row through unchanged
+            return in(0);  // both pass every input row through unchanged
+        case PhysicalOp::Limit:
+            return limits.rows_out(in(0));
     }
     return 0.0;
 }
@@ -148,6 +151,8 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)
         case PhysicalOp::FormatConvert:
             return in(0) * cal.convert_row;
+        case PhysicalOp::Limit:
+            return out_rows * cal.limit_row;
     }
     return 0.0;
 }
@@ -181,7 +186,7 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
     std::vector<double> input_rows;
     input_rows.reserve(node.children.size());
     for (const auto& c : node.children) input_rows.push_back(rows(*c));
-    return operator_rows(node.op, input_rows, node.table_name, *this);
+    return operator_rows(node.op, input_rows, node.table_name, *this, node.limits);
 }
 
 double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,

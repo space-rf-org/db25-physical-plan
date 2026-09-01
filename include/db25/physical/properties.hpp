@@ -43,10 +43,21 @@ struct PhysicalProperties {
 // The physical properties an operator's output has, given what its inputs
 // provide. Representation-independent (as the cost formulas are), so the tree
 // form below and the memo form - where inputs are GROUPS - derive identically.
+// `sort_keys` is the Sort operator's own payload - the order it establishes.
+// It has to be an input here, not patched on afterwards, because a Sort is now
+// both an ENFORCER (built by enforce(), which knows the order it is creating) and
+// the implementation of a logical Sort (a memo group, whose provided properties
+// the SEARCH reads). Deriving an empty order for the latter would tell the search
+// that an ORDER BY provides nothing, and it would stack a second Sort on top.
+//
+// FormatConvert's target format is still applied by the tree-form derive() below
+// rather than passed here, because a FormatConvert is only ever built by
+// enforce() - it is never a memo group, so no search ever asks what it provides.
 [[nodiscard]] PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
                                            StorageFormat scan_format,
                                            std::span<const PhysicalProperties> input_props,
-                                           Freshness scan_freshness = Freshness::Fresh);
+                                           Freshness scan_freshness = Freshness::Fresh,
+                                           std::span<const SortKey> sort_keys = {});
 
 // Is `op` a legal implementation for a join with these equi-keys? A MergeJoin
 // merges two sorted streams ON THE JOIN KEYS, so with no keys there is nothing to
