@@ -11,6 +11,7 @@
 // Cascades memo (memo.hpp) is where the many transient candidates live during
 // search; a PhysicalNode is the concrete plan the memo's winner extracts to.
 #include "db25/ast/node_types.hpp"    // ast::JoinType
+#include "db25/physical/small_vec.hpp"
 #include "db25/plan/expr_ir.hpp"       // complete db25::plan::Expr (borrowed payloads)
 #include "db25/plan/logical_plan.hpp"  // Schema, ColumnSchema
 
@@ -285,7 +286,19 @@ using PhysicalNodePtr = std::unique_ptr<PhysicalNode>;
 struct HashKey {
     std::uint32_t left_index = 0;
     std::uint32_t right_index = 0;
+
+    [[nodiscard]] bool operator==(const HashKey& o) const noexcept {
+        return left_index == o.left_index && right_index == o.right_index;
+    }
 };
+
+// A join's key list. Two columns INLINE, because that is what almost every
+// equi-join has and a std::vector reached the heap for the first one. Since
+// Increment 3.8a a group-expression OWNS its keys - two candidates in one group
+// may join on different keys - so the vector cost one allocation per candidate
+// per join: four on the five-group budget query, and multiplied by every
+// candidate a larger query enumerates. Longer key lists still work; they spill.
+using HashKeyVec = SmallVec<HashKey, 2>;
 
 // A physical plan node. Ownership is a plain owning tree (unique_ptr children),
 // mirroring the logical plan: the extracted plan is small and short-lived.
@@ -310,7 +323,7 @@ struct PhysicalNode {
     // are borrowed from the logical plan).
     std::vector<const Expr*> residual;
     std::vector<const Expr*> projections;  // Project: one borrowed expr per output column
-    std::vector<HashKey> hash_keys;        // HashJoin / MergeJoin: equi-join key pairs
+    HashKeyVec hash_keys;        // HashJoin / MergeJoin: equi-join key pairs
     // Join: WHICH relational join this physical operator implements. Without it a
     // physical LEFT JOIN and a physical INNER JOIN are the same node - the plan
     // says "HashJoin" and nothing more, and an executor reading it has no way to
@@ -363,10 +376,10 @@ struct PhysicalNode {
 [[nodiscard]] PhysicalNodePtr make_project(PhysicalNodePtr input, Schema output,
                                            std::vector<const Expr*> projections);
 [[nodiscard]] PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
-                                             std::vector<HashKey> keys, Schema output,
+                                             HashKeyVec keys, Schema output,
                                              std::vector<const Expr*> residual = {});
 [[nodiscard]] PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
-                                              std::vector<HashKey> keys, Schema output,
+                                              HashKeyVec keys, Schema output,
                                               std::vector<const Expr*> residual = {});
 [[nodiscard]] PhysicalNodePtr make_nested_loop_join(PhysicalNodePtr left, PhysicalNodePtr right,
                                                     Schema output,

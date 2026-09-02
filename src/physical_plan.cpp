@@ -202,7 +202,7 @@ PhysicalNodePtr make_project(PhysicalNodePtr input, Schema output,
 }
 
 PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
-                               std::vector<HashKey> keys, Schema output,
+                               HashKeyVec keys, Schema output,
                                std::vector<const Expr*> residual) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::HashJoin);
     n->hash_keys = std::move(keys);
@@ -214,7 +214,7 @@ PhysicalNodePtr make_hash_join(PhysicalNodePtr left, PhysicalNodePtr right,
 }
 
 PhysicalNodePtr make_merge_join(PhysicalNodePtr left, PhysicalNodePtr right,
-                                std::vector<HashKey> keys, Schema output,
+                                HashKeyVec keys, Schema output,
                                 std::vector<const Expr*> residual) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::MergeJoin);
     n->hash_keys = std::move(keys);

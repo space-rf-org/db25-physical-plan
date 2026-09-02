@@ -54,7 +54,7 @@ struct PhysicalProperties {
 // FormatConvert's target format is still applied by the tree-form derive() below
 // rather than passed here, because a FormatConvert is only ever built by
 // enforce() - it is never a memo group, so no search ever asks what it provides.
-[[nodiscard]] PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
+[[nodiscard]] PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
                                            StorageFormat scan_format,
                                            std::span<const PhysicalProperties> input_props,
                                            Freshness scan_freshness = Freshness::Fresh,
@@ -64,7 +64,7 @@ struct PhysicalProperties {
 // merges two sorted streams ON THE JOIN KEYS, so with no keys there is nothing to
 // merge on and it is not a valid way to compute the (cross) product - regardless
 // of what it would cost. Every other operator is unconditionally applicable.
-[[nodiscard]] bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys,
+[[nodiscard]] bool is_applicable(PhysicalOp op, const HashKeyVec& keys,
                                  ast::JoinType join_kind = ast::JoinType::Inner,
                                  GroupingSpec grouping = {},
                                  ast::SetOp set_op = ast::SetOp::Union);
@@ -87,7 +87,7 @@ struct PhysicalProperties {
 // grouping order, a Window's (PARTITION BY ++ ORDER BY), a StreamingDistinct's
 // every-column order. One name because it is one idea.
 [[nodiscard]] std::vector<PhysicalProperties> required_input_properties(
-    PhysicalOp op, const std::vector<HashKey>& keys,
+    PhysicalOp op, const HashKeyVec& keys,
     std::span<const SortKey> group_sort = {});
 
 // The physical properties of the output of `node`, derived bottom-up.

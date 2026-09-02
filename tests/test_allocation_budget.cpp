@@ -138,8 +138,22 @@ static plan::LogicalNodePtr reference_query() {
 // The obvious saving - a small-vector with inline capacity for hash keys, which
 // are one or two columns in almost every join - is a separate change and tracked
 // as one.
-constexpr long kBudgetDefault = 74;   // measured 70 (was 65 before Increment 3.8a)
-constexpr long kBudgetDedup = 89;     // measured 85 (dedup builds a key per group)
+// LOWERED by 6 and 8 in the small-vector change: a join's key list now holds two
+// columns INLINE, so the four candidates of this query's join no longer reach the
+// heap to copy one key each, and the dedup key does not either. That is the
+// allocation 3.8a spent to give each candidate its own keys, recovered - and then
+// some, because the same inline capacity also covers the group key.
+//
+// The budgets move DOWN as well as up. A budget left at the old number would
+// silently absorb the next regression of exactly this size, which is the failure
+// mode this file exists to prevent.
+// Headroom of TWO, not four. Four was the size of the saving this very change
+// made, which means a regression that gave the whole saving back would have sat
+// exactly on the budget and passed - and one was written as a mutation and did
+// pass. A budget whose slack is as large as the effect it guards cannot see the
+// effect come back.
+constexpr long kBudgetDefault = 66;   // measured 64 (was 70 before the small vector)
+constexpr long kBudgetDedup = 79;     // measured 77 (dedup builds a key per group)
 
 static long allocations_for(const LoweringContext& ctx, const plan::LogicalNode& q) {
     { const LoweringResult warm = lower(q, ctx); (void)warm; }  // one-off caches

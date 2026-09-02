@@ -57,7 +57,7 @@ struct GroupExpr {
     // different keys. In Cascades a group-expression IS (operator, input groups),
     // so this is the memo moving toward the model it already claimed to implement.
     ArityVec<GroupId> inputs;
-    std::vector<HashKey> hash_keys;      // equi-join keys, over `inputs`
+    HashKeyVec hash_keys;      // equi-join keys, over `inputs`
     std::vector<const Expr*> residual;   // non-key conjuncts to re-check per row
     // HashJoin: which input is MATERIALIZED into the hash table; the other streams
     // past it. Building the SMALLER side is what makes a hash join cheap, and
@@ -265,7 +265,7 @@ struct GroupKey {
     const Expr* predicate = nullptr;
     std::vector<const Expr*> residual;
     std::vector<const Expr*> op_exprs;
-    std::vector<HashKey> hash_keys;
+    HashKeyVec hash_keys;
     // Part of the key. Two joins over the same inputs with the same keys and the
     // same predicate are NOT the same group if one is inner and the other left:
     // deduplicating them would let one query's join silently reuse another's

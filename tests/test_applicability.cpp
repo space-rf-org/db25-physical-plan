@@ -66,7 +66,7 @@ const std::vector<SetOp>& all_set_ops() {
 // enumerate exhaustively, which is the point - a sampled grid would have the same
 // blind spot the individual guards had.
 struct Context {
-    std::vector<HashKey> keys;
+    HashKeyVec keys;
     JoinType join_kind;
     GroupingSpec grouping;
     SetOp set_op;
@@ -74,7 +74,7 @@ struct Context {
 
 std::vector<Context> all_contexts() {
     std::vector<Context> out;
-    const std::vector<std::vector<HashKey>> key_sets{{}, {{0, 0}}, {{0, 0}, {1, 1}}};
+    const std::vector<HashKeyVec> key_sets{{}, {{0, 0}}, {{0, 0}, {1, 1}}};
     const std::vector<GroupingSpec> groupings{
         GroupingSpec{0, false, false, 0}, GroupingSpec{0, true, false, 0},
         GroupingSpec{1, false, false, 0}, GroupingSpec{1, true, false, 0},
