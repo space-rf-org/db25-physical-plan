@@ -79,7 +79,16 @@
     (operator (name RecursiveFixpoint)  (arity 2) (kind pipeline-breaker))
     (operator (name WorkingTableScan)   (arity 0) (kind access-path))
     ; CREATE TABLE AS: materialize the input stream into a new table.
-    (operator (name CreateTableAs)      (arity 1) (kind pipeline-breaker)))
+    (operator (name CreateTableAs)      (arity 1) (kind pipeline-breaker))
+    ; The write path. One input each - the source query for an Insert, the
+    ; scanned and filtered target rows for an Update or a Delete - and each emits
+    ; the AFFECTED rows, which a RETURNING clause then projects. The target
+    ; relation is a NAME on the operator, not a child: it is written, not read.
+    ; Three operators rather than one with a mode, because an operator that does
+    ; not say which modification it performs reads the same as the other two.
+    (operator (name Insert)             (arity 1) (kind pipeline-breaker))
+    (operator (name Update)             (arity 1) (kind pipeline-breaker))
+    (operator (name Delete)             (arity 1) (kind pipeline-breaker)))
 
   ; Implementation rules: the physical operator each logical operator lowers to.
   ; Increment 0 is single-candidate (one physical op per logical op); a rule set
@@ -123,7 +132,15 @@
     ; than a rival to cost against it.
     (rule (logical RecursiveCTE)      (physical RecursiveFixpoint))
     (rule (logical WorkingTableScan)  (physical WorkingTableScan))
-    (rule (logical CreateTableAs)     (physical CreateTableAs)))
+    (rule (logical CreateTableAs)     (physical CreateTableAs))
+    (rule (logical Insert)            (physical Insert))
+    (rule (logical Update)            (physical Update))
+    (rule (logical Delete)            (physical Delete))
+    ; RETURNING is a projection over the rows the modification affected, which is
+    ; what Project already is. It gets no operator of its own: a Project above an
+    ; Insert can only be a RETURNING clause, there being no other reason for one
+    ; to sit there, and a second way to say projection would need a mapping.
+    (rule (logical Returning)         (physical Project)))
 
   ; Where exhaustive search stops being affordable (design D5). Past this many
   ; joins the planner falls back to a bounded enumeration - a worse plan chosen by
@@ -145,4 +162,5 @@
               Sort FormatConvert Limit HashAggregate StreamingAggregate Window
               HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan
               HashSemiJoin HashAntiJoin NestedLoopSemiJoin NestedLoopAntiJoin
-              HashGroupingSets RecursiveFixpoint WorkingTableScan CreateTableAs)))
+              HashGroupingSets RecursiveFixpoint WorkingTableScan CreateTableAs
+              Insert Update Delete)))

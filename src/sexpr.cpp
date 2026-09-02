@@ -133,6 +133,23 @@ std::string render_schema(const Schema& schema) {
     return s + "]";
 }
 
+// A SET list: which column each assignment targets and what it is set to. The
+// column is a catalog COLUMN ID, not a positional index into anything in this
+// plan - an assignment names a column of the target relation, which the operator
+// writes and does not read - so it is rendered with a `col` prefix that says so.
+std::string render_assignments(const std::vector<plan::Assignment>* a) {
+    std::string out = "set=[";
+    if (a != nullptr) {
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            if (i != 0) out += " ";
+            out += "(col" + std::to_string((*a)[i].target_column_id) + " " +
+                   render_expr((*a)[i].value.get()) + ")";
+        }
+    }
+    out += "]";
+    return out;
+}
+
 // ---- node rendering ------------------------------------------------------
 void render_node(const PhysicalNode& n, const std::string& indent, std::string& out) {
     out += indent;
@@ -319,6 +336,44 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             out += " cte=" + n.table_name;
             break;
         case PhysicalOp::CreateTableAs:
+            out += " table=" + n.table_name;
+            break;
+        case PhysicalOp::Insert: {
+            out += " table=" + n.table_name;
+            // The explicit column list, when the statement wrote one. Empty means
+            // every column in declaration order, which is a different statement -
+            // so the two are rendered differently rather than identically.
+            if (n.target_columns != nullptr && !n.target_columns->empty()) {
+                out += " cols=[";
+                for (std::size_t i = 0; i < n.target_columns->size(); ++i) {
+                    if (i != 0) out += " ";
+                    out += (*n.target_columns)[i];
+                }
+                out += "]";
+            }
+            if (n.conflict_action != plan::ConflictAction::None) {
+                out += " conflict=";
+                out += n.conflict_action == plan::ConflictAction::DoNothing ? "nothing"
+                                                                           : "update";
+                if (n.conflict_columns != nullptr && !n.conflict_columns->empty()) {
+                    out += " on=[";
+                    for (std::size_t i = 0; i < n.conflict_columns->size(); ++i) {
+                        if (i != 0) out += " ";
+                        out += (*n.conflict_columns)[i];
+                    }
+                    out += "]";
+                }
+                if (n.conflict_action == plan::ConflictAction::DoUpdate) {
+                    out += " " + render_assignments(n.assignments);
+                }
+            }
+            break;
+        }
+        case PhysicalOp::Update:
+            out += " table=" + n.table_name;
+            out += " " + render_assignments(n.assignments);
+            break;
+        case PhysicalOp::Delete:
             out += " table=" + n.table_name;
             break;
     }

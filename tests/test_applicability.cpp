@@ -184,6 +184,13 @@ const std::vector<Precondition>& declared_preconditions() {
         {PhysicalOp::RecursiveFixpoint},
         {PhysicalOp::WorkingTableScan},
         {PhysicalOp::CreateTableAs},
+        // The write path has no precondition either: each is the sole
+        // implementation of its logical operator, and nothing about a row makes
+        // one of them applicable where another is not - which of the three runs
+        // is decided by the STATEMENT, upstream of any choice this planner makes.
+        {PhysicalOp::Insert},
+        {PhysicalOp::Update},
+        {PhysicalOp::Delete},
     };
     return v;
 }
@@ -312,7 +319,16 @@ static void test_every_operator_derives_and_renders() {
         // Staleness must propagate: nothing here manufactures freshness, so an
         // operator over a stale input cannot claim Fresh, and must not leave the
         // field at Any - which would satisfy a Fresh requirement by accident.
-        if (arity > 0) {
+        // The write path is the ONE exception, and a real one rather than an
+        // oversight: Insert / Update / Delete emit the rows they just WROTE, so
+        // their output reflects all committed writes whatever their input read.
+        // `INSERT INTO t SELECT ... FROM replica RETURNING *` returns rows that
+        // now exist in t. It is the only place in this catalogue where freshness
+        // is manufactured, and it is manufactured because the operator is what
+        // makes the data current.
+        const bool writes = op == PhysicalOp::Insert || op == PhysicalOp::Update ||
+                            op == PhysicalOp::Delete;
+        if (arity > 0 && !writes) {
             if (p.freshness == Freshness::Any) {
                 std::printf("  operator does not derive freshness: %s\n",
                             physical_op_to_string(op));
@@ -320,6 +336,7 @@ static void test_every_operator_derives_and_renders() {
             CHECK(p.freshness != Freshness::Any);
             CHECK(p.freshness == Freshness::Stale);
         }
+        if (writes) CHECK(p.freshness == Freshness::Fresh);
         // And it must have a NAME - an operator absent from the string table
         // renders as "?" and is unreadable in every golden it appears in.
         CHECK(std::string(physical_op_to_string(op)) != "?");

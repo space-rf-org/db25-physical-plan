@@ -185,6 +185,13 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             return card.working_table_rows;
         case PhysicalOp::CreateTableAs:
             return in(0);  // every row the query produced goes into the new table
+        case PhysicalOp::Insert:
+        case PhysicalOp::Update:
+        case PhysicalOp::Delete:
+            // The AFFECTED rows: one per row that arrived. The filtering that
+            // decides WHICH rows an UPDATE or DELETE touches happened below, in
+            // the Filter that produced this input.
+            return in(0);
     }
     return 0.0;
 }
@@ -270,6 +277,15 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
         case PhysicalOp::WorkingTableScan:
             return out_rows * cal.working_table_row;
         case PhysicalOp::CreateTableAs:
+        case PhysicalOp::Insert:
+        case PhysicalOp::Update:
+        case PhysicalOp::Delete:
+            // One coefficient for all four, and that is a statement rather than
+            // laziness: this model has no measurement that says a delete is
+            // cheaper per row than an insert, and inventing a ratio between them
+            // would be a number with nothing behind it. They are durable
+            // per-row modifications, priced as such, and separating them is a
+            // calibration question for when there is an engine to measure.
             return out_rows * cal.table_write_row;
     }
     return 0.0;

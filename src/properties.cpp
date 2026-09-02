@@ -206,6 +206,16 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             // the row format; a columnar copy is a storage decision made after the
             // table exists, not one this operator gets to make.
             return PhysicalProperties{in(0).sort, StorageFormat::Row, in(0).freshness};
+        case PhysicalOp::Insert:
+        case PhysicalOp::Update:
+        case PhysicalOp::Delete:
+            // The AFFECTED rows, which a RETURNING clause projects. FRESH by
+            // construction: these rows are what this statement just wrote, so no
+            // stored copy stands between them and the reader. No order, because
+            // the order rows are written in is the storage layer's business and
+            // claiming it would be claiming a property of an execution strategy -
+            // the same line drawn at the nested loop and the semi joins.
+            return PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
     }
     return PhysicalProperties{};
 }
@@ -330,8 +340,25 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
         // new table. A table is stored row-wise here, so a columnar subplan
         // feeding either must be converted, and that conversion is priced like
         // any other.
-        op == PhysicalOp::RecursiveFixpoint || op == PhysicalOp::CreateTableAs) {
+        op == PhysicalOp::RecursiveFixpoint || op == PhysicalOp::CreateTableAs ||
+        // The write path materializes rows into a table, which is stored row-wise.
+        op == PhysicalOp::Insert || op == PhysicalOp::Update ||
+        op == PhysicalOp::Delete) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
+    }
+
+    // An UPDATE or a DELETE reads the rows it is about to modify, and a lagging
+    // copy is not merely a worse source - it is the wrong set of rows. So the
+    // input requirement is FRESH, which is a correctness constraint rather than a
+    // preference: no enforcer manufactures freshness, so a target available only
+    // as a stale replica makes the statement unplannable, and it fails saying so
+    // rather than modifying rows chosen from a lagging read.
+    //
+    // An INSERT is deliberately NOT here. Its input is the SOURCE query, not the
+    // target: `INSERT INTO t SELECT ... FROM archive` may legitimately read a
+    // replica, and requiring otherwise would refuse a query that is fine.
+    if ((op == PhysicalOp::Update || op == PhysicalOp::Delete) && !reqs.empty()) {
+        reqs[0].freshness = Freshness::Fresh;
     }
 
     // The requirement that makes a streaming aggregate what it is: its input must
