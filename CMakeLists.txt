@@ -57,6 +57,7 @@ add_library(db25physicalplan STATIC
     src/lowering.cpp
     src/join_order.cpp
     src/pipeline.cpp
+    src/plan_cache.cpp
     src/structural_key.cpp)
 target_include_directories(db25physicalplan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -127,6 +128,34 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_compile_definitions(distribution_tests PRIVATE
         DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
     add_test(NAME distribution_tests COMMAND distribution_tests)
+
+    # The plan cache and the key that makes one safe. Built WITH exceptions,
+    # because the input sweep uses std::function; the library stays
+    # -fno-exceptions.
+    # The cache-key field sweeps read the upstream IR headers at run time to check
+    # that every member of plan::Expr / plan::LogicalNode / plan::ColumnSchema is
+    # swept. Resolved from the logical-plan target's include path rather than a
+    # fixed relative path, because the umbrella builds this repo against ITS copy
+    # of db25-logical-plan, not ours.
+    get_target_property(_db25_lp_includes db25logicalplan INTERFACE_INCLUDE_DIRECTORIES)
+    find_file(DB25_PLAN_EXPR_HEADER db25/plan/expr_ir.hpp
+        PATHS ${_db25_lp_includes} NO_DEFAULT_PATH)
+    find_file(DB25_PLAN_NODE_HEADER db25/plan/logical_plan.hpp
+        PATHS ${_db25_lp_includes} NO_DEFAULT_PATH)
+    if(NOT DB25_PLAN_EXPR_HEADER OR NOT DB25_PLAN_NODE_HEADER)
+        message(FATAL_ERROR "cannot locate the db25-logical-plan IR headers on the "
+                            "db25logicalplan include path; the plan-cache field "
+                            "sweeps need them to check their own coverage")
+    endif()
+
+    add_executable(plan_cache_tests tests/test_plan_cache.cpp)
+    target_link_libraries(plan_cache_tests PRIVATE db25physicalplan)
+    target_compile_options(plan_cache_tests PRIVATE -Wall -Wextra)
+    target_compile_definitions(plan_cache_tests PRIVATE
+        DB25_PLAN_EXPR_HEADER="${DB25_PLAN_EXPR_HEADER}"
+        DB25_PLAN_NODE_HEADER="${DB25_PLAN_NODE_HEADER}"
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME plan_cache_tests COMMAND plan_cache_tests)
 
     # The applicability sweep. Iterates kAllPhysicalOps, so an operator added
     # without a decision about its preconditions, its cost, its derivation or its
