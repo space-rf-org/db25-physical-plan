@@ -69,7 +69,7 @@ bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& req
     return sort_prefix(provided.sort, required.sort);
 }
 
-PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
+PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
                              StorageFormat scan_format,
                              std::span<const PhysicalProperties> input_props,
                              Freshness scan_freshness, std::span<const SortKey> sort_keys) {
@@ -220,7 +220,7 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
     return PhysicalProperties{};
 }
 
-bool is_applicable(PhysicalOp op, const std::vector<HashKey>& keys, ast::JoinType join_kind,
+bool is_applicable(PhysicalOp op, const HashKeyVec& keys, ast::JoinType join_kind,
                    GroupingSpec grouping, ast::SetOp set_op) {
     // A LATERAL join's right input is CORRELATED: its subtree reads the current
     // left row through an OuterRef, so it has no meaning evaluated on its own.
@@ -316,7 +316,7 @@ std::optional<PhysicalProperties> pushdown_requirement(PhysicalOp op,
 }
 
 std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
-                                                          const std::vector<HashKey>& keys,
+                                                          const HashKeyVec& keys,
                                                           std::span<const SortKey> group_sort) {
     std::vector<PhysicalProperties> reqs(expected_arity(op));
 

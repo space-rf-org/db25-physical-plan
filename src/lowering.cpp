@@ -144,7 +144,7 @@ std::span<const PhysicalOp> resolve_candidates(plan::LogicalOp op, const Lowerin
 // constrains one input rather than relating the two - stays in `residual` and is
 // re-checked per candidate row.
 void split_join_predicate(const plan::Expr* e, std::uint32_t left_width,
-                          std::vector<HashKey>& keys, std::vector<const plan::Expr*>& residual) {
+                          HashKeyVec& keys, std::vector<const plan::Expr*>& residual) {
     if (e == nullptr) return;
     if (e->kind == plan::ExprKind::BinaryOp && e->bin_op == ast::BinaryOp::And) {
         const plan::Expr* l = e->children.size() > 0 ? e->children[0].get() : nullptr;
@@ -228,7 +228,7 @@ GroupingSpec grouping_of(const Group& g) {
 std::size_t add_candidates(Memo& memo, GroupId g, std::span<const PhysicalOp> cands,
                            std::span<const FormatAvailability> formats,
                            const std::vector<GroupId>& inputs,
-                           const std::vector<HashKey>& keys,
+                           const HashKeyVec& keys,
                            const std::vector<const plan::Expr*>& residual) {
     const ast::JoinType join_kind = memo.group(g).join_kind;
     const GroupingSpec group_spec = grouping_of(memo.group(g));
@@ -420,7 +420,7 @@ GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region
                 // a subtraction and every conjunct index a single offset away.
                 const std::uint32_t left_width =
                     region.end_of(split) - region.leaf_offset[first];
-                std::vector<HashKey> keys;
+                HashKeyVec keys;
                 std::vector<const plan::Expr*> residual;
                 for (const RegionConjunct& c : region.conjuncts) {
                     if (!placed_here(c, first, split, last)) continue;
@@ -502,7 +502,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     // group per logical node - so these locals are simply copied onto every
     // candidate, and the code says where they will diverge.
     Group payload;
-    std::vector<HashKey> hash_keys;
+    HashKeyVec hash_keys;
     std::vector<const plan::Expr*> residual;
     switch (n.op) {
         case plan::LogicalOp::Scan:

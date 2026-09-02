@@ -102,12 +102,12 @@ static GroupExpr group_expr(PhysicalOp op) {
 // string alive for as long as the memo. Passing a temporary here is a
 // use-after-free that ASan catches on the first run.
 static std::vector<GroupId> g_pending_inputs;
-static std::vector<HashKey> g_pending_keys;
+static HashKeyVec g_pending_keys;
 
 static void set_payload(Memo& m, GroupId g, std::vector<GroupId> inputs,
                         const std::string* table = nullptr, const Expr* pred = nullptr,
                         std::vector<const Expr*> projections = {},
-                        std::vector<HashKey> keys = {}) {
+                        HashKeyVec keys = {}) {
     Group& grp = m.group(g);
     grp.table_name = table;
     grp.predicate = pred;
@@ -121,7 +121,7 @@ static void set_payload(Memo& m, GroupId g, std::vector<GroupId> inputs,
 static void add_candidate(Memo& m, GroupId g, PhysicalOp op, std::vector<GroupId> inputs,
                           const std::string* table = nullptr, const Expr* pred = nullptr,
                           std::vector<const Expr*> projections = {},
-                          std::vector<HashKey> keys = {}) {
+                          HashKeyVec keys = {}) {
     set_payload(m, g, std::move(inputs), table, pred, std::move(projections),
                 std::move(keys));
     GroupExpr ge = group_expr(op);
@@ -155,7 +155,7 @@ static Schema proj_schema() {
 
 // Build the plan directly (owning tree). `pred`, `px`, `py` are borrowed.
 static PhysicalNodePtr build_plan(const Expr* pred, const Expr* px, const Expr* py,
-                                  std::vector<HashKey> keys) {
+                                  HashKeyVec keys) {
     auto scan_a = make_seq_scan("a", a_schema());
     auto scan_b = make_seq_scan("b", b_schema());
     auto join = make_hash_join(std::move(scan_a), std::move(scan_b), std::move(keys),
@@ -443,7 +443,92 @@ static void test_falsifiability_mutation_changes_render() {
     CHECK(base != mut_lit);
 }
 
+// ---- SmallVec ------------------------------------------------------------
+// A hand-rolled container gets its own tests. The planner's key lists are short,
+// which is the whole point of the inline buffer - and short is exactly the case
+// where a container bug hides, because nothing ever spills in normal use.
+static void test_small_vec_holds_its_elements_inline_and_spilled() {
+    std::printf("test_small_vec_holds_its_elements_inline_and_spilled\n");
+    using db25::physical::SmallVec;
+    SmallVec<HashKey, 2> v;
+    CHECK(v.empty());
+    for (std::uint32_t i = 0; i < 9; ++i) v.push_back(HashKey{i, i + 100});
+    CHECK(v.size() == 9);
+    // Every element survives every reallocation, in order. A grow that copied the
+    // wrong count or the wrong buffer shows up here and nowhere else.
+    for (std::uint32_t i = 0; i < 9; ++i) {
+        CHECK(v[i].left_index == i);
+        CHECK(v[i].right_index == i + 100);
+    }
+}
+
+static void test_small_vec_copies_are_independent() {
+    std::printf("test_small_vec_copies_are_independent\n");
+    using db25::physical::SmallVec;
+    // Both cases, because they take different paths: one copies the inline
+    // buffer, the other allocates.
+    for (const std::uint32_t n : {std::uint32_t{2}, std::uint32_t{7}}) {
+        SmallVec<HashKey, 2> a;
+        for (std::uint32_t i = 0; i < n; ++i) a.push_back(HashKey{i, i});
+        SmallVec<HashKey, 2> b = a;
+        CHECK(a == b);
+        b[0] = HashKey{99, 99};
+        // A copy that shared the heap buffer would change `a` too - which in the
+        // memo would be one candidate's keys changing when another's were edited.
+        CHECK(a[0].left_index == 0);
+        CHECK(!(a == b));
+
+        SmallVec<HashKey, 2> c;
+        c.push_back(HashKey{7, 7});
+        c = a;
+        CHECK(c == a);
+        c = c;  // NOLINT: self-assignment is exactly what is being checked
+        CHECK(c == a);
+    }
+}
+
+static void test_small_vec_moves_leave_the_source_empty() {
+    std::printf("test_small_vec_moves_leave_the_source_empty\n");
+    using db25::physical::SmallVec;
+    for (const std::uint32_t n : {std::uint32_t{2}, std::uint32_t{7}}) {
+        SmallVec<HashKey, 2> a;
+        for (std::uint32_t i = 0; i < n; ++i) a.push_back(HashKey{i, i});
+        SmallVec<HashKey, 2> b = std::move(a);
+        CHECK(b.size() == n);
+        CHECK(b[n - 1].left_index == n - 1);
+        CHECK(a.empty());  // NOLINT: reading a moved-from object is the contract here
+
+        SmallVec<HashKey, 2> c;
+        c.push_back(HashKey{5, 5});
+        c = std::move(b);
+        CHECK(c.size() == n);
+        CHECK(b.empty());  // NOLINT
+    }
+}
+
+static void test_small_vec_equality_ignores_where_the_elements_live() {
+    std::printf("test_small_vec_equality_ignores_where_the_elements_live\n");
+    using db25::physical::SmallVec;
+    SmallVec<HashKey, 2> inlined;
+    inlined.push_back(HashKey{1, 2});
+    inlined.push_back(HashKey{3, 4});
+    SmallVec<HashKey, 2> spilled;
+    spilled.reserve(16);  // forces the heap buffer without adding elements
+    spilled.push_back(HashKey{1, 2});
+    spilled.push_back(HashKey{3, 4});
+    // Two key lists naming the same columns ARE the same key list, and a memo
+    // group key compares them - so equality must not depend on storage.
+    CHECK(inlined == spilled);
+    CHECK(spilled == inlined);
+    spilled.push_back(HashKey{5, 6});
+    CHECK(!(inlined == spilled));
+}
+
 int main() {
+    test_small_vec_holds_its_elements_inline_and_spilled();
+    test_small_vec_copies_are_independent();
+    test_small_vec_moves_leave_the_source_empty();
+    test_small_vec_equality_ignores_where_the_elements_live();
     test_render_carries_structure();
     test_memo_extracts_to_same_render();
     test_extract_without_winner_fails();

@@ -193,7 +193,7 @@ static void test_enforcers_render() {
 // what enforcement costs, the derivation is what can save a later Sort.
 static void test_mergejoin_requires_and_derives_order() {
     std::printf("test_mergejoin_requires_and_derives_order\n");
-    const std::vector<HashKey> keys = {{0, 1}};
+    const HashKeyVec keys = {{0, 1}};
 
     // Requires: left sorted on its key column, right sorted on its own.
     const auto reqs = required_input_properties(PhysicalOp::MergeJoin, keys);
