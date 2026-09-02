@@ -223,6 +223,7 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     node->grouping_sets = g.grouping_sets;
     node->scan_format = ge.scan_format;
     node->scan_freshness = ge.scan_freshness;
+    if (g.scan_distribution != nullptr) node->scan_distribution = *g.scan_distribution;
     node->predicate = g.predicate;
     node->residual = ge.residual;
     // A Project's expressions and an Aggregate's payload share one vector on the

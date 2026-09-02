@@ -1,5 +1,7 @@
 #include "db25/physical/properties.hpp"
 
+#include <utility>
+
 #include <cstddef>
 #include <span>
 #include <utility>
@@ -66,15 +68,119 @@ bool satisfies(const PhysicalProperties& provided, const PhysicalProperties& req
     if (required.format != StorageFormat::Any && required.format != provided.format) {
         return false;
     }
+    if (!distribution_satisfies(provided.distribution, required.distribution)) return false;
     return sort_prefix(provided.sort, required.sort);
 }
 
 PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
                              StorageFormat scan_format,
                              std::span<const PhysicalProperties> input_props,
-                             Freshness scan_freshness, std::span<const SortKey> sort_keys) {
+                             Freshness scan_freshness, std::span<const SortKey> sort_keys,
+                             Distribution scan_distribution, std::uint32_t group_key_count) {
     const auto in = [&](std::size_t i) {
         return i < input_props.size() ? input_props[i] : PhysicalProperties{};
+    };
+    // Where the OUTPUT rows live. Derived alongside everything else and then
+    // applied at the end, so each case below can stay about the one thing it is
+    // really deciding.
+    //
+    // The DEFAULT is the first input's distribution, which is right for every
+    // operator that reshapes rows without moving them - a filter, a projection, a
+    // limit, a sort within each node. The cases that differ say so.
+    const auto row_preserving = [&]() { return in(0).distribution; };
+    Distribution dist = input_props.empty() ? Distribution{DistributionKind::Single, {}}
+                                            : row_preserving();
+    switch (op) {
+        case PhysicalOp::SeqScan:
+            dist = scan_distribution;
+            break;
+        case PhysicalOp::ValuesScan:
+        case PhysicalOp::WorkingTableScan:
+            // Literal rows, and the working table of a recursion this plan is
+            // running: both live where the plan runs.
+            dist = Distribution{DistributionKind::Single, {}};
+            break;
+        case PhysicalOp::HashJoin:
+        case PhysicalOp::MergeJoin:
+        case PhysicalOp::NestedLoopJoin: {
+            // A join's inputs arrive co-located on the keys (see
+            // required_input_properties), so its output is partitioned on them
+            // too - and the LEFT key indices are also output indices, because a
+            // join's output is left ++ right.
+            if (keys.empty()) {
+                // A cross product has no key to partition on. Its inputs were
+                // required Single, so its output is.
+                dist = Distribution{DistributionKind::Single, {}};
+            } else {
+                Distribution d{DistributionKind::Hashed, {}};
+                for (const HashKey& k : keys) d.keys.push_back(k.left_index);
+                dist = d;
+            }
+            break;
+        }
+        case PhysicalOp::HashSemiJoin:
+        case PhysicalOp::HashAntiJoin:
+        case PhysicalOp::NestedLoopSemiJoin:
+        case PhysicalOp::NestedLoopAntiJoin:
+            // A subset of the LEFT input's rows, so however the left was
+            // partitioned, the survivors still are.
+            dist = in(0).distribution;
+            break;
+        case PhysicalOp::HashAggregate:
+        case PhysicalOp::StreamingAggregate:
+        case PhysicalOp::HashGroupingSets: {
+            if (group_key_count == 0) {
+                // A scalar aggregate is exactly one row, and one row is in one
+                // place. Its input was required Single for the same reason: a
+                // partial sum per node is not a sum.
+                dist = Distribution{DistributionKind::Single, {}};
+            } else {
+                // The output is [keys..., aggregates...], so the grouping columns
+                // ARE output columns 0..n-1, and the groups landed on the node
+                // their key hashed to.
+                Distribution d{DistributionKind::Hashed, {}};
+                for (std::uint32_t i = 0; i < group_key_count; ++i) d.keys.push_back(i);
+                dist = d;
+            }
+            break;
+        }
+        case PhysicalOp::HashDistinct:
+        case PhysicalOp::StreamingDistinct: {
+            // De-duplication is over every output column, and its input arrived
+            // partitioned on them, so its output still is.
+            Distribution d{DistributionKind::Hashed, {}};
+            for (std::uint32_t i = 0; i < in(0).sort.size(); ++i) d.keys.push_back(i);
+            if (d.keys.empty()) d = in(0).distribution;
+            dist = d;
+            break;
+        }
+        case PhysicalOp::UnionAll:
+        case PhysicalOp::HashSetOp:
+        case PhysicalOp::RecursiveFixpoint:
+        case PhysicalOp::CreateTableAs:
+        case PhysicalOp::Insert:
+        case PhysicalOp::Update:
+        case PhysicalOp::Delete:
+            // All required Single of their inputs (see required_input_properties),
+            // so all produce Single. Distributed set operations, distributed
+            // recursion and distributed writes are each their own increment; the
+            // requirement is what makes saying so here honest rather than
+            // optimistic.
+            dist = Distribution{DistributionKind::Single, {}};
+            break;
+        case PhysicalOp::Exchange:
+            // Filled in by derive() from the node's own target, exactly as
+            // FormatConvert's format is - an enforcer's effect is its definition.
+            break;
+        default:
+            break;  // row-preserving: the default above
+    }
+    // Every `return` below builds the order / format / freshness triple this
+    // operator provides; `with` stamps the distribution derived above onto it, so
+    // no case has to remember to, and a new case cannot forget.
+    const auto with = [&](PhysicalProperties p) {
+        p.distribution = dist;
+        return p;
     };
     // Staleness propagates upward and never washes out: anything derived from a
     // lagging copy is itself lagging.
@@ -89,21 +195,21 @@ PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
         case PhysicalOp::SeqScan:
             // A base scan produces the table's stored format, in no guaranteed
             // order, as fresh as the copy it reads.
-            return PhysicalProperties{{}, scan_format, scan_freshness};
+            return with(PhysicalProperties{{}, scan_format, scan_freshness});
         case PhysicalOp::Filter:
         case PhysicalOp::Project:
             // Both drop or reshape columns but preserve order and format. (Project
             // preserves conservatively in Increment 1; a later increment tracks
             // whether the projection actually keeps the sort columns.)
-            return in(0);
+            return with(in(0));
         case PhysicalOp::HashJoin:
             // Builds a hash table: output order is not guaranteed.
-            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
+            return with(PhysicalProperties{{}, StorageFormat::Row, combined_freshness()});
         case PhysicalOp::NestedLoopJoin:
             // Emits pairs in left-outer-loop order. That IS the left input's
             // order, but claiming it would be claiming a property of a specific
             // execution strategy; until the engine guarantees it, derive nothing.
-            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
+            return with(PhysicalProperties{{}, StorageFormat::Row, combined_freshness()});
         case PhysicalOp::MergeJoin: {
             // Consumes both inputs in key order and emits in that same order, so
             // the join keys' order survives - the property that can save a later
@@ -113,20 +219,20 @@ PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
             for (const HashKey& k : keys) p.sort.push_back(SortKey{k.left_index, false});
             p.format = StorageFormat::Row;
             p.freshness = combined_freshness();
-            return p;
+            return with(p);
         }
         case PhysicalOp::Sort:
             // Establishes ITS order - the whole point of the operator - and
             // preserves the child's format and freshness.
-            return PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, in(0).format,
-                                      in(0).freshness};
+            return with(PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, in(0).format,
+                                      in(0).freshness});
         case PhysicalOp::FormatConvert:
             // Changes the format to its target (filled in by the caller); preserves order.
-            return PhysicalProperties{in(0).sort, StorageFormat::Any, in(0).freshness};
+            return with(PhysicalProperties{in(0).sort, StorageFormat::Any, in(0).freshness});
         case PhysicalOp::HashAggregate:
             // Builds a hash table on the grouping keys: the output comes out in
             // hash-bucket order, which is no order at all. Same as a HashJoin.
-            return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
+            return with(PhysicalProperties{{}, StorageFormat::Row, in(0).freshness});
         case PhysicalOp::StreamingAggregate:
             // Consumes its input in grouping-key order and emits one row per group
             // as each group closes, so that order SURVIVES - the property that can
@@ -134,8 +240,8 @@ PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
             // `sort_keys` is the grouping order here, on the same footing as it is
             // the established order for a Sort: in both cases it is the ordered key
             // set this operator works in.
-            return PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, StorageFormat::Row,
-                                      in(0).freshness};
+            return with(PhysicalProperties{{sort_keys.begin(), sort_keys.end()}, StorageFormat::Row,
+                                      in(0).freshness});
         case PhysicalOp::HashSemiJoin:
         case PhysicalOp::HashAntiJoin:
         case PhysicalOp::NestedLoopSemiJoin:
@@ -146,17 +252,17 @@ PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
             // neither, because both are properties of an execution strategy the
             // engine has not yet promised. Consistency matters more than the one
             // Sort it might save.
-            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
+            return with(PhysicalProperties{{}, StorageFormat::Row, combined_freshness()});
         case PhysicalOp::HashGroupingSets:
             // One hash table per grouping set, emitted set by set: no order.
-            return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
+            return with(PhysicalProperties{{}, StorageFormat::Row, in(0).freshness});
         case PhysicalOp::HashDistinct:
             // A hash table on every output column: emits in bucket order.
-            return PhysicalProperties{{}, StorageFormat::Row, in(0).freshness};
+            return with(PhysicalProperties{{}, StorageFormat::Row, in(0).freshness});
         case PhysicalOp::StreamingDistinct:
             // Collapses adjacent duplicates in one pass, so the input's order -
             // which it REQUIRED - survives.
-            return in(0);
+            return with(in(0));
         case PhysicalOp::UnionAll:
         case PhysicalOp::HashSetOp: {
             // Two streams meeting produce no single order, even when both inputs
@@ -167,45 +273,58 @@ PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
             for (const PhysicalProperties& p : input_props) {
                 if (p.freshness == Freshness::Stale) f = Freshness::Stale;
             }
-            return PhysicalProperties{{}, StorageFormat::Row, f};
+            return with(PhysicalProperties{{}, StorageFormat::Row, f});
         }
         case PhysicalOp::ValuesScan:
             // Literal rows: in the order written, but that is not an order over
             // any COLUMN, so there is no sort property to claim. Always fresh -
             // there is no stored copy that could lag.
-            return PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
+            return with(PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh});
         case PhysicalOp::Window:
             // Appends columns to rows it emits in the order it received them, so
             // everything its input provided survives. Its input is REQUIRED sorted
             // by (partition ++ order), so that order is what survives - stating it
             // as `in(0)` rather than restating the keys keeps one source of truth.
-            return in(0);
+            return with(in(0));
         case PhysicalOp::Limit:
             // Takes a contiguous window of its input's rows, so everything about
             // them is preserved: still in the same order, same format, same
             // freshness. What it does NOT preserve is WHICH rows - see
             // pushdown_requirement.
-            return in(0);
+            return with(in(0));
         case PhysicalOp::RecursiveFixpoint:
             // The anchor's rows, then each iteration's, concatenated. Even if
             // every iteration emitted its rows in some order, the concatenation of
             // iterations is not sorted on anything - the second iteration's rows
             // follow the first's whatever their values. So: no order, from either
             // input, ever.
-            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
+            return with(PhysicalProperties{{}, StorageFormat::Row, combined_freshness()});
         case PhysicalOp::WorkingTableScan:
             // Reads rows this same query produced an iteration ago. Always FRESH -
             // not as a convention but as a fact: they were computed here, and there
             // is no stored copy that could lag. No order: the fixpoint above
             // guarantees none, and this reads what it wrote.
-            return PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
+            return with(PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh});
         case PhysicalOp::CreateTableAs:
             // Passes its input's rows through as it writes them, so their order and
             // freshness survive to whatever reads this node's output. The FORMAT is
             // the new table's, and a table this statement is creating is written in
             // the row format; a columnar copy is a storage decision made after the
             // table exists, not one this operator gets to make.
-            return PhysicalProperties{in(0).sort, StorageFormat::Row, in(0).freshness};
+            return with(PhysicalProperties{in(0).sort, StorageFormat::Row, in(0).freshness});
+        case PhysicalOp::Exchange:
+            // Moves rows between nodes, and NO ORDER SURVIVES THAT. Rows arriving
+            // from several senders interleave however the network delivers them,
+            // and that is true of a gather as much as of a repartition - one
+            // receiver merging many streams is still merging them. An
+            // order-preserving gather is a real thing and a later operator; saying
+            // this one preserves order would let a MergeJoin read an input it
+            // believes is sorted and is not.
+            //
+            // The FORMAT and the FRESHNESS do survive: moving a row does not
+            // rewrite it or make it staler. What the exchange ESTABLISHES is
+            // applied by derive(), like FormatConvert's format.
+            return with(PhysicalProperties{{}, in(0).format, in(0).freshness});
         case PhysicalOp::Insert:
         case PhysicalOp::Update:
         case PhysicalOp::Delete:
@@ -215,9 +334,9 @@ PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
             // the order rows are written in is the storage layer's business and
             // claiming it would be claiming a property of an execution strategy -
             // the same line drawn at the nested loop and the semi joins.
-            return PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
+            return with(PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh});
     }
-    return PhysicalProperties{};
+    return with(PhysicalProperties{});
 }
 
 bool is_applicable(PhysicalOp op, const HashKeyVec& keys, ast::JoinType join_kind,
@@ -317,8 +436,85 @@ std::optional<PhysicalProperties> pushdown_requirement(PhysicalOp op,
 
 std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
                                                           const HashKeyVec& keys,
-                                                          std::span<const SortKey> group_sort) {
+                                                          std::span<const SortKey> group_sort,
+                                                          std::uint32_t group_key_count) {
     std::vector<PhysicalProperties> reqs(expected_arity(op));
+
+    // WHERE THE ROWS HAVE TO BE. Same machinery as the sort order above it: state
+    // the requirement, let the search cost the Exchange that would establish it,
+    // and let it choose. On a single-node catalog - which is the default, and DB25
+    // today - every one of these is already satisfied and no Exchange appears.
+    //
+    // A JOIN needs its two inputs CO-LOCATED on the join keys: a row can only be
+    // matched against a row on the same node. Each side is required hashed on ITS
+    // OWN key columns, which is why the two requirements below are built from
+    // different halves of the same HashKey.
+    if (op == PhysicalOp::HashJoin || op == PhysicalOp::MergeJoin ||
+        op == PhysicalOp::NestedLoopJoin || op == PhysicalOp::HashSemiJoin ||
+        op == PhysicalOp::HashAntiJoin || op == PhysicalOp::NestedLoopSemiJoin ||
+        op == PhysicalOp::NestedLoopAntiJoin) {
+        if (keys.empty()) {
+            // No key to partition on: a cross product pairs every row with every
+            // other, which is only correct if they are all in one place.
+            for (PhysicalProperties& r : reqs) {
+                r.distribution = Distribution{DistributionKind::Single, {}};
+            }
+        } else if (reqs.size() == 2) {
+            Distribution left{DistributionKind::Hashed, {}};
+            Distribution right{DistributionKind::Hashed, {}};
+            for (const HashKey& k : keys) {
+                left.keys.push_back(k.left_index);
+                right.keys.push_back(k.right_index);
+            }
+            reqs[0].distribution = std::move(left);
+            reqs[1].distribution = std::move(right);
+        }
+    }
+
+    // An aggregate needs every row of a group on one node, or it computes a
+    // partial per node and calls it the answer. A SCALAR aggregate is the extreme
+    // case of that: one group, so one node.
+    if (op == PhysicalOp::HashAggregate || op == PhysicalOp::StreamingAggregate ||
+        op == PhysicalOp::HashGroupingSets) {
+        Distribution d{DistributionKind::Single, {}};
+        if (group_key_count != 0) {
+            d = Distribution{DistributionKind::Hashed, {}};
+            // The grouping keys are the first `group_key_count` entries of
+            // `group_sort` when they are expressible as columns at all; when they
+            // are not (GROUP BY a + b), there is no column to partition on and
+            // Single is the only correct requirement.
+            if (group_sort.size() >= group_key_count) {
+                for (std::uint32_t i = 0; i < group_key_count; ++i) {
+                    d.keys.push_back(group_sort[i].column);
+                }
+            } else {
+                d = Distribution{DistributionKind::Single, {}};
+            }
+        }
+        if (!reqs.empty()) reqs[0].distribution = std::move(d);
+    }
+
+    // DISTINCT is over every output column, so duplicates must meet.
+    if (op == PhysicalOp::HashDistinct || op == PhysicalOp::StreamingDistinct) {
+        Distribution d{DistributionKind::Hashed, {}};
+        for (std::uint32_t i = 0; i < group_sort.size(); ++i) d.keys.push_back(group_sort[i].column);
+        if (d.keys.empty()) d = Distribution{DistributionKind::Single, {}};
+        if (!reqs.empty()) reqs[0].distribution = std::move(d);
+    }
+
+    // Set operations, recursion and the write path all require Single, and each
+    // for its own reason rather than by a blanket rule: a hash set operation has
+    // to see both sides' duplicates together, a fixpoint's working table is one
+    // table, and a distributed write is a transaction problem rather than a
+    // planning one. Each is its own increment; requiring Single is what makes
+    // saying that honest instead of optimistic.
+    if (op == PhysicalOp::UnionAll || op == PhysicalOp::HashSetOp ||
+        op == PhysicalOp::RecursiveFixpoint || op == PhysicalOp::CreateTableAs ||
+        op == PhysicalOp::Insert || op == PhysicalOp::Update || op == PhysicalOp::Delete) {
+        for (PhysicalProperties& r : reqs) {
+            r.distribution = Distribution{DistributionKind::Single, {}};
+        }
+    }
 
     // The reference engine's join operators consume ROW-format input (they
     // materialize rows into a hash table or merge row streams), so a columnar
@@ -410,10 +606,16 @@ PhysicalProperties derive(const PhysicalNode& node) {
     for (const auto& c : node.children) input_props.push_back(derive(*c));
 
     PhysicalProperties p = derive_op(node.op, node.hash_keys, node.scan_format, input_props,
-                                    node.scan_freshness, node.sort_keys);
+                                    node.scan_freshness, node.sort_keys,
+                                    node.scan_distribution,
+                                    static_cast<std::uint32_t>(node.group_keys.size()));
     // FormatConvert alone still carries its established property post-hoc; see the
     // note on derive_op. It is never a memo group, so nothing else has to agree.
     if (node.op == PhysicalOp::FormatConvert) p.format = node.target_format;
+    // The same post-hoc treatment, for the same reason: an Exchange is only ever
+    // built by enforce(), never a memo group, so nothing asks what it provides
+    // before it exists.
+    if (node.op == PhysicalOp::Exchange) p.distribution = node.target_distribution;
     return p;
 }
 
@@ -429,7 +631,21 @@ PhysicalNodePtr enforce(PhysicalNodePtr input, const PhysicalProperties& require
     }
     PhysicalNodePtr node = std::move(input);
 
-    // Format first, so the sort (if also needed) runs on the required format.
+    // Distribution FIRST, before the format conversion and the sort. Moving rows
+    // is the expensive step, and doing it first means the sort that follows runs
+    // on each node's own share rather than being done and then scattered - and a
+    // sort's order does not survive a repartition anyway, so the other order
+    // would establish an order and then destroy it.
+    if (!distribution_satisfies(have.distribution, required.distribution)) {
+        node = make_exchange(std::move(node), required.distribution);
+        have.distribution = required.distribution;
+        // No order survives an exchange - see derive_op - so a sort that was
+        // already satisfied has to be re-established above it. Which is exactly
+        // why the exchange goes FIRST: doing it the other way round would
+        // establish an order and then destroy it.
+        have.sort.clear();
+    }
+    // Format next, so the sort (if also needed) runs on the required format.
     if (required.format != StorageFormat::Any && have.format != required.format) {
         node = make_format_convert(std::move(node), required.format);
         have.format = required.format;  // what a FormatConvert establishes

@@ -192,6 +192,13 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             // decides WHICH rows an UPDATE or DELETE touches happened below, in
             // the Filter that produced this input.
             return in(0);
+        case PhysicalOp::Exchange:
+            // Moving rows does not create or destroy them. A BROADCAST puts a
+            // copy on every node, which is more DATA MOVED but not more rows in
+            // the relation - the relation is still its input's rows, and an
+            // operator above it that counted them n times would over-estimate
+            // everything above THAT. The copies are priced, not counted.
+            return in(0);
     }
     return 0.0;
 }
@@ -205,7 +212,8 @@ double input_evaluations(PhysicalOp op, std::size_t index,
 
 double operator_cost(PhysicalOp op, std::span<const double> input_rows, double out_rows,
                      const CalibrationProfile& cal, StorageFormat scan_format,
-                     bool build_right, std::uint32_t grouping_sets) {
+                     bool build_right, std::uint32_t grouping_sets,
+                     std::uint32_t exchange_fanout) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan:
@@ -279,6 +287,17 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
         case PhysicalOp::CreateTableAs:
         case PhysicalOp::Insert:
         case PhysicalOp::Update:
+        case PhysicalOp::Exchange:
+            // Priced on the rows that MOVE, which for a broadcast is every row to
+            // every node. This is the one cost in the model that is not about the
+            // CPU, and the one an operator can pay without doing any work of its
+            // own - which is exactly why it has to be charged, or a plan would
+            // scatter rows for free.
+            //
+            // A gather and a repartition each move every row once. The node count
+            // is one by default, so on a single-node database all three cost the
+            // same and none of them is ever inserted.
+            return out_rows * cal.exchange_row * static_cast<double>(exchange_fanout);
         case PhysicalOp::Delete:
             // One coefficient for all four, and that is a statement rather than
             // laziness: this model has no measurement that says a delete is
@@ -302,6 +321,21 @@ double enforcement_cost(const PhysicalProperties& provided, const PhysicalProper
     }
     double c = 0.0;
     PhysicalProperties after = provided;
+    // The exchange first, matching the order enforce() inserts them in - so the
+    // price a candidate is charged is the price of the plan that gets built.
+    if (!distribution_satisfies(provided.distribution, required.distribution)) {
+        const double one[1] = {rows};
+        const std::uint32_t fanout =
+            required.distribution.kind == DistributionKind::Broadcast ? cal.cluster_nodes : 1u;
+        c += operator_cost(PhysicalOp::Exchange, one, rows, cal, StorageFormat::Row, true, 0,
+                           fanout);
+        after.distribution = required.distribution;
+        // And the exchange destroys the order, so a sort that was already
+        // satisfied has to be paid for now. Charging the sort against the
+        // PRE-exchange order would under-price this plan - and the plan that gets
+        // BUILT does pay it, so the two would disagree.
+        after.sort.clear();
+    }
     if (required.format != StorageFormat::Any && required.format != provided.format) {
         const double one[1] = {rows};
         c += operator_cost(PhysicalOp::FormatConvert, one, rows, cal);
@@ -343,9 +377,16 @@ double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
         child_cost += cost_of(c, cal, card) * input_evaluations(node.op, i, card);
         input_rows.push_back(card.rows(c));
     }
+    // A broadcast sends every row to every node; everything else sends it once.
+    const std::uint32_t fanout =
+        (node.op == PhysicalOp::Exchange &&
+         node.target_distribution.kind == DistributionKind::Broadcast)
+            ? cal.cluster_nodes
+            : 1u;
     return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal,
                                       node.scan_format, node.build_right,
-                                      static_cast<std::uint32_t>(node.grouping_sets.size()));
+                                      static_cast<std::uint32_t>(node.grouping_sets.size()),
+                                      fanout);
 }
 
 }  // namespace db25::physical

@@ -83,9 +83,20 @@ struct CalibrationProfile {
     // it is a durable write, with whatever the storage layer does around it - and
     // that ratio is what stops a plan being chosen as if materializing were free.
     double table_write_row = 2.0;
+    // Move one row across the network. An order of magnitude above the dearest
+    // CPU coefficient here, and deliberately: the whole reason distribution is a
+    // property the search reasons about is that moving a row costs far more than
+    // touching one, so a plan that avoids the network should win by a wide margin
+    // rather than a narrow one. Only the ratio matters, and this ratio says
+    // "the network is not the CPU".
+    double exchange_row = 12.0;
     // Hardware facts (informational today; richer costing consumes them later).
     std::uint32_t simd_width = 8;
     std::uint32_t cache_line = 64;
+    // How many nodes a broadcast has to reach. ONE by default, which is DB25
+    // today - and at one node a broadcast costs exactly what a gather does,
+    // which is correct rather than a degenerate case to apologize for.
+    std::uint32_t cluster_nodes = 1;
 };
 
 // Where a CalibrationProfile comes from (design D10). Live measures the host;
@@ -184,11 +195,17 @@ struct CardinalityModel {
 [[nodiscard]] double input_evaluations(PhysicalOp op, std::size_t index,
                                        const CardinalityModel& card) noexcept;
 
+// `exchange_fanout` is how many COPIES of each row an Exchange moves: one for a
+// gather or a repartition, one per node for a broadcast. It is a parameter rather
+// than something read off the node so that both cost forms - the tree and the
+// memo's enforcement estimate - go through this one formula, which is the "one
+// cost model" invariant (D3) made structural rather than intended.
 [[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
                                    StorageFormat scan_format = StorageFormat::Row,
                                    bool build_right = true,
-                                   std::uint32_t grouping_sets = 0);
+                                   std::uint32_t grouping_sets = 0,
+                                   std::uint32_t exchange_fanout = 1);
 
 // What it would cost to make `rows` rows satisfying `provided` also satisfy
 // `required` - i.e. the enforcers that would have to be inserted. Zero when the

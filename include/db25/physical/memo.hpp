@@ -164,6 +164,13 @@ struct Group {
     // vector-of-ColumnSchema copy per group, and the group's schema is only ever
     // read to fill the extracted node's own copy - so the copy was pure duplication.
     // The referent must outlive the memo.
+    // Scan: how the table's rows are spread across the cluster. BORROWED from
+    // the DistributionCatalog, on the same contract as `table_name` above and for
+    // the same reason - a Distribution owns its key list, and owning one per
+    // group pushed sizeof(Group) past the deque cliff, which the static_assert
+    // below caught on the line that did it. Null means the default: single-node.
+    const Distribution* scan_distribution = nullptr;
+
     const Schema* output = nullptr;
     // Estimated output rows of this group. Every group-expression in a group is
     // semantically equivalent, so they all produce the same cardinality - it is a

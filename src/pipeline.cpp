@@ -116,6 +116,14 @@ EdgeKind edge_kind(PhysicalOp op, std::size_t index, bool build_right) noexcept 
         // right input and is recorded the same way.
         case PhysicalOp::RecursiveFixpoint:
             return index == 0 ? EdgeKind::Streaming : EdgeKind::Rescanned;
+
+        // An exchange is where a pipeline ENDS and another begins: the sending
+        // side is one loop and the receiving side another, on a different node.
+        // Nothing is buffered - rows go out as they are produced - so this is
+        // `separate` rather than `materialized`, the same distinction a merge
+        // join's right input gets.
+        case PhysicalOp::Exchange:
+            return EdgeKind::Separate;
     }
     return EdgeKind::Streaming;
 }

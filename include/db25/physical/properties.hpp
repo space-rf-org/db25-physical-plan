@@ -10,6 +10,7 @@
 // machinery as sort order, not a special case.
 #include "db25/physical/physical_plan.hpp"
 
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
@@ -23,6 +24,10 @@ struct PhysicalProperties {
     // correctness constraint - no enforcer can establish it, so a subplan that
     // cannot provide it is discarded rather than fixed up.
     Freshness freshness = Freshness::Any;
+    // How the rows are spread across a cluster. Enforceable, unlike freshness -
+    // an Exchange establishes it - and priced, unlike nothing else here, in
+    // NETWORK terms rather than CPU ones.
+    Distribution distribution;
 };
 
 // Value equality. Requirements are the KEY a group's winners are memoized under
@@ -54,11 +59,19 @@ struct PhysicalProperties {
 // FormatConvert's target format is still applied by the tree-form derive() below
 // rather than passed here, because a FormatConvert is only ever built by
 // enforce() - it is never a memo group, so no search ever asks what it provides.
+// `scan_distribution` is the table's layout, from the DistributionCatalog, on
+// exactly the same footing as `scan_format`. `group_key_count` is how many
+// leading OUTPUT columns of a grouping operator are its keys - the columns its
+// result ends up partitioned on - which cannot be read off `sort_keys`, since
+// those are empty for a grouping key that is not a plain column reference.
 [[nodiscard]] PhysicalProperties derive_op(PhysicalOp op, const HashKeyVec& keys,
                                            StorageFormat scan_format,
                                            std::span<const PhysicalProperties> input_props,
                                            Freshness scan_freshness = Freshness::Fresh,
-                                           std::span<const SortKey> sort_keys = {});
+                                           std::span<const SortKey> sort_keys = {},
+                                           Distribution scan_distribution =
+                                               Distribution{DistributionKind::Single, {}},
+                                           std::uint32_t group_key_count = 0);
 
 // Is `op` a legal implementation for a join with these equi-keys? A MergeJoin
 // merges two sorted streams ON THE JOIN KEYS, so with no keys there is nothing to
@@ -88,7 +101,8 @@ struct PhysicalProperties {
 // every-column order. One name because it is one idea.
 [[nodiscard]] std::vector<PhysicalProperties> required_input_properties(
     PhysicalOp op, const HashKeyVec& keys,
-    std::span<const SortKey> group_sort = {});
+    std::span<const SortKey> group_sort = {},
+    std::uint32_t group_key_count = 0);
 
 // The physical properties of the output of `node`, derived bottom-up.
 [[nodiscard]] PhysicalProperties derive(const PhysicalNode& node);
