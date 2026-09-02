@@ -186,6 +186,26 @@ PhysicalProperties derive_op(PhysicalOp op, const std::vector<HashKey>& keys,
             // freshness. What it does NOT preserve is WHICH rows - see
             // pushdown_requirement.
             return in(0);
+        case PhysicalOp::RecursiveFixpoint:
+            // The anchor's rows, then each iteration's, concatenated. Even if
+            // every iteration emitted its rows in some order, the concatenation of
+            // iterations is not sorted on anything - the second iteration's rows
+            // follow the first's whatever their values. So: no order, from either
+            // input, ever.
+            return PhysicalProperties{{}, StorageFormat::Row, combined_freshness()};
+        case PhysicalOp::WorkingTableScan:
+            // Reads rows this same query produced an iteration ago. Always FRESH -
+            // not as a convention but as a fact: they were computed here, and there
+            // is no stored copy that could lag. No order: the fixpoint above
+            // guarantees none, and this reads what it wrote.
+            return PhysicalProperties{{}, StorageFormat::Row, Freshness::Fresh};
+        case PhysicalOp::CreateTableAs:
+            // Passes its input's rows through as it writes them, so their order and
+            // freshness survive to whatever reads this node's output. The FORMAT is
+            // the new table's, and a table this statement is creating is written in
+            // the row format; a columnar copy is a storage decision made after the
+            // table exists, not one this operator gets to make.
+            return PhysicalProperties{in(0).sort, StorageFormat::Row, in(0).freshness};
     }
     return PhysicalProperties{};
 }
@@ -305,7 +325,12 @@ std::vector<PhysicalProperties> required_input_properties(PhysicalOp op,
         op == PhysicalOp::UnionAll || op == PhysicalOp::HashSetOp ||
         op == PhysicalOp::HashSemiJoin || op == PhysicalOp::HashAntiJoin ||
         op == PhysicalOp::NestedLoopSemiJoin || op == PhysicalOp::NestedLoopAntiJoin ||
-        op == PhysicalOp::HashGroupingSets) {
+        op == PhysicalOp::HashGroupingSets ||
+        // Both write rows: the fixpoint into the working table, the CTAS into the
+        // new table. A table is stored row-wise here, so a columnar subplan
+        // feeding either must be converted, and that conversion is priced like
+        // any other.
+        op == PhysicalOp::RecursiveFixpoint || op == PhysicalOp::CreateTableAs) {
         for (PhysicalProperties& r : reqs) r.format = StorageFormat::Row;
     }
 

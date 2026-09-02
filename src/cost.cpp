@@ -172,8 +172,28 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             return values_rows;
         case PhysicalOp::Limit:
             return limits.rows_out(in(0));
+        case PhysicalOp::RecursiveFixpoint: {
+            // The anchor once, then the recursive term once per iteration. The
+            // iteration count is an assumption, not a derivation - see
+            // CardinalityModel::recursive_iterations.
+            const double all = in(0) + card.recursive_iterations * in(1);
+            // UNION de-duplicates ACROSS iterations, which is also what makes it
+            // terminate on cyclic data; UNION ALL keeps every row.
+            return set_op_deduplicates(set_op) ? all * card.distinct_selectivity : all;
+        }
+        case PhysicalOp::WorkingTableScan:
+            return card.working_table_rows;
+        case PhysicalOp::CreateTableAs:
+            return in(0);  // every row the query produced goes into the new table
     }
     return 0.0;
+}
+
+double input_evaluations(PhysicalOp op, std::size_t index,
+                         const CardinalityModel& card) noexcept {
+    // The recursive term runs once per iteration; the anchor runs once.
+    if (op == PhysicalOp::RecursiveFixpoint && index == 1) return card.recursive_iterations;
+    return 1.0;
 }
 
 double operator_cost(PhysicalOp op, std::span<const double> input_rows, double out_rows,
@@ -241,6 +261,16 @@ double operator_cost(PhysicalOp op, std::span<const double> input_rows, double o
             return out_rows * cal.values_row;
         case PhysicalOp::Limit:
             return out_rows * cal.limit_row;
+        case PhysicalOp::RecursiveFixpoint:
+            // Its own work is the round trip through the working table, once per
+            // row it passes on. The recursive TERM's repeated evaluation is not
+            // here - it is charged where it belongs, by multiplying that input's
+            // own cost; see input_evaluations.
+            return out_rows * cal.recursive_row;
+        case PhysicalOp::WorkingTableScan:
+            return out_rows * cal.working_table_row;
+        case PhysicalOp::CreateTableAs:
+            return out_rows * cal.table_write_row;
     }
     return 0.0;
 }
@@ -290,9 +320,12 @@ double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
     double child_cost = 0.0;
     std::vector<double> input_rows;
     input_rows.reserve(node.children.size());
-    for (const auto& c : node.children) {
-        child_cost += cost_of(*c, cal, card);
-        input_rows.push_back(card.rows(*c));
+    for (std::size_t i = 0; i < node.children.size(); ++i) {
+        const PhysicalNode& c = *node.children[i];
+        // Times the number of times this operator EVALUATES that input - one for
+        // everything but a recursive fixpoint's second child.
+        child_cost += cost_of(c, cal, card) * input_evaluations(node.op, i, card);
+        input_rows.push_back(card.rows(c));
     }
     return child_cost + operator_cost(node.op, input_rows, card.rows(node), cal,
                                       node.scan_format, node.build_right,

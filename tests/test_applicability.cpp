@@ -176,6 +176,14 @@ const std::vector<Precondition>& declared_preconditions() {
         {PhysicalOp::HashAntiJoin, true, false, false, -1},
         {PhysicalOp::NestedLoopSemiJoin, false, false, true, -1},
         {PhysicalOp::NestedLoopAntiJoin, false, false, true, -1},
+        // The three of Increment 3.9a have NO precondition, and that is a claim
+        // rather than an omission: each is the sole implementation of its logical
+        // operator, so there is nothing for applicability to choose between. A
+        // fixpoint is evaluated one way; a working table is read one way; a table
+        // is written one way.
+        {PhysicalOp::RecursiveFixpoint},
+        {PhysicalOp::WorkingTableScan},
+        {PhysicalOp::CreateTableAs},
     };
     return v;
 }
