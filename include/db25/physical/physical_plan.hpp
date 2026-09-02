@@ -112,6 +112,13 @@ enum class PhysicalOp : std::uint8_t {
     Insert,
     Update,
     Delete,
+    // The third ENFORCER, alongside Sort and FormatConvert. It moves rows
+    // between nodes to establish a required DISTRIBUTION: repartition by hash,
+    // broadcast a copy everywhere, or gather everything to one place. Like the
+    // other two it is never a memo group - nothing chooses it, it is inserted
+    // where a requirement is unmet - and like them it is priced, so a plan that
+    // needs the network pays for it against one that does not.
+    Exchange,
 };
 
 [[nodiscard]] const char* physical_op_to_string(PhysicalOp op) noexcept;
@@ -124,7 +131,7 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 28> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 29> kAllPhysicalOps = {
     PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
     PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
     PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
@@ -135,7 +142,8 @@ inline constexpr std::array<PhysicalOp, 28> kAllPhysicalOps = {
     PhysicalOp::NestedLoopSemiJoin, PhysicalOp::NestedLoopAntiJoin,
     PhysicalOp::HashGroupingSets, PhysicalOp::RecursiveFixpoint,
     PhysicalOp::WorkingTableScan, PhysicalOp::CreateTableAs,
-    PhysicalOp::Insert, PhysicalOp::Update, PhysicalOp::Delete};
+    PhysicalOp::Insert, PhysicalOp::Update, PhysicalOp::Delete,
+    PhysicalOp::Exchange};
 
 // Is `op` a nested-loop family member - the implementations that re-evaluate
 // their right input per left row, and so are the only ones that can serve a
@@ -187,6 +195,52 @@ enum class Freshness : std::uint8_t {
     Stale,  // may lag (a replica); can never satisfy a Fresh requirement
 };
 [[nodiscard]] const char* freshness_to_string(Freshness f) noexcept;
+
+// How a relation's rows are spread across the nodes of a cluster (design D4's
+// sibling: the same machinery as sort order and storage format, one dimension
+// over).
+//
+// DB25 is a single-node database today, so a table nobody says otherwise about
+// is `Single` and no plan contains an Exchange. The vocabulary exists now
+// because distribution is a PROPERTY - derived, required, enforced and priced -
+// and retrofitting a property into a search is a different job from adding one.
+enum class DistributionKind : std::uint8_t {
+    Any,        // as a requirement: don't care. Never a derived value.
+    Single,     // every row on ONE node
+    Hashed,     // partitioned across nodes by the hash of `keys`
+    Broadcast,  // every node holds a full copy
+};
+[[nodiscard]] const char* distribution_kind_to_string(DistributionKind k) noexcept;
+
+struct Distribution {
+    DistributionKind kind = DistributionKind::Any;
+    // Hashed: the columns whose hash decides the node, as positional indices into
+    // the relation's own schema. Empty for every other kind.
+    //
+    // FOUR INLINE, because a PhysicalProperties is copied per candidate per goal
+    // and a std::vector here reached the heap for the first key. Measured: it
+    // took the dedup query from 77 allocations to 138 - the search copies these
+    // far more often than a plan contains them, which is exactly the shape the
+    // join keys had.
+    SmallVec<std::uint32_t, 4> keys;
+
+    [[nodiscard]] bool operator==(const Distribution& o) const noexcept {
+        return kind == o.kind && keys == o.keys;
+    }
+};
+
+// Does data distributed as `provided` satisfy a requirement for `required`?
+//
+// The interesting rule is the hashed one, and it runs the direction people first
+// guess wrong. Rows partitioned by hash(K') are co-located by K whenever
+// K' IS A SUBSET OF K: two rows agreeing on K also agree on K', so they hash to
+// the same node. Partitioning on FEWER columns is the stronger guarantee.
+//
+// Broadcast satisfies any hashed requirement - every node holds everything, so
+// every pair is co-located, which is exactly why a broadcast join works. Single
+// satisfies it too, for the same reason with one node doing the holding.
+[[nodiscard]] bool distribution_satisfies(const Distribution& provided,
+                                          const Distribution& required) noexcept;
 
 // LIMIT / OFFSET, as a value. The two are independently optional, so a sentinel
 // row count would be indistinguishable from a real one - hence the flags.
@@ -338,6 +392,11 @@ struct PhysicalNode {
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     StorageFormat scan_format = StorageFormat::Row;      // SeqScan: the table's stored format
     Freshness scan_freshness = Freshness::Fresh;         // SeqScan: does this copy lag?
+    // SeqScan: how the table's rows are spread across the cluster. On the node
+    // for the same reason the format and the freshness are: derive() works on a
+    // plan alone, with no catalog to consult, so a catalog fact a scan's output
+    // depends on has to travel with the scan.
+    Distribution scan_distribution{DistributionKind::Single, {}};
     StorageFormat target_format = StorageFormat::Any;    // FormatConvert: the format it produces
     LimitSpec limits;                                    // Limit: LIMIT / OFFSET
     // Aggregate: the GROUP BY key expressions and the aggregate calls, borrowed
@@ -354,6 +413,10 @@ struct PhysicalNode {
     std::uint32_t values_columns = 0;
     // HashGroupingSets: one bitmask per grouping set over `group_keys`.
     std::vector<std::uint64_t> grouping_sets;
+    // Exchange: the distribution it establishes. On the same footing as
+    // FormatConvert's `target_format` - an enforcer records what it produces,
+    // because an executor cannot infer it from the operator name alone.
+    Distribution target_distribution;
     // DML payload, BORROWED from the logical node on the same contract as every
     // expression payload here: the logical plan outlives the physical plan.
     //
@@ -388,5 +451,6 @@ struct PhysicalNode {
 // Sort is both an operator and an enforcer; FormatConvert is only an enforcer.
 [[nodiscard]] PhysicalNodePtr make_sort(PhysicalNodePtr input, std::vector<SortKey> keys);
 [[nodiscard]] PhysicalNodePtr make_format_convert(PhysicalNodePtr input, StorageFormat target);
+[[nodiscard]] PhysicalNodePtr make_exchange(PhysicalNodePtr input, Distribution target);
 
 }  // namespace db25::physical

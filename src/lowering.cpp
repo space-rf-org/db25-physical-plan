@@ -205,6 +205,14 @@ double values_rows_of(const Group& g) {
     return static_cast<double>(g.op_exprs.size() / g.op_split);
 }
 
+// A group's scan distribution, or the single-node default. `scan_distribution` is
+// a BORROWED pointer and null for every operator but a scan, so every reader
+// needs this - the same shape as table_name_of below it.
+Distribution distribution_of(const Group& g) {
+    return g.scan_distribution != nullptr ? *g.scan_distribution
+                                          : Distribution{DistributionKind::Single, {}};
+}
+
 // A group's table name, or the empty string. `table_name` is a BORROWED pointer
 // and null for every operator but a scan, so every reader needs this - returning a
 // reference to a static empty string rather than constructing one per call.
@@ -275,7 +283,8 @@ std::size_t add_candidates(Memo& memo, GroupId g, std::span<const PhysicalOp> ca
                 // into each candidate, and a copy of an ArityVec<PhysicalProperties>
                 // copies the sort vectors inside it. Measured: hoisting made the
                 // budget query WORSE by one allocation, not better.
-                ge.input_reqs = required_input_properties(cand, keys, memo.group(g).sort_keys);
+                ge.input_reqs = required_input_properties(
+                    cand, keys, memo.group(g).sort_keys, memo.group(g).op_split);
                 memo.add_expr(g, std::move(ge));
                 ++added;
             }
@@ -292,6 +301,7 @@ std::size_t add_candidates(Memo& memo, GroupId g, std::span<const PhysicalOp> ca
 // than a bottom-up sweep that happens to consult properties.
 GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
                 const CardinalityModel& card, const StorageCatalog& storage,
+                const DistributionCatalog& distribution,
                 LoweringArena& arena, std::size_t& candidates, std::size_t& shared,
                 std::size_t& joins, std::size_t& regions, std::string& error);
 
@@ -339,6 +349,7 @@ bool split_connects(const JoinRegion& region, std::size_t first, std::size_t spl
 GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region,
                             Memo& memo, const LoweringContext& ctx,
                             const CardinalityModel& card, const StorageCatalog& storage,
+                const DistributionCatalog& distribution,
                             LoweringArena& arena, std::size_t& candidates,
                             std::size_t& shared, std::size_t& joins,
                             std::size_t& regions, std::string& error) {
@@ -369,7 +380,7 @@ GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region
     // so a range's inputs already exist when its candidates are added.
     std::vector<GroupId> gid((nl + 1) * (nl + 1), kInvalidGroup);
     for (std::size_t i = 0; i < nl; ++i) {
-        const GroupId lg = explore(*region.leaves[i], memo, ctx, card, storage, arena,
+        const GroupId lg = explore(*region.leaves[i], memo, ctx, card, storage, distribution, arena,
                                    candidates, shared, joins, regions, error);
         if (lg == kInvalidGroup) return kInvalidGroup;  // error is set
         gid[at(i, i + 1)] = lg;
@@ -459,6 +470,7 @@ GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region
 
 GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
                 const CardinalityModel& card, const StorageCatalog& storage,
+                const DistributionCatalog& distribution,
                 LoweringArena& arena, std::size_t& candidates, std::size_t& shared,
                 std::size_t& joins, std::size_t& regions, std::string& error) {
     // A reorderable join region is planned as a whole rather than node by node:
@@ -469,7 +481,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     if (ctx.reorder_joins && n.op == plan::LogicalOp::Join) {
         JoinRegion region;
         if (collect_join_region(n, region)) {
-            const GroupId g = explore_join_region(n, region, memo, ctx, card, storage, arena,
+            const GroupId g = explore_join_region(n, region, memo, ctx, card, storage, distribution, arena,
                                                   candidates, shared, joins, regions, error);
             if (g != kInvalidGroup) return g;
             if (!error.empty()) return kInvalidGroup;
@@ -486,7 +498,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 
     std::vector<GroupId> inputs;
     for (std::size_t i = 0; i < n.child_count(); ++i) {
-        const GroupId g = explore(*n.child(i), memo, ctx, card, storage, arena, candidates,
+        const GroupId g = explore(*n.child(i), memo, ctx, card, storage, distribution, arena, candidates,
                                   shared, joins, regions, error);
         if (g == kInvalidGroup) return kInvalidGroup;
         inputs.push_back(g);
@@ -507,6 +519,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     switch (n.op) {
         case plan::LogicalOp::Scan:
             payload.table_name = &n.table_name;   // borrowed; the logical node outlives us
+            payload.scan_distribution = distribution.find(n.table_name);
             break;
         case plan::LogicalOp::Filter:
             payload.predicate = n.predicate.get();  // borrowed
@@ -785,6 +798,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     {
         Group& grp = memo.group(g);
         grp.table_name = payload.table_name;
+        grp.scan_distribution = payload.scan_distribution;
         grp.predicate = payload.predicate;
         grp.op_exprs = std::move(payload.op_exprs);
         grp.op_split = payload.op_split;
@@ -976,7 +990,8 @@ struct Optimizer {
                 const PhysicalProperties provided =
                     derive_op(ge.op, ge.hash_keys, ge.scan_format,
                               std::span<const PhysicalProperties>{child_props, n_child},
-                              ge.scan_freshness, grp.sort_keys);
+                              ge.scan_freshness, grp.sort_keys, distribution_of(grp),
+                              grp.op_split);
                 const double top = enforcement_cost(provided, required, out_rows, cal);
                 const double total = child_cost + own_cost + top;
                 if (total < best_cost) {
@@ -1018,7 +1033,8 @@ struct Optimizer {
                         const PhysicalProperties provided = derive_op(
                             ge.op, ge.hash_keys, ge.scan_format,
                             std::span<const PhysicalProperties>{pd_props, n_pd},
-                            ge.scan_freshness, grp.sort_keys);
+                            ge.scan_freshness, grp.sort_keys, distribution_of(grp),
+                            grp.op_split);
                         const double top =
                             enforcement_cost(provided, required, out_rows, cal);
                         const double total = pd_cost + own_cost + top;
@@ -1068,10 +1084,12 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     const CardinalityModel card =
         ctx.cardinality != nullptr ? *ctx.cardinality : CardinalityModel{};
     const StorageCatalog storage = ctx.storage != nullptr ? *ctx.storage : StorageCatalog{};
+    const DistributionCatalog distribution =
+        ctx.distribution != nullptr ? *ctx.distribution : DistributionCatalog{};
 
     Memo memo;
     const GroupId root_group =
-        explore(root, memo, ctx, card, storage, result.arena, result.candidates_considered,
+        explore(root, memo, ctx, card, storage, distribution, result.arena, result.candidates_considered,
                 result.groups_shared, result.join_count, result.join_regions_enumerated,
                 result.error);
     if (root_group == kInvalidGroup) {

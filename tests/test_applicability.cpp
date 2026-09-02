@@ -116,8 +116,14 @@ const PhysicalSpec& spec() {
 static void test_every_operator_is_reachable() {
     std::printf("test_every_operator_is_reachable\n");
     for (const PhysicalOp op : kAllPhysicalOps) {
-        // The two enforcers are inserted by enforce(), not by a rule.
-        if (op == PhysicalOp::Sort || op == PhysicalOp::FormatConvert) continue;
+        // The THREE enforcers are inserted by enforce(), not by a rule: a Sort
+        // for an order, a FormatConvert for a storage format, an Exchange for a
+        // distribution. No implementation rule names them, and an unreachability
+        // report for one would be noise.
+        if (op == PhysicalOp::Sort || op == PhysicalOp::FormatConvert ||
+            op == PhysicalOp::Exchange) {
+            continue;
+        }
         bool reachable = false;
         for (const auto& [logical, ops] : spec().resolved_rules) {
             (void)logical;
@@ -195,6 +201,9 @@ const std::vector<Precondition>& declared_preconditions() {
         {PhysicalOp::Insert},
         {PhysicalOp::Update},
         {PhysicalOp::Delete},
+        // An enforcer has no precondition by construction: it is inserted where a
+        // requirement is unmet, never chosen among alternatives.
+        {PhysicalOp::Exchange},
     };
     return v;
 }
@@ -417,6 +426,7 @@ PhysicalNode base(PhysicalOp op) {
     n.sort_keys = {SortKey{0, false, false, false}};
     n.scan_format = StorageFormat::Row;
     n.scan_freshness = Freshness::Fresh;
+    n.scan_distribution = Distribution{DistributionKind::Hashed, {0}};
     n.target_format = StorageFormat::Column;
     n.limits = LimitSpec{true, true, 10, 5};
     n.group_keys = {fx().col0.get()};
@@ -425,6 +435,7 @@ PhysicalNode base(PhysicalOp op) {
     n.values = {fx().lit7.get(), fx().col0.get()};
     n.values_columns = 2;
     n.grouping_sets = {0b1};
+    n.target_distribution = Distribution{DistributionKind::Hashed, {0, 1}};
     return n;
 }
 
@@ -486,6 +497,12 @@ void m_conflict_action(PhysicalNode& n) {
     n.conflict_action = db25::plan::ConflictAction::DoNothing;
 }
 void m_conflict_columns(PhysicalNode& n) { n.conflict_columns = &dml().cols_b; }
+void m_dist_kind(PhysicalNode& n) { n.target_distribution.kind = DistributionKind::Broadcast; }
+void m_dist_keys(PhysicalNode& n) { n.target_distribution.keys = {3, 4}; }
+void m_scan_dist(PhysicalNode& n) {
+    n.scan_distribution = Distribution{DistributionKind::Broadcast, {}};
+}
+void m_scan_dist_keys(PhysicalNode& n) { n.scan_distribution.keys = {1}; }
 
 // The DML base needs its borrowed pointers set; every other operator ignores them.
 PhysicalNode dml_base(PhysicalOp op) {
@@ -503,6 +520,11 @@ const std::vector<RenderCase>& cases() {
         {PhysicalOp::SeqScan, "scan_format", m_format},
         {PhysicalOp::SeqScan, "scan_freshness", m_fresh},
         {PhysicalOp::SeqScan, "output", m_output},
+        // Where the table's rows LIVE. A scan that did not say would read the
+        // same whether its rows are on one node or spread across a cluster, and
+        // the plans those two need are different plans.
+        {PhysicalOp::SeqScan, "scan_distribution.kind", m_scan_dist},
+        {PhysicalOp::SeqScan, "scan_distribution.keys", m_scan_dist_keys},
         {PhysicalOp::Filter, "predicate", m_pred},
         {PhysicalOp::Project, "projections", m_proj},
         {PhysicalOp::HashJoin, "join_kind", m_kind},
@@ -558,6 +580,11 @@ const std::vector<RenderCase>& cases() {
         {PhysicalOp::Update, "table_name", m_table},
         {PhysicalOp::Update, "assignments", m_assignments},
         {PhysicalOp::Delete, "table_name", m_table},
+        // What an Exchange establishes. A repartition that did not say which
+        // columns it hashes on reads the same as one that hashes on others, and
+        // the two send rows to different nodes.
+        {PhysicalOp::Exchange, "target_distribution.kind", m_dist_kind},
+        {PhysicalOp::Exchange, "target_distribution.keys", m_dist_keys},
     };
     return v;
 }

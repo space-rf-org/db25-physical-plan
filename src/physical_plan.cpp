@@ -34,6 +34,7 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::Insert:        return "Insert";
         case PhysicalOp::Update:        return "Update";
         case PhysicalOp::Delete:        return "Delete";
+        case PhysicalOp::Exchange:      return "Exchange";
     }
     return "?";
 }
@@ -172,8 +173,47 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::Insert:        return 1;
         case PhysicalOp::Update:        return 1;
         case PhysicalOp::Delete:        return 1;
+        case PhysicalOp::Exchange:      return 1;
     }
     return 0;
+}
+
+const char* distribution_kind_to_string(DistributionKind k) noexcept {
+    switch (k) {
+        case DistributionKind::Any:       return "any";
+        case DistributionKind::Single:    return "single";
+        case DistributionKind::Hashed:    return "hashed";
+        case DistributionKind::Broadcast: return "broadcast";
+    }
+    return "?";
+}
+
+bool distribution_satisfies(const Distribution& provided,
+                            const Distribution& required) noexcept {
+    if (required.kind == DistributionKind::Any) return true;
+    if (required.kind == DistributionKind::Single) {
+        return provided.kind == DistributionKind::Single;
+    }
+    if (required.kind == DistributionKind::Broadcast) {
+        // A full copy on EVERY node. One node holding everything is not that, and
+        // saying it were would let a plan read rows that are not there.
+        return provided.kind == DistributionKind::Broadcast;
+    }
+    // required.kind == Hashed: co-location by `required.keys`.
+    if (provided.kind == DistributionKind::Broadcast ||
+        provided.kind == DistributionKind::Single) {
+        // Everything is together, so everything is co-located by anything.
+        return true;
+    }
+    if (provided.kind != DistributionKind::Hashed) return false;
+    // Partitioning on a SUBSET is the stronger guarantee: two rows that agree on
+    // `required.keys` also agree on any subset of them, so they hash together.
+    for (const std::uint32_t k : provided.keys) {
+        bool found = false;
+        for (const std::uint32_t r : required.keys) found = found || (k == r);
+        if (!found) return false;
+    }
+    return true;
 }
 
 PhysicalNodePtr make_seq_scan(std::string table, Schema output) {
@@ -247,6 +287,15 @@ PhysicalNodePtr make_limit(PhysicalNodePtr input, LimitSpec limits) {
     auto n = std::make_unique<PhysicalNode>(PhysicalOp::Limit);
     n->limits = limits;
     n->output = input->output;  // a limit drops rows, it does not reshape them
+    n->children.push_back(std::move(input));
+    return n;
+}
+
+PhysicalNodePtr make_exchange(PhysicalNodePtr input, Distribution target) {
+    auto n = std::make_unique<PhysicalNode>(PhysicalOp::Exchange);
+    n->target_distribution = std::move(target);
+    // Moving rows between nodes does not change what they are.
+    n->output = input->output;
     n->children.push_back(std::move(input));
     return n;
 }

@@ -17,6 +17,7 @@
 #include "db25/physical/physical_plan.hpp"
 #include "db25/physical/properties.hpp"
 #include "db25/physical/spec.hpp"
+#include "db25/physical/distribution_catalog.hpp"
 #include "db25/physical/storage_catalog.hpp"
 
 #include "db25/plan/logical_plan.hpp"
@@ -43,6 +44,12 @@ struct LoweringContext {
     // per available format, so the substrate is chosen by cost like any other
     // physical decision. Defaults to row-only when not supplied.
     const StorageCatalog* storage = nullptr;
+    // How each table's rows are spread across a cluster. Defaults to
+    // single-node, which is DB25 today - and with that default every
+    // distribution requirement is already satisfied, so no Exchange is ever
+    // inserted and no plan changes. The seam is real and inert until a caller
+    // declares a partitioned table.
+    const DistributionCatalog* distribution = nullptr;
     // What the QUERY demands of the data it reads. Fresh means it must reflect
     // all committed writes, so a lagging copy is not merely dearer - it is
     // ineligible, and a scan that can only be served from one is discarded.

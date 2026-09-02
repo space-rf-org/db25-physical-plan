@@ -162,6 +162,21 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
             out += std::string(" fmt=") + storage_format_to_string(n.scan_format);
             // Only the interesting case is rendered: a fresh scan is the norm.
             if (n.scan_freshness == Freshness::Stale) out += " stale";
+            // Likewise single-node is the norm, and printing it on every scan of
+            // every plan would be noise. A PARTITIONED table is the fact worth
+            // seeing, and it says which columns it is partitioned on.
+            if (n.scan_distribution.kind != DistributionKind::Single) {
+                out += std::string(" dist=") +
+                       distribution_kind_to_string(n.scan_distribution.kind);
+                if (!n.scan_distribution.keys.empty()) {
+                    out += " on=[";
+                    for (std::size_t i = 0; i < n.scan_distribution.keys.size(); ++i) {
+                        if (i != 0) out += " ";
+                        out += "#" + std::to_string(n.scan_distribution.keys[i]);
+                    }
+                    out += "]";
+                }
+            }
             break;
         case PhysicalOp::Filter:
             out += " pred=" + render_expr(n.predicate);
@@ -376,6 +391,22 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
         case PhysicalOp::Delete:
             out += " table=" + n.table_name;
             break;
+        case PhysicalOp::Exchange: {
+            out += std::string(" to=") +
+                   distribution_kind_to_string(n.target_distribution.kind);
+            // The partitioning columns, when there are any. A repartition that did
+            // not say WHICH columns it hashes on would be indistinguishable from
+            // one that hashes on others, and the two send rows to different nodes.
+            if (!n.target_distribution.keys.empty()) {
+                out += " on=[";
+                for (std::size_t i = 0; i < n.target_distribution.keys.size(); ++i) {
+                    if (i != 0) out += " ";
+                    out += "#" + std::to_string(n.target_distribution.keys[i]);
+                }
+                out += "]";
+            }
+            break;
+        }
     }
 
     out += " out=" + render_schema(n.output);

@@ -298,6 +298,10 @@ static const std::vector<DeclaredEdge>& declared_edges() {
         {PhysicalOp::NestedLoopSemiJoin, EdgeKind::Streaming, EdgeKind::Rescanned},
         {PhysicalOp::NestedLoopAntiJoin, EdgeKind::Streaming, EdgeKind::Rescanned},
         {PhysicalOp::RecursiveFixpoint, EdgeKind::Streaming, EdgeKind::Rescanned},
+        // The third enforcer. Its edge is `separate`: the sending side is one
+        // loop and the receiving side another, on a different node, and nothing
+        // is buffered between them.
+        {PhysicalOp::Exchange, EdgeKind::Separate, EdgeKind::Separate},
     };
     return v;
 }

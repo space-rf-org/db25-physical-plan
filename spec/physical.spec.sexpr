@@ -100,6 +100,11 @@
     (operator (name Sort)          (arity 1) (kind pipeline-breaker) (edges materialized))
     ; A pure enforcer: inserted to establish a required storage format.
     (operator (name FormatConvert) (arity 1) (kind pipeline) (edges streaming))
+    ; The third enforcer: moves rows between nodes to establish a required
+    ; DISTRIBUTION - repartition by hash, broadcast, or gather to one place. Its
+    ; edge is `separate` rather than `materialized`: the sending and receiving
+    ; sides are two loops, but nothing is buffered between them.
+    (operator (name Exchange)      (arity 1) (kind pipeline) (edges separate))
     ; WITH RECURSIVE. RecursiveFixpoint takes the anchor and the recursive term as
     ; its two children - the anchor is evaluated once, the term once per iteration,
     ; which is why they are separate children rather than one hidden input.
@@ -193,4 +198,4 @@
               HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan
               HashSemiJoin HashAntiJoin NestedLoopSemiJoin NestedLoopAntiJoin
               HashGroupingSets RecursiveFixpoint WorkingTableScan CreateTableAs
-              Insert Update Delete)))
+              Insert Update Delete Exchange)))
