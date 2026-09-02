@@ -101,16 +101,22 @@ static GroupExpr group_expr(PhysicalOp op) {
 // `table` is BORROWED, matching Group::table_name - the caller must keep the
 // string alive for as long as the memo. Passing a temporary here is a
 // use-after-free that ASan catches on the first run.
+static std::vector<GroupId> g_pending_inputs;
+static std::vector<HashKey> g_pending_keys;
+
 static void set_payload(Memo& m, GroupId g, std::vector<GroupId> inputs,
                         const std::string* table = nullptr, const Expr* pred = nullptr,
                         std::vector<const Expr*> projections = {},
                         std::vector<HashKey> keys = {}) {
     Group& grp = m.group(g);
-    grp.inputs = inputs;
     grp.table_name = table;
     grp.predicate = pred;
     grp.op_exprs = std::move(projections);
-    grp.hash_keys = std::move(keys);
+    // Inputs and keys belong to the CANDIDATE now, so they are stashed for
+    // add_candidate to attach - a group with no candidate has no inputs, which is
+    // the point of the move.
+    g_pending_inputs = std::move(inputs);
+    g_pending_keys = std::move(keys);
 }
 static void add_candidate(Memo& m, GroupId g, PhysicalOp op, std::vector<GroupId> inputs,
                           const std::string* table = nullptr, const Expr* pred = nullptr,
@@ -118,7 +124,10 @@ static void add_candidate(Memo& m, GroupId g, PhysicalOp op, std::vector<GroupId
                           std::vector<HashKey> keys = {}) {
     set_payload(m, g, std::move(inputs), table, pred, std::move(projections),
                 std::move(keys));
-    m.add_expr(g, group_expr(op));
+    GroupExpr ge = group_expr(op);
+    for (const GroupId in : g_pending_inputs) ge.inputs.push_back(in);
+    ge.hash_keys = g_pending_keys;
+    m.add_expr(g, std::move(ge));
 }
 
 // Borrowed by the memo, so they live as long as the program rather than as long

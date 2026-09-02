@@ -215,12 +215,18 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         inputs.push_back(g);
     }
 
-    // The payload every candidate shares - they are alternative ALGORITHMS for
-    // one logical operator, not different operators - so it is built ONCE and
-    // lives on the group. Assembled here before the group exists so that dedup
-    // can key on it; moved in below.
+    // The payload every candidate in this group SHARES - what the logical operator
+    // is, rather than how it is computed. Assembled here before the group exists so
+    // that dedup can key on it; moved in below.
+    //
+    // The inputs, join keys and residual are NOT here: they belong to each
+    // candidate, because a candidate is (operator, input groups) and two candidates
+    // in one group may read different inputs. Today they never do - lowering is one
+    // group per logical node - so these locals are simply copied onto every
+    // candidate, and the code says where they will diverge.
     Group payload;
-    payload.inputs = inputs;
+    std::vector<HashKey> hash_keys;
+    std::vector<const plan::Expr*> residual;
     switch (n.op) {
         case plan::LogicalOp::Scan:
             payload.table_name = &n.table_name;   // borrowed; the logical node outlives us
@@ -241,8 +247,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 n.child(0) != nullptr ? static_cast<std::uint32_t>(n.child(0)->output.size()) : 0;
             // Keys and residual are independent outputs: a join may have both
             // (an equi-key plus an extra condition), either, or neither (CROSS).
-            split_join_predicate(n.predicate.get(), left_width, payload.hash_keys,
-                                 payload.residual);
+            split_join_predicate(n.predicate.get(), left_width, hash_keys, residual);
             break;
         }
         case plan::LogicalOp::Sort:
@@ -433,12 +438,12 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.output = &n.output;
         key.inputs = inputs;
         key.predicate = payload.predicate;
-        key.residual = payload.residual;
+        key.residual = residual;
         key.op_exprs = payload.op_exprs;
         key.op_split = payload.op_split;
         key.grouping_sets = payload.grouping_sets;
         key.set_op = payload.set_op;
-        key.hash_keys = payload.hash_keys;
+        key.hash_keys = hash_keys;
         key.join_kind = payload.join_kind;
         key.sort_keys = payload.sort_keys;
         key.limits = payload.limits;
@@ -452,15 +457,12 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     const GroupId g = memo.add_group(n.output);
     {
         Group& grp = memo.group(g);
-        grp.inputs = payload.inputs;
         grp.table_name = payload.table_name;
         grp.predicate = payload.predicate;
-        grp.residual = std::move(payload.residual);
         grp.op_exprs = std::move(payload.op_exprs);
         grp.op_split = payload.op_split;
         grp.grouping_sets = std::move(payload.grouping_sets);
         grp.set_op = payload.set_op;
-        grp.hash_keys = std::move(payload.hash_keys);
         grp.join_kind = payload.join_kind;
         grp.sort_keys = payload.sort_keys;
         grp.limits = payload.limits;
@@ -498,7 +500,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         }
     }
 
-    const std::vector<HashKey>& keys = memo.group(g).hash_keys;
+    const std::vector<HashKey>& keys = hash_keys;
     const ast::JoinType payload_join_kind = memo.group(g).join_kind;
     const GroupingSpec group_spec = grouping_of(memo.group(g));
     // The candidate count is known before the loop, so the vector never has to
@@ -532,6 +534,12 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                 ge.scan_format = fa.format;
                 ge.scan_freshness = fa.freshness;
                 ge.build_right = (side == 0);
+                // Per candidate, because a candidate IS (operator, input groups).
+                // Every candidate in this group gets the same three today; join
+                // reordering is where they start to differ.
+                ge.inputs = inputs;
+                ge.hash_keys = hash_keys;
+                ge.residual = residual;
                 // Recomputed per candidate rather than hoisted out of these loops.
                 // Hoisting looks like an obvious win - it depends on neither the
                 // format nor the build side - but the result must then be COPIED
@@ -654,7 +662,7 @@ struct Optimizer {
             const GroupExpr& ge = grp.exprs[i];
             double in_rows_buf[kMaxArity] = {};
             std::size_t n_in = 0;
-            for (const GroupId in : grp.inputs) {
+            for (const GroupId in : ge.inputs) {
                 if (n_in == kMaxArity) break;
                 in_rows_buf[n_in++] = memo.group(in).rows;
             }
@@ -672,10 +680,10 @@ struct Optimizer {
             double child_cost = 0.0;
             PhysicalProperties child_props[kMaxArity];
             std::size_t n_child = 0;
-            if (optimize_inputs(grp.inputs, op_reqs, bound - own_cost, child_cost,
+            if (optimize_inputs(ge.inputs, op_reqs, bound - own_cost, child_cost,
                                 child_props, n_child)) {
                 const PhysicalProperties provided =
-                    derive_op(ge.op, grp.hash_keys, ge.scan_format,
+                    derive_op(ge.op, ge.hash_keys, ge.scan_format,
                               std::span<const PhysicalProperties>{child_props, n_child},
                               ge.scan_freshness, grp.sort_keys);
                 const double top = enforcement_cost(provided, required, out_rows, cal);
@@ -714,10 +722,10 @@ struct Optimizer {
                     double pd_cost = 0.0;
                     PhysicalProperties pd_props[kMaxArity];
                     std::size_t n_pd = 0;
-                    if (optimize_inputs(grp.inputs, pushed, bound - own_cost, pd_cost,
+                    if (optimize_inputs(ge.inputs, pushed, bound - own_cost, pd_cost,
                                         pd_props, n_pd)) {
                         const PhysicalProperties provided = derive_op(
-                            ge.op, grp.hash_keys, ge.scan_format,
+                            ge.op, ge.hash_keys, ge.scan_format,
                             std::span<const PhysicalProperties>{pd_props, n_pd},
                             ge.scan_freshness, grp.sort_keys);
                         const double top =

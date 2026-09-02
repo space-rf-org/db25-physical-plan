@@ -212,7 +212,7 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     node->scan_format = ge.scan_format;
     node->scan_freshness = ge.scan_freshness;
     node->predicate = g.predicate;
-    node->residual = g.residual;
+    node->residual = ge.residual;
     // A Project's expressions and an Aggregate's payload share one vector on the
     // group; they are separate fields on the extracted NODE, which is not in a
     // deque and so is not size-critical.
@@ -232,7 +232,7 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     }
     node->set_op = g.set_op;
     node->build_right = ge.build_right;
-    node->hash_keys = g.hash_keys;
+    node->hash_keys = ge.hash_keys;
     node->join_kind = g.join_kind;
     node->sort_keys = g.sort_keys;
     node->limits = g.limits;
@@ -242,10 +242,10 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
     // different plan from the same child optimized for nothing, and extracting
     // the wrong one would build a plan nobody costed.
     const ArityVec<PhysicalProperties>& reqs = won->input_required;
-    for (std::size_t i = 0; i < g.inputs.size(); ++i) {
+    for (std::size_t i = 0; i < ge.inputs.size(); ++i) {
         const PhysicalProperties& child_req =
             i < reqs.size() ? reqs[i] : Group::unconstrained();
-        auto child = extract_winner_for(g.inputs[i], child_req);
+        auto child = extract_winner_for(ge.inputs[i], child_req);
         if (!child) {
             return nullptr;  // an input group had no winner: extraction fails
         }

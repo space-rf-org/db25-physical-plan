@@ -46,6 +46,19 @@ struct GroupExpr {
     PhysicalOp op;
     StorageFormat scan_format = StorageFormat::Row;  // SeqScan: the format read
     Freshness scan_freshness = Freshness::Fresh;     // SeqScan: does that copy lag?
+    // The INPUT GROUPS this candidate joins, in operand order, and the join keys
+    // and residual conjuncts it uses over them.
+    //
+    // These sat on the Group until Increment 3.8a, on the assumption that every
+    // candidate in a group is an alternative ALGORITHM for one logical operator -
+    // true only while lowering is one group per logical node. Join reordering
+    // breaks it: (A join B) join C and A join (B join C) produce the same rows and
+    // so belong in the SAME group, but they read different input groups and join on
+    // different keys. In Cascades a group-expression IS (operator, input groups),
+    // so this is the memo moving toward the model it already claimed to implement.
+    ArityVec<GroupId> inputs;
+    std::vector<HashKey> hash_keys;      // equi-join keys, over `inputs`
+    std::vector<const Expr*> residual;   // non-key conjuncts to re-check per row
     // HashJoin: which input is MATERIALIZED into the hash table; the other streams
     // past it. Building the SMALLER side is what makes a hash join cheap, and
     // which side is smaller is not knowable until cardinalities are - so it is a
@@ -91,7 +104,6 @@ struct Group {
     GroupId id = kInvalidGroup;
 
     // --- the logical operator every candidate in this group implements ---
-    ArityVec<GroupId> inputs;              // child groups, in operand order
     // BORROWED from the logical node, like every other payload here - the logical
     // plan already has to outlive the physical plan, and GroupKey has borrowed
     // this same string since dedup was written. Owning a copy cost 32 bytes per
@@ -99,14 +111,12 @@ struct Group {
     // `grouping_sets` below without pushing sizeof(Group) past the deque cliff.
     const std::string* table_name = nullptr;   // Scan
     const Expr* predicate = nullptr;       // Filter
-    std::vector<const Expr*> residual;     // Join: non-key conjuncts to re-check
     // Project: one borrowed expression per output column.
     // Aggregate: the GROUP BY keys followed by the aggregate calls, split at
     // `op_split`. One vector for both is this struct's stated
     // union-by-convention on the logical operator - and here it is also load
     // bearing; see the note below.
     std::vector<const Expr*> op_exprs;
-    std::vector<HashKey> hash_keys;        // equi-join keys
     // Join: the relational join being implemented. Part of the GROUP payload, not
     // of a candidate: every group-expression in a group implements the SAME
     // logical operator, and an inner join is not equivalent to a left join.
