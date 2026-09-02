@@ -14,45 +14,75 @@
   (version 0)
 
   ; The physical operator catalog. `arity` is the number of child inputs; `kind`
-  ; is a coarse pipeline classification (informational today; the cost model and
-  ; property framework consume richer per-operator data in later units).
+  ; is a coarse pipeline classification.
+  ;
+  ; `kind` IS AND REMAINS A SUMMARY, and increment 4.1 is where that stopped
+  ; being a placeholder and became a statement. Where rows stop is a property of
+  ; an EDGE, not of an operator: a hash join MATERIALIZES its build input and
+  ; STREAMS its probe input, and which of the two is the build side is chosen per
+  ; plan by the search, so no label on this line can be right for both. The
+  ; per-edge answer lives in pipeline.hpp's `edge_kind`, where it can read the
+  ; candidate; a test declares it for every input of every operator, and another
+  ; asserts the two do not contradict each other for the operators where a single
+  ; label CAN be right.
+  ;
+  ; So each operator also declares `edges`: one word per INPUT, saying what
+  ; happens to rows arriving on it.
+  ;
+  ;   streaming    - they flow into this operator's output within one loop
+  ;   materialized - this whole input is buffered before anything is emitted
+  ;   rescanned    - this input is RE-EXECUTED, once per row of another input
+  ;   separate     - its own loop, feeding the same consumer as a sibling
+  ;
+  ; `kind` is then DERIVED from `edges`: an operator is a pipeline-breaker
+  ; exactly when it materializes an input, which is the question an executor asks
+  ; when it wants to know where the memory goes. Conformance checks both - that
+  ; `edge_kind()` in the code agrees with `edges` here, and that `kind` is the
+  ; summary `edges` implies - so the three cannot drift apart.
+  ;
+  ; Nine labels were wrong when this was first checked: a merge join, the three
+  ; nested loops and the recursive fixpoint were called breakers though they
+  ; buffer nothing, and the four write operators were called breakers though rows
+  ; pass straight through them into a table. They END pipelines, which is a real
+  ; thing and is what `edges` now says; they do not BREAK them in the sense that
+  ; costs memory.
   (operators
     (operator (name SeqScan)       (arity 0) (kind access-path))
-    (operator (name Filter)        (arity 1) (kind pipeline))
-    (operator (name Project)       (arity 1) (kind pipeline))
-    (operator (name HashJoin)      (arity 2) (kind pipeline-breaker))
+    (operator (name Filter)        (arity 1) (kind pipeline) (edges streaming))
+    (operator (name Project)       (arity 1) (kind pipeline) (edges streaming))
+    (operator (name HashJoin)      (arity 2) (kind pipeline-breaker) (edges streaming materialized))
     ; MergeJoin requires both inputs sorted on the join keys and preserves that
     ; order on its output - so it is cheaper per row than HashJoin when the order
     ; is already there, and dearer once a Sort must be enforced to get it.
-    (operator (name MergeJoin)     (arity 2) (kind pipeline-breaker))
+    (operator (name MergeJoin)     (arity 2) (kind pipeline) (edges streaming separate))
     ; NestedLoopJoin needs no equi-key, which makes it the ONLY legal
     ; implementation of a cross product or a purely non-equi join - and its cost
     ; is quadratic in the inputs, so it never wins where a keyed join applies.
-    (operator (name NestedLoopJoin) (arity 2) (kind pipeline-breaker))
+    (operator (name NestedLoopJoin) (arity 2) (kind pipeline) (edges streaming rescanned))
     ; Limit passes at most `limit` rows through after discarding `offset` of
     ; them. Order-SENSITIVE: which rows survive depends entirely on the order its
     ; input arrives in, which is why the planner may not push an order
     ; requirement through it.
-    (operator (name Limit)         (arity 1) (kind pipeline))
+    (operator (name Limit)         (arity 1) (kind pipeline) (edges streaming))
     ; Two implementations of GROUP BY. HashAggregate works on any input and
     ; produces no order; StreamingAggregate needs its input already sorted on the
     ; grouping keys, is cheaper per row, and keeps that order on its output.
-    (operator (name HashAggregate)      (arity 1) (kind pipeline-breaker))
-    (operator (name StreamingAggregate) (arity 1) (kind pipeline))
+    (operator (name HashAggregate)      (arity 1) (kind pipeline-breaker) (edges materialized))
+    (operator (name StreamingAggregate) (arity 1) (kind pipeline) (edges streaming))
     ; Window consumes its input sorted by (PARTITION BY ++ ORDER BY) and appends
     ; one column per window function, emitting in that same order.
-    (operator (name Window)             (arity 1) (kind pipeline))
+    (operator (name Window)             (arity 1) (kind pipeline) (edges streaming))
     ; GROUPING SETS / ROLLUP / CUBE in one pass, hashing each row into every set's
     ; table. No streaming counterpart: different sets want different orderings.
-    (operator (name HashGroupingSets)   (arity 1) (kind pipeline-breaker))
+    (operator (name HashGroupingSets)   (arity 1) (kind pipeline-breaker) (edges materialized))
     ; Two implementations of SELECT DISTINCT, the same trade as the aggregates.
-    (operator (name HashDistinct)       (arity 1) (kind pipeline-breaker))
-    (operator (name StreamingDistinct)  (arity 1) (kind pipeline))
+    (operator (name HashDistinct)       (arity 1) (kind pipeline-breaker) (edges materialized))
+    (operator (name StreamingDistinct)  (arity 1) (kind pipeline) (edges streaming))
     ; Set operations. UnionAll compares nothing; HashSetOp builds from the right
     ; and probes with the left. They are NOT alternatives for one another -
     ; applicability, not cost, selects between them.
-    (operator (name UnionAll)           (arity 2) (kind pipeline))
-    (operator (name HashSetOp)          (arity 2) (kind pipeline-breaker))
+    (operator (name UnionAll)           (arity 2) (kind pipeline) (edges separate separate))
+    (operator (name HashSetOp)          (arity 2) (kind pipeline-breaker) (edges streaming materialized))
     ; A literal row set, and the synthetic single row of a FROM-less SELECT.
     (operator (name ValuesScan)         (arity 0) (kind access-path))
     ; Semi and anti joins (EXISTS / IN, NOT EXISTS). Both emit the LEFT schema
@@ -60,35 +90,35 @@
     ; which is why they are their own operators rather than a join plus a distinct.
     ; Four rather than two with a mode flag: they are exact complements, and an
     ; operator that does not say which it is reads the same as the other.
-    (operator (name HashSemiJoin)       (arity 2) (kind pipeline-breaker))
-    (operator (name HashAntiJoin)       (arity 2) (kind pipeline-breaker))
-    (operator (name NestedLoopSemiJoin) (arity 2) (kind pipeline-breaker))
-    (operator (name NestedLoopAntiJoin) (arity 2) (kind pipeline-breaker))
+    (operator (name HashSemiJoin)       (arity 2) (kind pipeline-breaker) (edges streaming materialized))
+    (operator (name HashAntiJoin)       (arity 2) (kind pipeline-breaker) (edges streaming materialized))
+    (operator (name NestedLoopSemiJoin) (arity 2) (kind pipeline) (edges streaming rescanned))
+    (operator (name NestedLoopAntiJoin) (arity 2) (kind pipeline) (edges streaming rescanned))
     ; Sort is BOTH the implementation of a logical Sort (ORDER BY) and the
     ; enforcer inserted to establish a required order - one operator, because they
     ; are one operation; only who asked for it differs.
-    (operator (name Sort)          (arity 1) (kind pipeline-breaker))
+    (operator (name Sort)          (arity 1) (kind pipeline-breaker) (edges materialized))
     ; A pure enforcer: inserted to establish a required storage format.
-    (operator (name FormatConvert) (arity 1) (kind pipeline))
+    (operator (name FormatConvert) (arity 1) (kind pipeline) (edges streaming))
     ; WITH RECURSIVE. RecursiveFixpoint takes the anchor and the recursive term as
     ; its two children - the anchor is evaluated once, the term once per iteration,
     ; which is why they are separate children rather than one hidden input.
     ; WorkingTableScan is the recursive self-reference: a leaf whose rows come from
     ; the previous iteration, and the only operator in this catalog fed from
     ; elsewhere in its own plan.
-    (operator (name RecursiveFixpoint)  (arity 2) (kind pipeline-breaker))
+    (operator (name RecursiveFixpoint)  (arity 2) (kind pipeline) (edges streaming rescanned))
     (operator (name WorkingTableScan)   (arity 0) (kind access-path))
     ; CREATE TABLE AS: materialize the input stream into a new table.
-    (operator (name CreateTableAs)      (arity 1) (kind pipeline-breaker))
+    (operator (name CreateTableAs)      (arity 1) (kind pipeline) (edges streaming))
     ; The write path. One input each - the source query for an Insert, the
     ; scanned and filtered target rows for an Update or a Delete - and each emits
     ; the AFFECTED rows, which a RETURNING clause then projects. The target
     ; relation is a NAME on the operator, not a child: it is written, not read.
     ; Three operators rather than one with a mode, because an operator that does
     ; not say which modification it performs reads the same as the other two.
-    (operator (name Insert)             (arity 1) (kind pipeline-breaker))
-    (operator (name Update)             (arity 1) (kind pipeline-breaker))
-    (operator (name Delete)             (arity 1) (kind pipeline-breaker)))
+    (operator (name Insert)             (arity 1) (kind pipeline) (edges streaming))
+    (operator (name Update)             (arity 1) (kind pipeline) (edges streaming))
+    (operator (name Delete)             (arity 1) (kind pipeline) (edges streaming)))
 
   ; Implementation rules: the physical operator each logical operator lowers to.
   ; Increment 0 is single-candidate (one physical op per logical op); a rule set

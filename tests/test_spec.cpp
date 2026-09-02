@@ -90,6 +90,51 @@ static void test_arity_mismatch_is_reported() {
     CHECK(any_contains(problems, "arity mismatch"));
 }
 
+// The per-input edge kinds are the spec's, and the code must agree with them.
+// Declared here as a NEGATIVE test - a spec that says the wrong thing must be
+// reported - because the positive direction (the shipped spec conforms) passes
+// just as well when the check does nothing at all. A mutation that disabled the
+// comparison survived until this existed.
+static void test_edge_mismatch_is_reported() {
+    std::printf("test_edge_mismatch_is_reported\n");
+    // A Filter that claims to buffer its input, which it does not.
+    const std::string text =
+        "(physical-spec (version 0)"
+        "  (operators"
+        "    (operator (name SeqScan)  (arity 0) (kind access-path))"
+        "    (operator (name Filter)   (arity 1) (kind pipeline-breaker) (edges materialized))"
+        "    (operator (name Project)  (arity 1) (kind pipeline) (edges streaming))"
+        "    (operator (name HashJoin) (arity 2) (kind pipeline-breaker) "
+        "              (edges streaming materialized)))"
+        "  (capability-profile (name reference) (executes SeqScan Filter Project HashJoin)))";
+    std::string error;
+    auto spec = parse_spec(text, error);
+    CHECK(spec.has_value());
+    if (!spec) return;
+    const auto problems = check_conformance(*spec);
+    CHECK(any_contains(problems, "the IR says 'streaming'"));
+}
+
+// `kind` is a SUMMARY of `edges`, not an independent claim, so a spec whose two
+// disagree is reported rather than quietly believed. This is the check that
+// found nine wrong labels in the shipped spec when it was written.
+static void test_kind_contradicting_its_edges_is_reported() {
+    std::printf("test_kind_contradicting_its_edges_is_reported\n");
+    const std::string text =
+        "(physical-spec (version 0)"
+        "  (operators"
+        "    (operator (name SeqScan) (arity 0) (kind access-path))"
+        // Buffers its input, but calls itself a pipeline operator.
+        "    (operator (name Sort)    (arity 1) (kind pipeline) (edges materialized)))"
+        "  (capability-profile (name reference) (executes SeqScan Sort)))";
+    std::string error;
+    auto spec = parse_spec(text, error);
+    CHECK(spec.has_value());
+    if (!spec) return;
+    const auto problems = check_conformance(*spec);
+    CHECK(any_contains(problems, "contradicts its edges"));
+}
+
 static void test_phantom_operator_is_reported() {
     std::printf("test_phantom_operator_is_reported\n");
     // A deliberately fictional name: this case previously used MergeJoin, which
@@ -148,6 +193,8 @@ int main() {
     test_shipped_spec_loads_and_conforms();
     test_missing_operator_is_reported();
     test_arity_mismatch_is_reported();
+    test_edge_mismatch_is_reported();
+    test_kind_contradicting_its_edges_is_reported();
     test_phantom_operator_is_reported();
     test_not_executable_is_reported();
     test_malformed_sexpr_is_rejected();
