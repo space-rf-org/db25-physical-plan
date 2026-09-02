@@ -122,8 +122,24 @@ static plan::LogicalNodePtr reference_query() {
 //
 // A legitimate increase means editing these numbers in a commit that explains
 // why. That is the mechanism, not an obstacle to it.
-constexpr long kBudgetDefault = 69;   // measured 65
-constexpr long kBudgetDedup = 84;     // measured 80 (dedup builds a key per group)
+// Raised by 5 in Increment 3.8a, which moved `inputs`, `hash_keys` and `residual`
+// from the Group to each GroupExpr. The cost is exact and was measured by removing
+// each copy in turn: the join group has FOUR candidates (HashJoin building either
+// side, MergeJoin, NestedLoopJoin) and each now owns its own copy of the join
+// keys, where all four previously shared one on the group. `residual` costs
+// nothing here - it is empty in this query, and an empty vector copy does not
+// allocate - and `inputs` is an ArityVec, stored inline.
+//
+// That is the model being right rather than waste: a candidate is (operator, input
+// groups), and join reordering needs two candidates in one group to read different
+// inputs and join on different keys. Paying four allocations for it on a five-group
+// query is the correct trade, and it is recorded here rather than absorbed.
+//
+// The obvious saving - a small-vector with inline capacity for hash keys, which
+// are one or two columns in almost every join - is a separate change and tracked
+// as one.
+constexpr long kBudgetDefault = 74;   // measured 70 (was 65 before Increment 3.8a)
+constexpr long kBudgetDedup = 89;     // measured 85 (dedup builds a key per group)
 
 static long allocations_for(const LoweringContext& ctx, const plan::LogicalNode& q) {
     { const LoweringResult warm = lower(q, ctx); (void)warm; }  // one-off caches
