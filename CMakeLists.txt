@@ -56,6 +56,7 @@ add_library(db25physicalplan STATIC
     src/properties.cpp
     src/lowering.cpp
     src/join_order.cpp
+    src/pipeline.cpp
     src/structural_key.cpp)
 target_include_directories(db25physicalplan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -109,6 +110,15 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_compile_definitions(join_order_tests PRIVATE
         DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
     add_test(NAME join_order_tests COMMAND join_order_tests)
+
+    # Pipelines: where a row stops, and the per-EDGE fact the spec's
+    # per-operator `kind` cannot express.
+    add_executable(pipeline_tests tests/test_pipeline.cpp)
+    target_link_libraries(pipeline_tests PRIVATE db25physicalplan)
+    target_compile_options(pipeline_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    target_compile_definitions(pipeline_tests PRIVATE
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME pipeline_tests COMMAND pipeline_tests)
 
     # The applicability sweep. Iterates kAllPhysicalOps, so an operator added
     # without a decision about its preconditions, its cost, its derivation or its

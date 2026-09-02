@@ -1,5 +1,7 @@
 #include "db25/physical/spec.hpp"
 
+#include "db25/physical/pipeline.hpp"
+
 #include "db25/physical/sexpr_read.hpp"
 
 #include <charconv>
@@ -70,6 +72,11 @@ std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& err
                 os.arity = static_cast<std::size_t>(parsed);
             }
             if (const SNode* k = op.child("kind")) os.kind = value_of(*k);
+            if (const SNode* e = op.child("edges")) {
+                for (std::size_t i = 1; i < e->list.size(); ++i) {
+                    if (!e->list[i].is_list) os.edges.push_back(e->list[i].atom);
+                }
+            }
             if (os.name.empty()) { error = "an operator has no name"; return std::nullopt; }
             spec.operators.push_back(std::move(os));
         }
@@ -147,6 +154,38 @@ std::vector<std::string> check_conformance(const PhysicalSpec& spec) {
             problems.push_back("operator '" + name + "' arity mismatch: spec " +
                                std::to_string(os->arity) + " vs IR " +
                                std::to_string(expected_arity(op)));
+        } else {
+            // Where rows stop, declared per INPUT and checked against the code.
+            // The build side of a hash-family operator is a per-PLAN decision, so
+            // the spec declares the build-right shape and edge_kind() is asked for
+            // that shape here; the flip is a code-level fact a test pins.
+            if (os->edges.size() != expected_arity(op)) {
+                problems.push_back("operator '" + name + "' declares " +
+                                   std::to_string(os->edges.size()) +
+                                   " edge kind(s) for " + std::to_string(expected_arity(op)) +
+                                   " input(s)");
+            } else {
+                bool materializes = false;
+                for (std::size_t i = 0; i < os->edges.size(); ++i) {
+                    const std::string got = edge_kind_to_string(edge_kind(op, i, true));
+                    if (got != os->edges[i]) {
+                        problems.push_back("operator '" + name + "' input " +
+                                           std::to_string(i) + ": spec says '" +
+                                           os->edges[i] + "', the IR says '" + got + "'");
+                    }
+                    materializes = materializes || os->edges[i] == "materialized";
+                }
+                // `kind` is the summary `edges` implies, not an independent claim.
+                // An operator that buffers an input is a breaker; one that does
+                // not is not, however else its inputs are consumed.
+                const std::string implied =
+                    expected_arity(op) == 0 ? "access-path"
+                                            : (materializes ? "pipeline-breaker" : "pipeline");
+                if (os->kind != implied) {
+                    problems.push_back("operator '" + name + "' kind '" + os->kind +
+                                       "' contradicts its edges, which imply '" + implied + "'");
+                }
+            }
         }
         if (!spec.profile.can_execute(name)) {
             problems.push_back("operator '" + name +

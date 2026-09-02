@@ -25,6 +25,12 @@ struct OperatorSpec {
     std::string name;
     std::size_t arity = 0;
     std::string kind;
+    // What happens to rows arriving on each INPUT, one word per input:
+    // streaming / materialized / rescanned / separate. This is the part a single
+    // `kind` cannot carry - a hash join materializes one input and streams the
+    // other - and conformance asserts `edge_kind()` in the code agrees with it,
+    // and that `kind` is the summary these imply.
+    std::vector<std::string> edges;
 };
 
 // The reference execution-capability profile: which operators the (future)
