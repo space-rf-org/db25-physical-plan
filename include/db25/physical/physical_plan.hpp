@@ -86,6 +86,22 @@ enum class PhysicalOp : std::uint8_t {
     Limit,          // LIMIT / OFFSET: pass at most `limit` rows through, after
                     // discarding the first `offset`. Order-SENSITIVE - which
                     // rows survive depends entirely on the order of its input.
+    // The two operators a WITH RECURSIVE needs. They are a PAIR: neither means
+    // anything without the other, which is why they arrive together.
+    RecursiveFixpoint,  // iterate to a fixpoint: evaluate the anchor once, then
+                    // the recursive term repeatedly over the rows the previous
+                    // iteration produced, until an iteration produces none.
+                    // `set_op` says whether UNION (dedup across iterations) or
+                    // UNION ALL. Named for what it DOES rather than for the SQL
+                    // that produces it - the operator is a fixpoint, and a plan
+                    // that said "RecursiveCTE" would be naming its own syntax.
+    WorkingTableScan, // read the working table: the rows the previous iteration
+                    // produced. A leaf, and the only operator whose input comes
+                    // from elsewhere in the same plan - which is exactly what
+                    // makes the fixpoint above a fixpoint rather than a join.
+    CreateTableAs,  // materialize the input stream into a NEW table. Named for
+                    // the statement because that is precisely what it does; a
+                    // synonym would only be a mapping that can drift.
 };
 
 [[nodiscard]] const char* physical_op_to_string(PhysicalOp op) noexcept;
@@ -98,7 +114,7 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 22> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 25> kAllPhysicalOps = {
     PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
     PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
     PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
@@ -107,7 +123,8 @@ inline constexpr std::array<PhysicalOp, 22> kAllPhysicalOps = {
     PhysicalOp::HashSetOp,      PhysicalOp::ValuesScan,
     PhysicalOp::HashSemiJoin,   PhysicalOp::HashAntiJoin,
     PhysicalOp::NestedLoopSemiJoin, PhysicalOp::NestedLoopAntiJoin,
-    PhysicalOp::HashGroupingSets};
+    PhysicalOp::HashGroupingSets, PhysicalOp::RecursiveFixpoint,
+    PhysicalOp::WorkingTableScan, PhysicalOp::CreateTableAs};
 
 // Is `op` a nested-loop family member - the implementations that re-evaluate
 // their right input per left row, and so are the only ones that can serve a

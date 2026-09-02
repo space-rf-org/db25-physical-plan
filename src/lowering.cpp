@@ -39,6 +39,9 @@ const char* logical_op_name(plan::LogicalOp op) {
         case plan::LogicalOp::Values:  return "Values";
         case plan::LogicalOp::SemiJoin: return "SemiJoin";
         case plan::LogicalOp::AntiJoin: return "AntiJoin";
+        case plan::LogicalOp::RecursiveCTE: return "RecursiveCTE";
+        case plan::LogicalOp::WorkingTableScan: return "WorkingTableScan";
+        case plan::LogicalOp::CreateTableAs: return "CreateTableAs";
         default:                       return nullptr;
     }
 }
@@ -72,6 +75,14 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
                                         PhysicalOp::NestedLoopSemiJoin};
     static constexpr PhysicalOp kAnti[]{PhysicalOp::HashAntiJoin,
                                         PhysicalOp::NestedLoopAntiJoin};
+    // One implementation each, and not for want of looking. A fixpoint is
+    // evaluated one way - anchor, then the term until it adds nothing - and the
+    // semi-naive refinement is a detail INSIDE that operator, not a different
+    // operator to cost against it. The working-table scan and the CTAS write are
+    // likewise single-valued: there is nothing to choose.
+    static constexpr PhysicalOp kRecursive[]{PhysicalOp::RecursiveFixpoint};
+    static constexpr PhysicalOp kWorkingTable[]{PhysicalOp::WorkingTableScan};
+    static constexpr PhysicalOp kCreateTableAs[]{PhysicalOp::CreateTableAs};
     switch (op) {
         case plan::LogicalOp::Scan:    return kScan;
         case plan::LogicalOp::Filter:  return kFilter;
@@ -86,6 +97,9 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
         case plan::LogicalOp::Values:  return kValues;
         case plan::LogicalOp::SemiJoin: return kSemi;
         case plan::LogicalOp::AntiJoin: return kAnti;
+        case plan::LogicalOp::RecursiveCTE: return kRecursive;
+        case plan::LogicalOp::WorkingTableScan: return kWorkingTable;
+        case plan::LogicalOp::CreateTableAs: return kCreateTableAs;
         default:                       return {};
     }
 }
@@ -639,6 +653,20 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         case plan::LogicalOp::SetOp:
             payload.set_op = n.set_op;
             break;
+        case plan::LogicalOp::RecursiveCTE:
+            // UNION de-duplicates across iterations, UNION ALL does not - and on
+            // cyclic data that is the difference between terminating and not. It
+            // is carried for the same reason a join's kind is: an operator that
+            // does not say which it computes reads the same as the other.
+            payload.set_op = n.set_op;
+            payload.table_name = &n.table_name;  // the CTE's name; borrowed
+            break;
+        case plan::LogicalOp::WorkingTableScan:
+        case plan::LogicalOp::CreateTableAs:
+            // The CTE name being read back, and the table being created. Borrowed
+            // from the logical node like every other payload here.
+            payload.table_name = &n.table_name;
+            break;
         case plan::LogicalOp::Values: {
             // Flattened row-major, `op_split` columns wide. A FROM-less SELECT is
             // one row of zero columns, which is why the width is carried
@@ -680,7 +708,12 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         // Borrowed from the LOGICAL NODE, not from the local GroupExpr: the index
         // outlives this call, and pointing at a local was a stack-use-after-return
         // (ASan caught it on the first run). Only a Scan carries a table name.
-        key.table_name = n.op == plan::LogicalOp::Scan ? &n.table_name : nullptr;
+        // Every operator that CARRIES a name, not just the scan. A
+        // WorkingTableScan names the CTE it reads back and a CreateTableAs the
+        // table it creates; keying only the scan would let two working-table
+        // scans of different CTEs with the same column types share one group, and
+        // one recursion would read the other's rows.
+        key.table_name = payload.table_name;
         key.output = &n.output;
         key.inputs = inputs;
         key.predicate = payload.predicate;
@@ -775,6 +808,10 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 struct Optimizer {
     Memo& memo;
     const CalibrationProfile& cal;
+    // Read for one thing only: how many times an operator evaluates each input
+    // (input_evaluations). Cardinalities themselves live on the groups, set at
+    // exploration.
+    const CardinalityModel& card;
     bool prune = true;
     // The D5 budget guard. When engaged the search still costs every APPLICABLE
     // candidate with the same cost model - it just stops exploring the second
@@ -801,7 +838,7 @@ struct Optimizer {
     // kMaxArity, so the search has no reason to reach the heap once per candidate
     // per goal. This is the allocation the search MULTIPLIES - every other one is
     // bounded by plan size rather than by how hard the search works.
-    bool optimize_inputs(const ArityVec<GroupId>& inputs,
+    bool optimize_inputs(PhysicalOp op, const ArityVec<GroupId>& inputs,
                          const ArityVec<PhysicalProperties>& reqs, double budget,
                          double& cost_out, PhysicalProperties* provided_out,
                          std::size_t& provided_count) {
@@ -810,11 +847,18 @@ struct Optimizer {
         for (std::size_t i = 0; i < inputs.size() && i < kMaxArity; ++i) {
             const PhysicalProperties& r =
                 i < reqs.size() ? reqs[i] : Group::unconstrained();
+            // How many times this operator EVALUATES this input. One for every
+            // operator but a recursive fixpoint's second child, which runs once
+            // per iteration - and charging it once would cost a recursive query as
+            // though the recursion were free. The bound passed DOWN is divided by
+            // the same factor, so branch-and-bound still compares like with like:
+            // a subplan that will be run ten times has a tenth of the budget.
+            const double runs = input_evaluations(op, i, card);
             const std::optional<std::uint32_t> w =
-                optimize(inputs[i], r, prune ? budget - cost_out : kNoBound);
+                optimize(inputs[i], r, prune ? (budget - cost_out) / runs : kNoBound);
             if (!w) return false;
             const WinnerEntry& e = memo.group(inputs[i]).winners[*w];
-            cost_out += e.cost;
+            cost_out += e.cost * runs;
             if (prune && cost_out >= budget) return false;  // cannot win; stop here
             provided_out[provided_count++] = e.provided;
         }
@@ -875,7 +919,7 @@ struct Optimizer {
             double child_cost = 0.0;
             PhysicalProperties child_props[kMaxArity];
             std::size_t n_child = 0;
-            if (optimize_inputs(ge.inputs, op_reqs, bound - own_cost, child_cost,
+            if (optimize_inputs(ge.op, ge.inputs, op_reqs, bound - own_cost, child_cost,
                                 child_props, n_child)) {
                 const PhysicalProperties provided =
                     derive_op(ge.op, ge.hash_keys, ge.scan_format,
@@ -917,7 +961,7 @@ struct Optimizer {
                     double pd_cost = 0.0;
                     PhysicalProperties pd_props[kMaxArity];
                     std::size_t n_pd = 0;
-                    if (optimize_inputs(ge.inputs, pushed, bound - own_cost, pd_cost,
+                    if (optimize_inputs(ge.op, ge.inputs, pushed, bound - own_cost, pd_cost,
                                         pd_props, n_pd)) {
                         const PhysicalProperties provided = derive_op(
                             ge.op, ge.hash_keys, ge.scan_format,
@@ -990,7 +1034,7 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
                                                             : SearchBudget{}.max_join_count);
     result.budget_guard_engaged = result.join_count > budget;
 
-    Optimizer opt{memo, cal, ctx.prune, result.budget_guard_engaged, 0, 0};
+    Optimizer opt{memo, cal, card, ctx.prune, result.budget_guard_engaged, 0, 0};
     if (!opt.optimize(root_group, ctx.required_output)) {
         result.error = "no plan satisfies the required output properties";
         return result;

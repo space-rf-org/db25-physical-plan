@@ -644,8 +644,10 @@ static void test_unsupported_operator_is_an_error() {
     // until Increment 3.2 gave Aggregate one, at which point the test started
     // asserting that a supported operator fails - which is why it is written
     // against the furthest-out operator in the roadmap rather than the nearest.
-    // When RecursiveCTE lowers, move this to whatever still does not.
-    auto unsupported = std::make_unique<plan::LogicalNode>(plan::LogicalOp::RecursiveCTE);
+    // It was RecursiveCTE until 3.9a lowered that; DML is what is left, and when
+    // DML lowers this test has nothing to stand on and should be rewritten
+    // against a SPEC that omits a rule rather than against the roadmap's tail.
+    auto unsupported = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Insert);
     unsupported->output = a_schema();
     unsupported->add_child(std::move(scan));
 
@@ -2190,6 +2192,233 @@ static void test_the_build_side_is_only_chosen_where_it_is_sound() {
     if (r.plan) CHECK(contains(physical_to_sexpr(*r.plan), "kind=left build=right"));
 }
 
+// ---- Increment 3.9a: WITH RECURSIVE and CREATE TABLE AS -------------------
+
+// The shape of `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t
+// WHERE n < 10) SELECT n FROM t`, as the binder produces it: a fixpoint whose
+// anchor is a projection over one literal row and whose recursive term reads the
+// working table.
+static plan::LogicalNodePtr build_recursive(db25::ast::SetOp set_op = db25::ast::SetOp::UnionAll) {
+    const plan::Schema cte_out{{"n", DataType::Integer, false}};
+
+    auto values = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Values);
+    values->value_rows.emplace_back();  // one row of zero columns
+    auto anchor = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Project);
+    anchor->output = cte_out;
+    anchor->exprs.push_back(int_lit(1));
+    anchor->add_child(std::move(values));
+
+    auto wts = std::make_unique<plan::LogicalNode>(plan::LogicalOp::WorkingTableScan);
+    wts->table_name = "t";
+    wts->output = cte_out;
+    auto filter = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Filter);
+    filter->output = cte_out;
+    filter->predicate = binop(BinaryOp::LessThan, col(0, DataType::Integer), int_lit(10));
+    filter->add_child(std::move(wts));
+    auto term = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Project);
+    term->output = cte_out;
+    term->exprs.push_back(binop(BinaryOp::Add, col(0, DataType::Integer), int_lit(1)));
+    term->add_child(std::move(filter));
+
+    auto fix = std::make_unique<plan::LogicalNode>(plan::LogicalOp::RecursiveCTE);
+    fix->table_name = "t";
+    fix->set_op = set_op;
+    fix->output = cte_out;
+    fix->add_child(std::move(anchor));
+    fix->add_child(std::move(term));
+
+    auto project = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Project);
+    project->output = cte_out;
+    project->exprs.push_back(col(0, DataType::Integer));
+    project->add_child(std::move(fix));
+    return project;
+}
+
+// The last two logical operators the corpus could not lower. Before this, both
+// fixtures ended in `(lower-error "unsupported logical operator in lowering")` -
+// the physical planner refusing a query the three stages beneath it had planned
+// completely.
+static void test_a_recursive_cte_lowers() {
+    std::printf("test_a_recursive_cte_lowers\n");
+    auto logical = build_recursive();
+    const LoweringResult r = lower(*logical);
+    CHECK(r.ok);
+    if (!r.ok) { std::printf("  error: %s\n", r.error.c_str()); return; }
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "(RecursiveFixpoint cte=t kind=union-all"));
+    // The self-reference is a LEAF inside the recursive term, not a scan of a
+    // stored table - a plan that lowered it to a SeqScan of "t" would be reading
+    // a relation that does not exist.
+    CHECK(contains(s, "(WorkingTableScan cte=t"));
+    CHECK(!contains(s, "SeqScan table=t"));
+    // Anchor first, term second: the fixpoint's two children are not
+    // interchangeable, and the plan has to say which is which by position.
+    const std::size_t fix = s.find("RecursiveFixpoint");
+    const std::size_t wts = s.find("WorkingTableScan");
+    CHECK(fix != std::string::npos && wts != std::string::npos && wts > fix);
+    // Everything above the fixpoint is ordinary: the outer SELECT is a Project.
+    CHECK(s.rfind("(Project", 0) == 0);
+}
+
+// UNION and UNION ALL are different recursions, not two spellings of one. UNION
+// de-duplicates across iterations, which is also what makes it terminate on
+// cyclic data. An operator that did not say which it computes would read the
+// same either way - the defect this planner has now found in a join kind, a set
+// operation and a build side.
+static void test_a_recursive_union_is_not_a_recursive_union_all() {
+    std::printf("test_a_recursive_union_is_not_a_recursive_union_all\n");
+    auto all = build_recursive(db25::ast::SetOp::UnionAll);
+    auto dedup = build_recursive(db25::ast::SetOp::Union);
+    const LoweringResult ra = lower(*all);
+    const LoweringResult rd = lower(*dedup);
+    CHECK(ra.ok && rd.ok);
+    const std::string sa = ra.plan ? physical_to_sexpr(*ra.plan) : std::string{};
+    const std::string sd = rd.plan ? physical_to_sexpr(*rd.plan) : std::string{};
+    CHECK(contains(sa, "kind=union-all"));
+    CHECK(contains(sd, "kind=union "));
+    CHECK(sa != sd);
+    // And the estimate differs, because de-duplicating across iterations really
+    // does produce fewer rows.
+    const db25::physical::CardinalityModel card;
+    CHECK(ra.plan && rd.plan);
+    if (ra.plan && rd.plan) CHECK(card.rows(*ra.plan) > card.rows(*rd.plan));
+}
+
+// The recursive TERM runs once per iteration. Charging its subtree once would
+// cost a recursive query as though the recursion were free - and the term is
+// where all the work is, so that is not a rounding error. This is the assertion
+// input_evaluations exists for.
+static void test_the_recursive_term_is_charged_once_per_iteration() {
+    std::printf("test_the_recursive_term_is_charged_once_per_iteration\n");
+    auto logical = build_recursive();
+    db25::physical::CardinalityModel card;
+    card.recursive_iterations = 10.0;
+    LoweringContext ctx;
+    ctx.cardinality = &card;
+    const LoweringResult r = lower(*logical, ctx);
+    CHECK(r.ok);
+    if (!r.plan) return;
+    const db25::physical::CalibrationProfile cal = db25::physical::default_calibration();
+
+    // Find the fixpoint and its two children in the extracted plan.
+    const db25::physical::PhysicalNode* fix = r.plan->children.empty()
+                                                  ? nullptr
+                                                  : r.plan->children[0].get();
+    CHECK(fix != nullptr && fix->op == PhysicalOp::RecursiveFixpoint);
+    if (fix == nullptr || fix->children.size() != 2) return;
+    const double anchor = cost_of(*fix->children[0], cal, card);
+    const double term = cost_of(*fix->children[1], cal, card);
+    const double whole = cost_of(*fix, cal, card);
+    CHECK(term > 0.0);
+    // Ten runs of the term, not one. The `>=` is because the fixpoint's own
+    // per-row work is on top of this; the point is the floor.
+    CHECK(whole >= anchor + 10.0 * term);
+    // And the floor is not vacuous: charging the term once would be well below it.
+    CHECK(anchor + term < anchor + 10.0 * term);
+
+    // The same multiplier is in the ROW estimate, and it has to be: an operator
+    // above the fixpoint sizes itself from this number, and one iteration's worth
+    // of rows would understate a ten-iteration recursion by an order of
+    // magnitude. Asserted as an EQUALITY against the two children's estimates,
+    // because "more rows than one iteration" is satisfied by any multiplier at
+    // all - including one that ignores the iteration count entirely and merely
+    // adds the two children.
+    const double anchor_rows = card.rows(*fix->children[0]);
+    const double term_rows = card.rows(*fix->children[1]);
+    CHECK(term_rows > 0.0);
+    CHECK(card.rows(*fix) == anchor_rows + 10.0 * term_rows);
+}
+
+// A working-table scan reads rows THIS query produced an iteration ago. That
+// makes it Fresh as a fact rather than as a convention - there is no stored copy
+// that could lag - and orderless, because the fixpoint above it guarantees no
+// order and this reads what that wrote.
+static void test_a_working_table_scan_is_fresh_and_orderless() {
+    std::printf("test_a_working_table_scan_is_fresh_and_orderless\n");
+    auto logical = build_recursive();
+    // A query that demands fresh data must not be refused because of one.
+    LoweringContext ctx;
+    ctx.required_freshness = Freshness::Fresh;
+    const LoweringResult r = lower(*logical, ctx);
+    CHECK(r.ok);
+    if (!r.plan) { std::printf("  error: %s\n", r.error.c_str()); return; }
+    auto wts = std::make_unique<db25::physical::PhysicalNode>(PhysicalOp::WorkingTableScan);
+    wts->table_name = "t";
+    const PhysicalProperties p = derive(*wts);
+    CHECK(p.freshness == Freshness::Fresh);
+    CHECK(p.sort.empty());
+}
+
+// Two DIFFERENT CTEs whose columns happen to have the same types are not the
+// same relation, and structural dedup must not merge them. Before the group key
+// carried a working-table scan's name, it carried only a SeqScan's - so these
+// two scans were structurally identical and one recursion would have read the
+// other's rows.
+static void test_two_working_table_scans_of_different_ctes_never_share_a_group() {
+    std::printf("test_two_working_table_scans_of_different_ctes_never_share_a_group\n");
+    const plan::Schema out{{"n", DataType::Integer, false}};
+    const auto scan_of = [&](const char* name) {
+        auto w = std::make_unique<plan::LogicalNode>(plan::LogicalOp::WorkingTableScan);
+        w->table_name = name;
+        w->output = out;
+        return w;
+    };
+    // A union of two working-table scans - the smallest plan that puts both in
+    // one memo, which is what dedup would have to merge them in.
+    auto set = std::make_unique<plan::LogicalNode>(plan::LogicalOp::SetOp);
+    set->set_op = db25::ast::SetOp::UnionAll;
+    set->output = out;
+    set->add_child(scan_of("t"));
+    set->add_child(scan_of("u"));
+
+    LoweringContext ctx;
+    ctx.dedup = true;
+    const LoweringResult r = lower(*set, ctx);
+    CHECK(r.ok);
+    CHECK(r.groups_shared == 0);
+    const std::string s = r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    CHECK(contains(s, "cte=t"));
+    CHECK(contains(s, "cte=u"));
+
+    // The control: two scans of the SAME cte ARE one group, so the check above
+    // is about the name and not about dedup being off.
+    auto same = std::make_unique<plan::LogicalNode>(plan::LogicalOp::SetOp);
+    same->set_op = db25::ast::SetOp::UnionAll;
+    same->output = out;
+    same->add_child(scan_of("t"));
+    same->add_child(scan_of("t"));
+    const LoweringResult rs = lower(*same, ctx);
+    CHECK(rs.ok);
+    CHECK(rs.groups_shared == 1);
+}
+
+// CREATE TABLE AS: the query plans exactly as it would on its own, with one
+// operator on top that writes the rows into the new table.
+static void test_create_table_as_lowers_and_prices_the_write() {
+    std::printf("test_create_table_as_lowers_and_prices_the_write\n");
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "a";
+    scan->output = a_schema();
+    auto ctas = std::make_unique<plan::LogicalNode>(plan::LogicalOp::CreateTableAs);
+    ctas->table_name = "big_a";
+    ctas->output = a_schema();
+    ctas->add_child(std::move(scan));
+
+    const LoweringResult r = lower(*ctas);
+    CHECK(r.ok);
+    if (!r.plan) { std::printf("  error: %s\n", r.error.c_str()); return; }
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(contains(s, "(CreateTableAs table=big_a"));
+    CHECK(contains(s, "SeqScan table=a"));
+
+    // The write is PRICED. A materialization charged nothing would make plans
+    // that write look free next to plans that do not.
+    const db25::physical::CalibrationProfile cal = db25::physical::default_calibration();
+    const db25::physical::CardinalityModel card;
+    const double child = cost_of(*r.plan->children[0], cal, card);
+    CHECK(cost_of(*r.plan, cal, card) > child);
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -2247,6 +2476,12 @@ int main() {
     test_the_hash_join_builds_the_smaller_side();
     test_a_hash_join_beats_a_nested_loop_on_lopsided_inputs();
     test_the_build_side_is_only_chosen_where_it_is_sound();
+    test_a_recursive_cte_lowers();
+    test_a_recursive_union_is_not_a_recursive_union_all();
+    test_the_recursive_term_is_charged_once_per_iteration();
+    test_a_working_table_scan_is_fresh_and_orderless();
+    test_two_working_table_scans_of_different_ctes_never_share_a_group();
+    test_create_table_as_lowers_and_prices_the_write();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

@@ -306,6 +306,21 @@ void render_node(const PhysicalNode& n, const std::string& indent, std::string& 
         case PhysicalOp::FormatConvert:
             out += std::string(" to=") + storage_format_to_string(n.target_format);
             break;
+        case PhysicalOp::RecursiveFixpoint:
+            // The CTE's name, and WHICH union. UNION de-duplicates across
+            // iterations and UNION ALL does not, which on cyclic data is the
+            // difference between terminating and not - so it is printed, for the
+            // same reason a set operation and a join kind are.
+            out += " cte=" + n.table_name;
+            out += " kind=";
+            out += set_op_to_string(n.set_op);
+            break;
+        case PhysicalOp::WorkingTableScan:
+            out += " cte=" + n.table_name;
+            break;
+        case PhysicalOp::CreateTableAs:
+            out += " table=" + n.table_name;
+            break;
     }
 
     out += " out=" + render_schema(n.output);

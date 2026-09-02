@@ -28,6 +28,9 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::HashGroupingSets: return "HashGroupingSets";
         case PhysicalOp::HashAggregate: return "HashAggregate";
         case PhysicalOp::StreamingAggregate: return "StreamingAggregate";
+        case PhysicalOp::RecursiveFixpoint: return "RecursiveFixpoint";
+        case PhysicalOp::WorkingTableScan: return "WorkingTableScan";
+        case PhysicalOp::CreateTableAs: return "CreateTableAs";
     }
     return "?";
 }
@@ -152,6 +155,13 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::HashGroupingSets: return 1;
         case PhysicalOp::HashAggregate: return 1;
         case PhysicalOp::StreamingAggregate: return 1;
+        // Binary: the anchor and the recursive term, in that order. Two children
+        // rather than one with the recursion hidden inside, because the anchor is
+        // evaluated ONCE and the term repeatedly - a distinction the plan has to
+        // make for an executor to be able to run it.
+        case PhysicalOp::RecursiveFixpoint: return 2;
+        case PhysicalOp::WorkingTableScan: return 0;
+        case PhysicalOp::CreateTableAs: return 1;
     }
     return 0;
 }

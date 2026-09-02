@@ -69,7 +69,17 @@
     ; are one operation; only who asked for it differs.
     (operator (name Sort)          (arity 1) (kind pipeline-breaker))
     ; A pure enforcer: inserted to establish a required storage format.
-    (operator (name FormatConvert) (arity 1) (kind pipeline)))
+    (operator (name FormatConvert) (arity 1) (kind pipeline))
+    ; WITH RECURSIVE. RecursiveFixpoint takes the anchor and the recursive term as
+    ; its two children - the anchor is evaluated once, the term once per iteration,
+    ; which is why they are separate children rather than one hidden input.
+    ; WorkingTableScan is the recursive self-reference: a leaf whose rows come from
+    ; the previous iteration, and the only operator in this catalog fed from
+    ; elsewhere in its own plan.
+    (operator (name RecursiveFixpoint)  (arity 2) (kind pipeline-breaker))
+    (operator (name WorkingTableScan)   (arity 0) (kind access-path))
+    ; CREATE TABLE AS: materialize the input stream into a new table.
+    (operator (name CreateTableAs)      (arity 1) (kind pipeline-breaker)))
 
   ; Implementation rules: the physical operator each logical operator lowers to.
   ; Increment 0 is single-candidate (one physical op per logical op); a rule set
@@ -107,7 +117,13 @@
     (rule (logical SemiJoin)  (physical HashSemiJoin))
     (rule (logical SemiJoin)  (physical NestedLoopSemiJoin))
     (rule (logical AntiJoin)  (physical HashAntiJoin))
-    (rule (logical AntiJoin)  (physical NestedLoopAntiJoin)))
+    (rule (logical AntiJoin)  (physical NestedLoopAntiJoin))
+    ; Single-candidate, and not for want of looking: a fixpoint is evaluated one
+    ; way, and the semi-naive refinement is a detail inside that operator rather
+    ; than a rival to cost against it.
+    (rule (logical RecursiveCTE)      (physical RecursiveFixpoint))
+    (rule (logical WorkingTableScan)  (physical WorkingTableScan))
+    (rule (logical CreateTableAs)     (physical CreateTableAs)))
 
   ; Where exhaustive search stops being affordable (design D5). Past this many
   ; joins the planner falls back to a bounded enumeration - a worse plan chosen by
@@ -129,4 +145,4 @@
               Sort FormatConvert Limit HashAggregate StreamingAggregate Window
               HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan
               HashSemiJoin HashAntiJoin NestedLoopSemiJoin NestedLoopAntiJoin
-              HashGroupingSets)))
+              HashGroupingSets RecursiveFixpoint WorkingTableScan CreateTableAs)))

@@ -71,6 +71,18 @@ struct CalibrationProfile {
     double union_all_row = 0.15;          // copy one row through; no comparison
     double set_op_row = 1.0;              // hash-build or probe one row
     double values_row = 0.05;             // materialize one literal row
+    // One iteration of a recursive fixpoint per row that flows through it: write
+    // the row to the working table and read it back on the next pass. Above
+    // union_all_row because the round trip through the working table is a
+    // materialization, not a copy-through.
+    double recursive_row = 0.6;
+    // Read one row back out of the working table. Below scan_row: the working
+    // table was written by this same query and is where it was left.
+    double working_table_row = 0.5;
+    // Write one row into the table a CTAS is creating. Dearer than reading one -
+    // it is a durable write, with whatever the storage layer does around it - and
+    // that ratio is what stops a plan being chosen as if materializing were free.
+    double table_write_row = 2.0;
     // Hardware facts (informational today; richer costing consumes them later).
     std::uint32_t simd_width = 8;
     std::uint32_t cache_line = 64;
@@ -119,6 +131,17 @@ struct CardinalityModel {
     // column sets - a GROUP BY key list versus every output column - and a real
     // estimate from statistics will not give them the same answer.
     double distinct_selectivity = 0.5;
+    // How many times a recursive term is expected to run. NOT derivable: it
+    // depends on the data, and a planner that pretended otherwise would be
+    // inventing a number rather than admitting one. Postgres assumes ten for the
+    // same reason, and this is that assumption, named and in one place so a
+    // statistics source can replace it.
+    double recursive_iterations = 10.0;
+    // Rows the working table is assumed to hold on an iteration. Same status as
+    // the above and for the same reason: the recursive term is explored bottom-up,
+    // BEFORE the fixpoint that will feed it exists, so there is nothing to derive
+    // it from at the point it is needed.
+    double working_table_rows = 100.0;
 
     // Estimated output rows of the plan rooted at `node`.
     [[nodiscard]] double rows(const PhysicalNode& node) const;
@@ -148,6 +171,19 @@ struct CardinalityModel {
 // `build_right` says which input a hash join materializes - the difference
 // between hashing a thousand rows and probing ten, and hashing ten and probing a
 // thousand.
+// How many times `op` evaluates input `index`. One for every operator but the
+// recursive fixpoint, whose SECOND input - the recursive term - runs once per
+// iteration. Without this the term's whole subtree would be charged once, and a
+// recursive query would be costed as though the recursion were free.
+//
+// The nested loops deliberately return one here even though they re-scan their
+// right input per left row. Their quadratic `nested_loop_pair` term already
+// prices that re-scanning, and multiplying the child's cost on top would charge
+// it twice. The difference is that the fixpoint has NO term standing in for its
+// repetition - which is why this exists.
+[[nodiscard]] double input_evaluations(PhysicalOp op, std::size_t index,
+                                       const CardinalityModel& card) noexcept;
+
 [[nodiscard]] double operator_cost(PhysicalOp op, std::span<const double> input_rows,
                                    double out_rows, const CalibrationProfile& cal,
                                    StorageFormat scan_format = StorageFormat::Row,
