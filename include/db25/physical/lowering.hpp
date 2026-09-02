@@ -13,6 +13,7 @@
 // the planner exist now; the producer arrives with the execution engine, so it is
 // currently an empty, optional input the lowering accepts and ignores.
 #include "db25/physical/cost.hpp"
+#include "db25/physical/join_order.hpp"
 #include "db25/physical/physical_plan.hpp"
 #include "db25/physical/properties.hpp"
 #include "db25/physical/spec.hpp"
@@ -72,6 +73,12 @@ struct LoweringContext {
     // re-derivation exponential. Turn this on with that, or for a workload with
     // genuinely repeated subtrees; the mechanism is ready either way.
     bool dedup = false;
+    // Associative join reordering (increment 3.8b). A region of INNER / CROSS
+    // joins is re-associated by an interval DP, so which tree the query text
+    // happened to write is not the tree the planner has to build. On by default;
+    // off is a diagnostic, and the pair of runs is what a test compares to show
+    // that reordering only ever produced a plan the cost model prefers.
+    bool reorder_joins = true;
     // Override the spec's search budget (design D5). Zero means "use the spec's".
     // A test can force the guard on a small query; production reads the spec.
     std::uint32_t max_join_count_override = 0;
@@ -81,6 +88,12 @@ struct LoweringContext {
 struct LoweringResult {
     bool ok = false;
     std::string error;
+    // Storage the plan BORROWS. Declared before `plan` so it outlives it through
+    // destruction as well as through use: reordering re-addresses a conjunct's
+    // columns when it moves a join, and the re-addressed copy has to live
+    // somewhere the caller owns. Empty for a plan that reordered nothing, which
+    // is every plan the earlier increments produced.
+    LoweringArena arena;
     PhysicalNodePtr plan;
     std::size_t memo_groups = 0;  // groups the memo held (one per logical node)
     // Physical candidates enumerated across all groups. More than one per group
@@ -106,6 +119,14 @@ struct LoweringResult {
     // needs to know which of the two it got.
     std::size_t join_count = 0;
     bool budget_guard_engaged = false;
+    // Join regions the interval DP enumerated - maximal INNER / CROSS subtrees of
+    // three or more leaves whose every join has a connecting predicate. ENUMERATED,
+    // not reordered: the tree the query wrote is one of the trees the DP considers,
+    // so a region can be enumerated and still come out exactly as written, which is
+    // the correct outcome when the written order is already the cheapest. Zero on a
+    // query with no such region, which is most of them - two tables have only one
+    // association, and a region containing a cross product is left alone.
+    std::size_t join_regions_enumerated = 0;
 };
 
 // Lower a logical plan to a physical plan. The physical plan borrows expression

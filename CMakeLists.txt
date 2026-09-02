@@ -102,6 +102,14 @@ if(DB25_PHYSICAL_BUILD_TESTS)
         DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
     add_test(NAME lowering_tests COMMAND lowering_tests)
 
+    # Join reordering: the interval DP and the index arithmetic it rests on.
+    add_executable(join_order_tests tests/test_join_order.cpp)
+    target_link_libraries(join_order_tests PRIVATE db25physicalplan)
+    target_compile_options(join_order_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    target_compile_definitions(join_order_tests PRIVATE
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME join_order_tests COMMAND join_order_tests)
+
     # The applicability sweep. Iterates kAllPhysicalOps, so an operator added
     # without a decision about its preconditions, its cost, its derivation or its
     # name fails HERE rather than in a query months later.

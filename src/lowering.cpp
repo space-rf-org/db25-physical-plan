@@ -188,6 +188,71 @@ GroupingSpec grouping_of(const Group& g) {
                         static_cast<std::uint32_t>(g.grouping_sets.size())};
 }
 
+// Add every applicable candidate for one group: each implementation the rules
+// offer, times each storage format the substrate has, times each build side that
+// is a real choice. Shared by ordinary lowering and by the reordering DP below,
+// which differ only in where the inputs and the predicate came from - so a new
+// applicability rule or a new candidate axis lands in ONE loop rather than two
+// that drift apart.
+std::size_t add_candidates(Memo& memo, GroupId g, std::span<const PhysicalOp> cands,
+                           std::span<const FormatAvailability> formats,
+                           const std::vector<GroupId>& inputs,
+                           const std::vector<HashKey>& keys,
+                           const std::vector<const plan::Expr*>& residual) {
+    const ast::JoinType join_kind = memo.group(g).join_kind;
+    const GroupingSpec group_spec = grouping_of(memo.group(g));
+    // The candidate count is known before the loop, so the vector never has to
+    // grow and re-move what it already holds.
+    // Reserve the EXACT candidate count, build sides included. Reserving only
+    // cands * formats left the vector one grow short as soon as a join offered
+    // both build sides, and that grow showed up as +2 allocations on the budget
+    // query - a reserve that is nearly right is a reserve that reallocates.
+    std::size_t n_cand = 0;
+    for (const PhysicalOp cand : cands) {
+        n_cand += formats.size() * (is_build_side_choosable(cand, join_kind) ? 2u : 1u);
+    }
+    // RESERVE, not assign: the DP adds the candidates of every split to the same
+    // group, so this runs more than once per group and must never shrink what is
+    // already there.
+    memo.group(g).exprs.reserve(memo.group(g).exprs.size() + n_cand);
+    std::size_t added = 0;
+    for (const PhysicalOp cand : cands) {
+        // A candidate whose precondition does not hold is not a cheaper option, it
+        // is not an option at all.
+        if (!is_applicable(cand, keys, join_kind, group_spec, memo.group(g).set_op)) continue;
+        // Where the build side is a real choice, offer BOTH and let the search
+        // cost them like any other pair. Where it is not, offer only the
+        // semantically fixed one - a swapped candidate there would compute a
+        // different relation, not a cheaper plan.
+        const bool choose_build = is_build_side_choosable(cand, join_kind);
+        for (const FormatAvailability& fa : formats) {
+            for (int side = 0; side < (choose_build ? 2 : 1); ++side) {
+                GroupExpr ge;
+                ge.op = cand;
+                ge.scan_format = fa.format;
+                ge.scan_freshness = fa.freshness;
+                ge.build_right = (side == 0);
+                // Per candidate, because a candidate IS (operator, input groups) -
+                // which is what lets the DP put two associations of the same join
+                // in one group, reading different inputs on different keys.
+                ge.inputs = inputs;
+                ge.hash_keys = keys;
+                ge.residual = residual;
+                // Recomputed per candidate rather than hoisted out of these loops.
+                // Hoisting looks like an obvious win - it depends on neither the
+                // format nor the build side - but the result must then be COPIED
+                // into each candidate, and a copy of an ArityVec<PhysicalProperties>
+                // copies the sort vectors inside it. Measured: hoisting made the
+                // budget query WORSE by one allocation, not better.
+                ge.input_reqs = required_input_properties(cand, keys, memo.group(g).sort_keys);
+                memo.add_expr(g, std::move(ge));
+                ++added;
+            }
+        }
+    }
+    return added;
+}
+
 // ---- phase 1: exploration -------------------------------------------------
 // Build the memo's groups and their candidate group-expressions. NO costing and
 // NO winner here: what a candidate costs, and therefore which one wins, depends
@@ -196,8 +261,189 @@ GroupingSpec grouping_of(const Group& g) {
 // than a bottom-up sweep that happens to consult properties.
 GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
                 const CardinalityModel& card, const StorageCatalog& storage,
-                std::size_t& candidates, std::size_t& shared, std::size_t& joins,
-                std::string& error) {
+                LoweringArena& arena, std::size_t& candidates, std::size_t& shared,
+                std::size_t& joins, std::size_t& regions, std::string& error);
+
+// ---- join reordering: the interval DP -------------------------------------
+// A region of INNER / CROSS joins has many association trees returning the same
+// rows at very different costs, and which one the query text happened to write is
+// not a planning decision. This enumerates them.
+//
+// The state is a RANGE of leaves, because an in-order traversal gives every
+// subtree a contiguous one (see join_order.hpp). So the DP is the classic
+// interval DP: one memo group per range [first, last), and one group-expression
+// per split point - each split being a different association, all producing the
+// same relation, which is exactly what a memo group is for. That is O(n^2) groups
+// and O(n^3) candidates, against the O(3^n) of the general subset DP, and it is
+// the whole of what re-association (as opposed to permutation) can reach.
+//
+// TWO RULES BOUND IT, and neither is about cost:
+//
+//   Only CONNECTED splits are enumerated - a split whose join has a conjunct
+//   touching both sides. Not primarily to avoid cross products, but because the
+//   cardinality model charges one flat join_selectivity per join: a cross product
+//   estimated at a fraction of |A|x|B| is not merely imprecise, it is off by that
+//   fraction, and the DP would happily choose the plan built on that error. A
+//   region with no connected tree at all is left exactly as written.
+//
+//   The leaf count is capped. n^2 groups and n^3 candidates is fine at ten leaves
+//   and is not at sixty-four, and a planner that takes longer than the query is
+//   not a faster planner.
+constexpr std::size_t kMaxReorderLeaves = 10;
+
+// Does the join over [first, split) and [split, last) carry a conjunct relating
+// its two sides? A conjunct placed here that names only one side constrains an
+// input; it does not join anything, so it does not make the pair connected.
+bool split_connects(const JoinRegion& region, std::size_t first, std::size_t split,
+                    std::size_t last) {
+    const std::uint64_t l = range_mask(first, split);
+    const std::uint64_t r = range_mask(split, last);
+    for (const RegionConjunct& c : region.conjuncts) {
+        if (!placed_here(c, first, split, last)) continue;
+        if ((c.leaf_mask & l) != 0 && (c.leaf_mask & r) != 0) return true;
+    }
+    return false;
+}
+
+GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region,
+                            Memo& memo, const LoweringContext& ctx,
+                            const CardinalityModel& card, const StorageCatalog& storage,
+                            LoweringArena& arena, std::size_t& candidates,
+                            std::size_t& shared, std::size_t& joins,
+                            std::size_t& regions, std::string& error) {
+    const std::size_t nl = region.leaf_count();
+    if (nl > kMaxReorderLeaves) return kInvalidGroup;
+    const auto at = [nl](std::size_t first, std::size_t last) { return first * (nl + 1) + last; };
+
+    // Pass one: which ranges have a connected tree at all. Run BEFORE anything is
+    // built, so a region the DP cannot cover costs nothing and is lowered the
+    // ordinary way - the fallback has to be free, or a query with a cross product
+    // in it would pay for an enumeration that found nothing.
+    std::vector<char> viable((nl + 1) * (nl + 1), 0);
+    for (std::size_t i = 0; i < nl; ++i) viable[at(i, i + 1)] = 1;  // a leaf is its own plan
+    for (std::size_t width = 2; width <= nl; ++width) {
+        for (std::size_t first = 0; first + width <= nl; ++first) {
+            const std::size_t last = first + width;
+            for (std::size_t split = first + 1; split < last; ++split) {
+                if (viable[at(first, split)] == 0 || viable[at(split, last)] == 0) continue;
+                if (!split_connects(region, first, split, last)) continue;
+                viable[at(first, last)] = 1;
+                break;
+            }
+        }
+    }
+    if (viable[at(0, nl)] == 0) return kInvalidGroup;
+
+    // Pass two: build. Leaves first, then every viable range in increasing width,
+    // so a range's inputs already exist when its candidates are added.
+    std::vector<GroupId> gid((nl + 1) * (nl + 1), kInvalidGroup);
+    for (std::size_t i = 0; i < nl; ++i) {
+        const GroupId lg = explore(*region.leaves[i], memo, ctx, card, storage, arena,
+                                   candidates, shared, joins, regions, error);
+        if (lg == kInvalidGroup) return kInvalidGroup;  // error is set
+        gid[at(i, i + 1)] = lg;
+    }
+    joins += nl - 1;  // the region's joins, however it ends up associated
+    ++regions;
+
+    const std::span<const PhysicalOp> cands = resolve_candidates(plan::LogicalOp::Join, ctx);
+    if (cands.empty()) {
+        error = "no implementation rule for logical operator 'Join'";
+        return kInvalidGroup;
+    }
+    static const FormatAvailability kRowOnly[]{FormatAvailability{StorageFormat::Row}};
+
+    for (std::size_t width = 2; width <= nl; ++width) {
+        for (std::size_t first = 0; first + width <= nl; ++first) {
+            const std::size_t last = first + width;
+            if (viable[at(first, last)] == 0) continue;
+            // The range's schema is its leaves' columns concatenated, which for the
+            // WHOLE region is the logical node's own output - so the parent, which
+            // holds indices into that, sees no change whatever the DP chooses. A
+            // proper sub-range produced no logical node, so its schema is
+            // synthesized here and owned by the arena.
+            const plan::Schema* out = region.output;
+            if (width != nl) {
+                arena.schemas.push_back(std::make_unique<plan::Schema>());
+                plan::Schema& sch = *arena.schemas.back();
+                std::size_t w = 0;
+                for (std::size_t i = first; i < last; ++i) w += region.leaves[i]->output.size();
+                sch.reserve(w);
+                for (std::size_t i = first; i < last; ++i) {
+                    for (const plan::ColumnSchema& c : region.leaves[i]->output) sch.push_back(c);
+                }
+                out = &sch;
+            }
+            const GroupId g = memo.add_group(*out);
+            // An INNER join: every join the DP builds carries a connecting
+            // conjunct, so none of them is the cross product that CROSS names.
+            memo.group(g).join_kind = ast::JoinType::Inner;
+
+            bool rows_set = false;
+            for (std::size_t split = first + 1; split < last; ++split) {
+                if (viable[at(first, split)] == 0 || viable[at(split, last)] == 0) continue;
+                if (!split_connects(region, first, split, last)) continue;
+                const std::vector<GroupId> inputs{gid[at(first, split)], gid[at(split, last)]};
+                // This join's own left input is the region's columns
+                // [leaf_offset[first], end_of(split)) - contiguous, so its width is
+                // a subtraction and every conjunct index a single offset away.
+                const std::uint32_t left_width =
+                    region.end_of(split) - region.leaf_offset[first];
+                std::vector<HashKey> keys;
+                std::vector<const plan::Expr*> residual;
+                for (const RegionConjunct& c : region.conjuncts) {
+                    if (!placed_here(c, first, split, last)) continue;
+                    split_join_predicate(translate_conjunct(c, region, first, arena),
+                                         left_width, keys, residual);
+                }
+                candidates += add_candidates(memo, g, cands, kRowOnly, inputs, keys, residual);
+                if (!rows_set) {
+                    // Cardinality is a property of the GROUP, and every split of a
+                    // range yields the same one: rows multiply and the model
+                    // charges one selectivity per join, so |A||B|s . |C|s and
+                    // |A|s . |B||C|s are the same product. Taken from the first
+                    // split rather than averaged, so the estimate is a number the
+                    // model actually produced.
+                    const double in_rows[2] = {memo.group(inputs[0]).rows,
+                                               memo.group(inputs[1]).rows};
+                    memo.set_rows(g, operator_rows(PhysicalOp::HashJoin,
+                                                   std::span<const double>{in_rows, 2}, "", card,
+                                                   LimitSpec{}, GroupingSpec{}, ast::SetOp::Union,
+                                                   0.0));
+                    rows_set = true;
+                }
+            }
+            if (memo.group(g).exprs.empty()) {
+                // Viability said a connected tree exists, so a split was offered;
+                // reaching here means no physical operator was applicable to any of
+                // them, which is a planning failure and not a reason to reorder less.
+                error = "no applicable physical operator for a reordered join";
+                return kInvalidGroup;
+            }
+            gid[at(first, last)] = g;
+        }
+    }
+    return gid[at(0, nl)];
+}
+
+GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& ctx,
+                const CardinalityModel& card, const StorageCatalog& storage,
+                LoweringArena& arena, std::size_t& candidates, std::size_t& shared,
+                std::size_t& joins, std::size_t& regions, std::string& error) {
+    // A reorderable join region is planned as a whole rather than node by node:
+    // the tree the query wrote is one of the trees the DP enumerates, not the
+    // frame the others have to fit inside. When the region cannot be covered
+    // (a cross product in it, or too many leaves) this returns kInvalidGroup with
+    // no error and lowering proceeds exactly as it did before.
+    if (ctx.reorder_joins && n.op == plan::LogicalOp::Join) {
+        JoinRegion region;
+        if (collect_join_region(n, region)) {
+            const GroupId g = explore_join_region(n, region, memo, ctx, card, storage, arena,
+                                                  candidates, shared, joins, regions, error);
+            if (g != kInvalidGroup) return g;
+            if (!error.empty()) return kInvalidGroup;
+        }
+    }
     if (n.op == plan::LogicalOp::Join) ++joins;
     const std::span<const PhysicalOp> cands = resolve_candidates(n.op, ctx);
     if (cands.empty()) {
@@ -209,8 +455,8 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
 
     std::vector<GroupId> inputs;
     for (std::size_t i = 0; i < n.child_count(); ++i) {
-        const GroupId g = explore(*n.child(i), memo, ctx, card, storage, candidates, shared,
-                                  joins, error);
+        const GroupId g = explore(*n.child(i), memo, ctx, card, storage, arena, candidates,
+                                  shared, joins, regions, error);
         if (g == kInvalidGroup) return kInvalidGroup;
         inputs.push_back(g);
     }
@@ -500,58 +746,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         }
     }
 
-    const std::vector<HashKey>& keys = hash_keys;
-    const ast::JoinType payload_join_kind = memo.group(g).join_kind;
-    const GroupingSpec group_spec = grouping_of(memo.group(g));
-    // The candidate count is known before the loop, so the vector never has to
-    // grow and re-move what it already holds.
-    // Reserve the EXACT candidate count, build sides included. Reserving only
-    // cands * formats left the vector one grow short as soon as a join offered
-    // both build sides, and that grow showed up as +2 allocations on the budget
-    // query - a reserve that is nearly right is a reserve that reallocates.
-    {
-        std::size_t n_cand = 0;
-        for (const PhysicalOp cand : cands) {
-            n_cand += scan_formats.size() *
-                      (is_build_side_choosable(cand, memo.group(g).join_kind) ? 2u : 1u);
-        }
-        memo.group(g).exprs.reserve(n_cand);
-    }
-    for (const PhysicalOp cand : cands) {
-        // A candidate whose precondition does not hold is not a cheaper option, it
-        // is not an option at all.
-        if (!is_applicable(cand, keys, payload_join_kind, group_spec,
-                           memo.group(g).set_op)) continue;
-        // Where the build side is a real choice, offer BOTH and let the search
-        // cost them like any other pair. Where it is not, offer only the
-        // semantically fixed one - a swapped candidate there would compute a
-        // different relation, not a cheaper plan.
-        const bool choose_build = is_build_side_choosable(cand, payload_join_kind);
-        for (const FormatAvailability& fa : scan_formats) {
-            for (int side = 0; side < (choose_build ? 2 : 1); ++side) {
-                GroupExpr ge;
-                ge.op = cand;
-                ge.scan_format = fa.format;
-                ge.scan_freshness = fa.freshness;
-                ge.build_right = (side == 0);
-                // Per candidate, because a candidate IS (operator, input groups).
-                // Every candidate in this group gets the same three today; join
-                // reordering is where they start to differ.
-                ge.inputs = inputs;
-                ge.hash_keys = hash_keys;
-                ge.residual = residual;
-                // Recomputed per candidate rather than hoisted out of these loops.
-                // Hoisting looks like an obvious win - it depends on neither the
-                // format nor the build side - but the result must then be COPIED
-                // into each candidate, and a copy of an ArityVec<PhysicalProperties>
-                // copies the sort vectors inside it. Measured: hoisting made the
-                // budget query WORSE by one allocation, not better.
-                ge.input_reqs = required_input_properties(cand, keys, memo.group(g).sort_keys);
-                memo.add_expr(g, std::move(ge));
-                ++candidates;
-            }
-        }
-    }
+    candidates += add_candidates(memo, g, cands, scan_formats, inputs, hash_keys, residual);
     if (memo.group(g).exprs.empty()) {
         const char* ln = logical_op_name(n.op);
         error = std::string("no applicable physical operator for logical '") +
@@ -780,8 +975,9 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
 
     Memo memo;
     const GroupId root_group =
-        explore(root, memo, ctx, card, storage, result.candidates_considered,
-                result.groups_shared, result.join_count, result.error);
+        explore(root, memo, ctx, card, storage, result.arena, result.candidates_considered,
+                result.groups_shared, result.join_count, result.join_regions_enumerated,
+                result.error);
     if (root_group == kInvalidGroup) {
         return result;  // ok stays false, error set
     }
