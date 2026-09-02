@@ -102,6 +102,15 @@ enum class PhysicalOp : std::uint8_t {
     CreateTableAs,  // materialize the input stream into a NEW table. Named for
                     // the statement because that is precisely what it does; a
                     // synonym would only be a mapping that can drift.
+    // The write path. Each takes its rows from one input - the source query for
+    // an Insert, the (scanned and filtered) target rows for an Update or a
+    // Delete - and emits the AFFECTED rows, which is what a RETURNING clause
+    // then projects. Three operators rather than one with a mode, for the reason
+    // semi and anti joins are four: an operator that does not say which
+    // modification it performs reads the same as the other two.
+    Insert,
+    Update,
+    Delete,
 };
 
 [[nodiscard]] const char* physical_op_to_string(PhysicalOp op) noexcept;
@@ -114,7 +123,7 @@ enum class PhysicalOp : std::uint8_t {
 // Every physical operator, for exhaustive iteration (the conformance check walks
 // this against the spec so a newly-added op that the spec has not declared is
 // caught, not silently emittable). Keep in sync with PhysicalOp.
-inline constexpr std::array<PhysicalOp, 25> kAllPhysicalOps = {
+inline constexpr std::array<PhysicalOp, 28> kAllPhysicalOps = {
     PhysicalOp::SeqScan,        PhysicalOp::Filter,        PhysicalOp::Project,
     PhysicalOp::HashJoin,       PhysicalOp::MergeJoin,     PhysicalOp::NestedLoopJoin,
     PhysicalOp::Sort,           PhysicalOp::FormatConvert, PhysicalOp::Limit,
@@ -124,7 +133,8 @@ inline constexpr std::array<PhysicalOp, 25> kAllPhysicalOps = {
     PhysicalOp::HashSemiJoin,   PhysicalOp::HashAntiJoin,
     PhysicalOp::NestedLoopSemiJoin, PhysicalOp::NestedLoopAntiJoin,
     PhysicalOp::HashGroupingSets, PhysicalOp::RecursiveFixpoint,
-    PhysicalOp::WorkingTableScan, PhysicalOp::CreateTableAs};
+    PhysicalOp::WorkingTableScan, PhysicalOp::CreateTableAs,
+    PhysicalOp::Insert, PhysicalOp::Update, PhysicalOp::Delete};
 
 // Is `op` a nested-loop family member - the implementations that re-evaluate
 // their right input per left row, and so are the only ones that can serve a
@@ -331,6 +341,18 @@ struct PhysicalNode {
     std::uint32_t values_columns = 0;
     // HashGroupingSets: one bitmask per grouping set over `group_keys`.
     std::vector<std::uint64_t> grouping_sets;
+    // DML payload, BORROWED from the logical node on the same contract as every
+    // expression payload here: the logical plan outlives the physical plan.
+    //
+    // These are carried rather than reconstructed because an executor cannot
+    // recover them from anything else in the plan. An Update whose SET list was
+    // dropped is a physical operator that says "modify these rows" and not what
+    // to modify them to - the same shape of defect as a join that did not say it
+    // was an outer join.
+    const std::vector<plan::Assignment>* assignments = nullptr;   // Update, DO UPDATE
+    const std::vector<std::string>* target_columns = nullptr;     // Insert: the column list
+    const std::vector<std::string>* conflict_columns = nullptr;   // ON CONFLICT (...)
+    plan::ConflictAction conflict_action = plan::ConflictAction::None;
 
     explicit PhysicalNode(PhysicalOp o) : op(o) {}
 };

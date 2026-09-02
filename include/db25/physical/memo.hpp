@@ -139,6 +139,15 @@ struct Group {
     std::vector<std::uint64_t> grouping_sets;
     std::vector<SortKey> sort_keys;        // Sort: the order it establishes
     LimitSpec limits;                      // Limit: LIMIT / OFFSET
+    // DML: the SET list, the INSERT column list, and the ON CONFLICT target.
+    // BORROWED pointers, not copies - three vectors here would be 72 bytes and
+    // would push sizeof(Group) past the deque cliff this struct is built around,
+    // while the logical plan that owns them already has to outlive the memo.
+    // `conflict_action` packs against the one-byte enums above.
+    const std::vector<plan::Assignment>* assignments = nullptr;
+    const std::vector<std::string>* target_columns = nullptr;
+    const std::vector<std::string>* conflict_columns = nullptr;
+    plan::ConflictAction conflict_action = plan::ConflictAction::None;
 
     // WHY THE AGGREGATE PAYLOAD SHARES ONE VECTOR. Groups live in a std::deque,
     // and libstdc++ packs 512/sizeof(T) elements into each deque node - one per
@@ -225,6 +234,19 @@ struct Group {
     }
 };
 
+// The deque cliff, asserted rather than merely written down. libstdc++ packs
+// 512/sizeof(T) elements into each deque node, so crossing 256 halves the packing
+// and DOUBLES the memo's node allocations for every query - which is how a
+// 48-byte addition to this struct once cost four allocations on a five-group
+// query. The comment inside Group has said "keep sizeof(Group) at or below 256"
+// since 3.2; nothing checked it, and the allocation budget test only reports the
+// consequence after the fact and only for one query. This fails at compile time,
+// on the line that added the field.
+static_assert(sizeof(Group) <= 256,
+              "sizeof(Group) crossed the libstdc++ deque packing boundary: every "
+              "query now costs twice the memo node allocations. Borrow a pointer "
+              "instead of owning a container, or pack against the one-byte enums.");
+
 // The structural identity of a group, as exploration knows it: the logical
 // operator, the schema it produces, the groups it consumes, and its own payload.
 // Two groups with equal keys are interchangeable, so only one need exist.
@@ -257,6 +279,15 @@ struct GroupKey {
     ast::SetOp set_op = ast::SetOp::Union;
     std::uint32_t op_split = 0;
     std::vector<std::uint64_t> grouping_sets;
+    // Part of the key for the reason the join kind and the set operation are: two
+    // Updates over the same rows with different SET lists are not one operator,
+    // and merging them would apply one statement's assignments to the other's.
+    // Compared by IDENTITY (the borrowed pointer), which is exact here - each
+    // logical node owns its own vector, so two nodes never share one.
+    const std::vector<plan::Assignment>* assignments = nullptr;
+    const std::vector<std::string>* target_columns = nullptr;
+    const std::vector<std::string>* conflict_columns = nullptr;
+    plan::ConflictAction conflict_action = plan::ConflictAction::None;
     bool comparable = false;
     std::uint64_t hash = 0;
 

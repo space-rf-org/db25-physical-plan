@@ -45,6 +45,14 @@ void GroupKey::finish() noexcept {
     h = mix64(h, op_split);
     for (const std::uint64_t s : grouping_sets) h = mix64(h, s);
     h = mix64(h, static_cast<std::uint64_t>(set_op));
+    // DML payload, hashed by the IDENTITY of the borrowed vectors. Each logical
+    // node owns its own, so two nodes never share one and pointer identity is
+    // exactly "the same SET list" - which is what has to be part of the key, or
+    // two Updates differing only in what they assign would share a group.
+    h = mix64(h, reinterpret_cast<std::uintptr_t>(assignments));
+    h = mix64(h, reinterpret_cast<std::uintptr_t>(target_columns));
+    h = mix64(h, reinterpret_cast<std::uintptr_t>(conflict_columns));
+    h = mix64(h, static_cast<std::uint64_t>(conflict_action));
     hash = h;
 }
 
@@ -82,6 +90,10 @@ bool GroupKey::equals(const GroupKey& o) const noexcept {
     if (op_split != o.op_split) return false;
     if (grouping_sets != o.grouping_sets) return false;
     if (set_op != o.set_op) return false;
+    if (assignments != o.assignments) return false;
+    if (target_columns != o.target_columns) return false;
+    if (conflict_columns != o.conflict_columns) return false;
+    if (conflict_action != o.conflict_action) return false;
     if (op_exprs.size() != o.op_exprs.size()) return false;
     for (std::size_t i = 0; i < op_exprs.size(); ++i) {
         if (!expr_structurally_equal(op_exprs[i], o.op_exprs[i])) return false;
@@ -231,6 +243,10 @@ PhysicalNodePtr Memo::extract_winner_for(GroupId id, const PhysicalProperties& r
         node->projections = g.op_exprs;
     }
     node->set_op = g.set_op;
+    node->assignments = g.assignments;
+    node->target_columns = g.target_columns;
+    node->conflict_columns = g.conflict_columns;
+    node->conflict_action = g.conflict_action;
     node->build_right = ge.build_right;
     node->hash_keys = ge.hash_keys;
     node->join_kind = g.join_kind;

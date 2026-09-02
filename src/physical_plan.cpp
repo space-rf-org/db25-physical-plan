@@ -31,6 +31,9 @@ const char* physical_op_to_string(PhysicalOp op) noexcept {
         case PhysicalOp::RecursiveFixpoint: return "RecursiveFixpoint";
         case PhysicalOp::WorkingTableScan: return "WorkingTableScan";
         case PhysicalOp::CreateTableAs: return "CreateTableAs";
+        case PhysicalOp::Insert:        return "Insert";
+        case PhysicalOp::Update:        return "Update";
+        case PhysicalOp::Delete:        return "Delete";
     }
     return "?";
 }
@@ -162,6 +165,13 @@ std::size_t expected_arity(PhysicalOp op) noexcept {
         case PhysicalOp::RecursiveFixpoint: return 2;
         case PhysicalOp::WorkingTableScan: return 0;
         case PhysicalOp::CreateTableAs: return 1;
+        // One input each: the source query for an Insert, the target rows for an
+        // Update or a Delete. The TARGET RELATION is a name on the node, not a
+        // child - it is written, not read, and a scan of it as an input would say
+        // the wrong thing.
+        case PhysicalOp::Insert:        return 1;
+        case PhysicalOp::Update:        return 1;
+        case PhysicalOp::Delete:        return 1;
     }
     return 0;
 }

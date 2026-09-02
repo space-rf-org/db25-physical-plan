@@ -635,26 +635,40 @@ static void test_guarded_search_is_deterministic() {
     CHECK(contains(first, "Join"));
 }
 
+// A logical operator the rules do not cover must fail HONESTLY - with an error
+// naming the operator - rather than emit a plan that silently drops it.
+//
+// This test has been rewritten. It used to name whichever logical operator the
+// roadmap had not reached yet (Aggregate, then RecursiveCTE, then Insert), and
+// each increment turned it into a test asserting that a SUPPORTED operator
+// fails. After 3.9b there is no such operator left: every LogicalOp lowers. So it
+// now takes the shipped spec and REMOVES a rule from the resolved rule set, which
+// is the real condition it was always about - the planner meeting a logical
+// operator its rules do not cover - and which no future increment can invalidate.
 static void test_unsupported_operator_is_an_error() {
     std::printf("test_unsupported_operator_is_an_error\n");
-    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
-    scan->table_name = "a";
-    scan->output = a_schema();
-    // Deliberately an operator with NO implementation rule. This was Aggregate
-    // until Increment 3.2 gave Aggregate one, at which point the test started
-    // asserting that a supported operator fails - which is why it is written
-    // against the furthest-out operator in the roadmap rather than the nearest.
-    // It was RecursiveCTE until 3.9a lowered that; DML is what is left, and when
-    // DML lowers this test has nothing to stand on and should be rewritten
-    // against a SPEC that omits a rule rather than against the roadmap's tail.
-    auto unsupported = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Insert);
-    unsupported->output = a_schema();
-    unsupported->add_child(std::move(scan));
+    std::string error;
+    auto spec = db25::physical::load_spec(
+        std::string(DB25_PHYSICAL_SPEC_DIR) + "/physical.spec.sexpr", error);
+    CHECK(spec.has_value());
+    if (!spec) { std::printf("  spec load failed: %s\n", error.c_str()); return; }
 
-    const LoweringResult r = lower(*unsupported);
+    auto logical = build_logical();  // a Project over a Filter over a Join
+    LoweringContext ctx;
+    ctx.spec = &*spec;
+    // The control: with the full rule set this query lowers.
+    CHECK(lower(*logical, ctx).ok);
+
+    // Now take away the Filter's only implementation.
+    spec->resolved_rules.erase("Filter");
+    const LoweringResult r = lower(*logical, ctx);
     CHECK(!r.ok);
     CHECK(!r.error.empty());
     CHECK(r.plan == nullptr);
+    // And the error NAMES the operator. "lowering failed" would be true and
+    // useless; the point of failing honestly is that the reader learns which
+    // rule is missing.
+    CHECK(contains(r.error, "Filter"));
 }
 
 // MACHINERY test for cost-based selection. The two candidates here are not
@@ -2419,6 +2433,315 @@ static void test_create_table_as_lowers_and_prices_the_write() {
     CHECK(cost_of(*r.plan, cal, card) > child);
 }
 
+// ---- Increment 3.9b: the write path --------------------------------------
+
+// `INSERT INTO t (id, x) VALUES (1, 2)`, as the binder shapes it: an Insert over
+// the source rows, with the target relation a NAME on the node rather than a
+// child - it is written, not read.
+static plan::LogicalNodePtr build_insert(plan::ConflictAction conflict =
+                                             plan::ConflictAction::None) {
+    auto values = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Values);
+    values->output = a_schema();
+    values->value_rows.emplace_back();
+    values->value_rows.back().push_back(int_lit(1));
+    values->value_rows.back().push_back(int_lit(2));
+
+    auto ins = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Insert);
+    ins->table_name = "t";
+    ins->output = a_schema();
+    ins->target_columns = {"id", "x"};
+    ins->conflict_action = conflict;
+    if (conflict != plan::ConflictAction::None) ins->conflict_columns = {"id"};
+    if (conflict == plan::ConflictAction::DoUpdate) {
+        ins->assignments.push_back(plan::Assignment{2, int_lit(99)});
+    }
+    ins->add_child(std::move(values));
+    return ins;
+}
+
+// `UPDATE t SET x = <value> WHERE x > 10`: the target rows are scanned and
+// filtered below, and the operator says what to set them to.
+static plan::LogicalNodePtr build_update(std::int64_t value) {
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "t";
+    scan->output = a_schema();
+    auto filter = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Filter);
+    filter->output = a_schema();
+    filter->predicate = binop(BinaryOp::GreaterThan, col(1, DataType::Integer), int_lit(10));
+    filter->add_child(std::move(scan));
+
+    auto upd = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Update);
+    upd->table_name = "t";
+    upd->output = a_schema();
+    upd->assignments.push_back(plan::Assignment{2, int_lit(value)});
+    upd->add_child(std::move(filter));
+    return upd;
+}
+
+static plan::LogicalNodePtr build_delete() {
+    auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    scan->table_name = "t";
+    scan->output = a_schema();
+    auto del = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Delete);
+    del->table_name = "t";
+    del->output = a_schema();
+    del->add_child(std::move(scan));
+    return del;
+}
+
+// The write path lowers, and each of the three says which modification it is.
+// One operator with a mode would render identically for all three, which is the
+// defect this planner has now found in a join kind, a set operation, a build side
+// and a recursive union.
+static void test_the_write_path_lowers() {
+    std::printf("test_the_write_path_lowers\n");
+    const auto plan_of = [](const plan::LogicalNode& n) {
+        const LoweringResult r = lower(n);
+        CHECK(r.ok);
+        if (!r.ok) std::printf("  error: %s\n", r.error.c_str());
+        return r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    };
+    const auto ins = build_insert();
+    const auto upd = build_update(5);
+    const auto del = build_delete();
+    const std::string si = plan_of(*ins);
+    const std::string su = plan_of(*upd);
+    const std::string sd = plan_of(*del);
+
+    CHECK(contains(si, "(Insert table=t cols=[id x]"));
+    CHECK(contains(su, "(Update table=t set=[(col2 (lit 5))]"));
+    CHECK(contains(sd, "(Delete table=t"));
+    // The target relation is not a child of the Insert - the only scan in an
+    // UPDATE's plan is of the rows being modified, and an INSERT from VALUES
+    // scans nothing at all.
+    CHECK(!contains(si, "SeqScan"));
+    CHECK(contains(su, "SeqScan table=t"));
+    CHECK(si != su && su != sd && si != sd);
+}
+
+// An UPDATE's SET list is the whole of what it does. Dropped, the operator says
+// "modify these rows" and not what to modify them to - the same shape of defect
+// as a join that did not say it was an outer join, and unrecoverable from
+// anything else in the plan.
+static void test_an_update_carries_its_set_list() {
+    std::printf("test_an_update_carries_its_set_list\n");
+    const auto five = build_update(5);
+    const auto six = build_update(6);
+    const LoweringResult r5 = lower(*five);
+    const LoweringResult r6 = lower(*six);
+    CHECK(r5.ok && r6.ok);
+    const std::string s5 = r5.plan ? physical_to_sexpr(*r5.plan) : std::string{};
+    const std::string s6 = r6.plan ? physical_to_sexpr(*r6.plan) : std::string{};
+    CHECK(contains(s5, "set=[(col2 (lit 5))]"));
+    CHECK(contains(s6, "set=[(col2 (lit 6))]"));
+    // Two UPDATEs differing ONLY in what they assign must not render alike.
+    CHECK(s5 != s6);
+}
+
+// An upsert is a different statement from a plain INSERT, and DO NOTHING is a
+// different statement from DO UPDATE. All three have to render differently or an
+// executor reading the plan runs the wrong one. The clause was parsed and then
+// silently discarded at bind until an earlier pass caught it; this is the same
+// question asked one stage further down.
+static void test_an_upsert_is_not_a_plain_insert() {
+    std::printf("test_an_upsert_is_not_a_plain_insert\n");
+    const auto render = [](plan::ConflictAction a) {
+        const auto q = build_insert(a);
+        const LoweringResult r = lower(*q);
+        CHECK(r.ok);
+        return r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    };
+    const std::string plain = render(plan::ConflictAction::None);
+    const std::string nothing = render(plan::ConflictAction::DoNothing);
+    const std::string update = render(plan::ConflictAction::DoUpdate);
+    CHECK(!contains(plain, "conflict="));
+    CHECK(contains(nothing, "conflict=nothing on=[id]"));
+    CHECK(contains(update, "conflict=update on=[id] set=[(col2 (lit 99))]"));
+    CHECK(plain != nothing && nothing != update && plain != update);
+}
+
+// RETURNING is a projection over the rows the modification affected, and gets no
+// operator of its own. A Project above an Insert can only be a RETURNING clause -
+// there is no other reason for one to sit there - so nothing is lost by the name,
+// and a second way to say projection would need a mapping between them.
+static void test_returning_is_a_projection_over_the_affected_rows() {
+    std::printf("test_returning_is_a_projection_over_the_affected_rows\n");
+    auto ins = build_insert();
+    auto ret = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Returning);
+    ret->output = {{"id", DataType::Integer, false}};
+    ret->exprs.push_back(col(0, DataType::Integer));
+    ret->add_child(std::move(ins));
+
+    const LoweringResult r = lower(*ret);
+    CHECK(r.ok);
+    if (!r.ok) { std::printf("  error: %s\n", r.error.c_str()); return; }
+    const std::string s = physical_to_sexpr(*r.plan);
+    CHECK(s.rfind("(Project exprs=[(col #0)]", 0) == 0);
+    CHECK(contains(s, "(Insert table=t"));
+}
+
+// An UPDATE or a DELETE reads the rows it is about to modify. A lagging copy is
+// not a worse source, it is the WRONG SET OF ROWS - so freshness is a correctness
+// constraint here, and since no operator manufactures it, a target available only
+// as a stale replica makes the statement unplannable. It fails saying so rather
+// than modifying rows chosen from a lagging read.
+static void test_an_update_may_not_read_a_stale_replica() {
+    std::printf("test_an_update_may_not_read_a_stale_replica\n");
+    StorageCatalog stale;
+    stale.formats["t"] = {FormatAvailability{StorageFormat::Column, Freshness::Stale}};
+    StorageCatalog fresh;
+    fresh.formats["t"] = {FormatAvailability{StorageFormat::Row, Freshness::Fresh},
+                          FormatAvailability{StorageFormat::Column, Freshness::Stale}};
+
+    const auto upd = build_update(5);
+    const auto del = build_delete();
+    const auto try_with = [](const plan::LogicalNode& n, const StorageCatalog& cat) {
+        LoweringContext ctx;
+        ctx.storage = &cat;
+        return lower(n, ctx);
+    };
+    CHECK(!try_with(*upd, stale).ok);
+    CHECK(!try_with(*del, stale).ok);
+    CHECK(!try_with(*upd, stale).error.empty());
+    // With a fresh copy available it plans, and picks the fresh one - the stale
+    // columnar copy is cheaper to scan, so this is applicability overriding cost
+    // rather than the cost model happening to agree.
+    const LoweringResult ok = try_with(*upd, fresh);
+    CHECK(ok.ok);
+    if (ok.plan) CHECK(!contains(physical_to_sexpr(*ok.plan), "stale"));
+
+    // An INSERT is deliberately different. Its input is the SOURCE query, not the
+    // target: `INSERT INTO t SELECT ... FROM archive` may legitimately read a
+    // replica, and requiring otherwise would refuse a query that is fine.
+    auto src = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+    src->table_name = "archive";
+    src->output = a_schema();
+    auto ins = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Insert);
+    ins->table_name = "t";
+    ins->output = a_schema();
+    ins->add_child(std::move(src));
+    StorageCatalog stale_src;
+    stale_src.formats["archive"] = {FormatAvailability{StorageFormat::Column,
+                                                       Freshness::Stale}};
+    CHECK(try_with(*ins, stale_src).ok);
+}
+
+// Two UPDATEs over the same rows with different SET lists are not one operator,
+// and structural dedup must not merge them - it would apply one statement's
+// assignments to the other's rows. The SET list is part of the group's identity
+// for the reason a join's kind and a set operation are.
+static void test_two_updates_with_different_set_lists_never_share_a_group() {
+    std::printf("test_two_updates_with_different_set_lists_never_share_a_group\n");
+    // A union of two updates is artificial as SQL and is exactly the right shape
+    // here: it is the smallest plan that puts both in one memo.
+    auto both = std::make_unique<plan::LogicalNode>(plan::LogicalOp::SetOp);
+    both->set_op = db25::ast::SetOp::UnionAll;
+    both->output = a_schema();
+    both->add_child(build_update(5));
+    both->add_child(build_update(6));
+
+    LoweringContext ctx;
+    ctx.dedup = true;
+    const LoweringResult r = lower(*both, ctx);
+    CHECK(r.ok);
+    const std::string s = r.plan ? physical_to_sexpr(*r.plan) : std::string{};
+    CHECK(contains(s, "set=[(col2 (lit 5))]"));
+    CHECK(contains(s, "set=[(col2 (lit 6))]"));
+
+    // The control: two IDENTICAL updates still share, so the check above is about
+    // the SET list and not about dedup being switched off.
+    auto same = std::make_unique<plan::LogicalNode>(plan::LogicalOp::SetOp);
+    same->set_op = db25::ast::SetOp::UnionAll;
+    same->output = a_schema();
+    same->add_child(build_update(5));
+    same->add_child(build_update(5));
+    const LoweringResult rs = lower(*same, ctx);
+    CHECK(rs.ok);
+    // The two scans and the two filters share; the two Updates do NOT, because
+    // each owns its own assignment vector and identity is what the key compares.
+    CHECK(rs.groups_shared >= 2);
+}
+
+// GroupKey::equals, tested DIRECTLY rather than through a plan.
+//
+// The plan-level dedup tests above cannot reach it. The hash already includes
+// every payload field, so two keys differing in one never land in the same bucket
+// and `equals` is never called on them - which means deleting a comparison from
+// `equals` passes the whole suite. But `equals` is not a redundant second opinion:
+// find_group buckets by hash and then VERIFIES field by field, precisely because a
+// hash COLLISION that merged two different subtrees would plan one query as
+// another. That verification is what this exercises, by asking the question a
+// collision would ask.
+static void test_the_group_key_compares_every_dml_field() {
+    std::printf("test_the_group_key_compares_every_dml_field\n");
+    using db25::physical::GroupKey;
+    const plan::Schema out = a_schema();
+    const std::string table = "t";
+    std::vector<plan::Assignment> set_a;
+    set_a.push_back(plan::Assignment{2, int_lit(5)});
+    std::vector<plan::Assignment> set_b;
+    set_b.push_back(plan::Assignment{2, int_lit(6)});
+    const std::vector<std::string> cols_a{"id"};
+    const std::vector<std::string> cols_b{"x"};
+
+    const auto make = [&] {
+        GroupKey k;
+        k.logical_op = static_cast<int>(plan::LogicalOp::Update);
+        k.table_name = &table;
+        k.output = &out;
+        k.assignments = &set_a;
+        k.target_columns = &cols_a;
+        k.conflict_columns = &cols_a;
+        k.conflict_action = plan::ConflictAction::None;
+        k.finish();
+        return k;
+    };
+    // The control FIRST: two identical keys are equal. Without it every assertion
+    // below would pass on a key that is simply never comparable to anything.
+    GroupKey base = make();
+    GroupKey same = make();
+    CHECK(base.comparable);
+    CHECK(base.equals(same));
+
+    GroupKey other_set = make();
+    other_set.assignments = &set_b;
+    other_set.finish();
+    CHECK(!base.equals(other_set));
+
+    GroupKey other_cols = make();
+    other_cols.target_columns = &cols_b;
+    other_cols.finish();
+    CHECK(!base.equals(other_cols));
+
+    GroupKey other_target = make();
+    other_target.conflict_columns = &cols_b;
+    other_target.finish();
+    CHECK(!base.equals(other_target));
+
+    GroupKey other_action = make();
+    other_action.conflict_action = plan::ConflictAction::DoNothing;
+    other_action.finish();
+    CHECK(!base.equals(other_action));
+}
+
+// The write is PRICED. A modification charged nothing would make a plan that
+// writes look free beside one that does not.
+static void test_the_write_is_priced() {
+    std::printf("test_the_write_is_priced\n");
+    const db25::physical::CalibrationProfile cal = db25::physical::default_calibration();
+    const db25::physical::CardinalityModel card;
+    const auto ins = build_insert();
+    const auto upd = build_update(5);
+    const auto del = build_delete();
+    for (const plan::LogicalNode* q : {ins.get(), upd.get(), del.get()}) {
+        const LoweringResult r = lower(*q);
+        CHECK(r.ok);
+        if (!r.plan || r.plan->children.empty()) continue;
+        const double child = cost_of(*r.plan->children[0], cal, card);
+        CHECK(cost_of(*r.plan, cal, card) > child);
+    }
+}
+
 int main() {
     test_lowers_the_increment0_query();
     test_keyless_join_never_merges();
@@ -2482,6 +2805,14 @@ int main() {
     test_a_working_table_scan_is_fresh_and_orderless();
     test_two_working_table_scans_of_different_ctes_never_share_a_group();
     test_create_table_as_lowers_and_prices_the_write();
+    test_the_write_path_lowers();
+    test_an_update_carries_its_set_list();
+    test_an_upsert_is_not_a_plain_insert();
+    test_returning_is_a_projection_over_the_affected_rows();
+    test_an_update_may_not_read_a_stale_replica();
+    test_two_updates_with_different_set_lists_never_share_a_group();
+    test_the_group_key_compares_every_dml_field();
+    test_the_write_is_priced();
 
     if (g_failures == 0) {
         std::printf("lowering tests: all passed\n");

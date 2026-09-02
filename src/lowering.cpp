@@ -42,6 +42,10 @@ const char* logical_op_name(plan::LogicalOp op) {
         case plan::LogicalOp::RecursiveCTE: return "RecursiveCTE";
         case plan::LogicalOp::WorkingTableScan: return "WorkingTableScan";
         case plan::LogicalOp::CreateTableAs: return "CreateTableAs";
+        case plan::LogicalOp::Insert:  return "Insert";
+        case plan::LogicalOp::Update:  return "Update";
+        case plan::LogicalOp::Delete:  return "Delete";
+        case plan::LogicalOp::Returning: return "Returning";
         default:                       return nullptr;
     }
 }
@@ -83,6 +87,15 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
     static constexpr PhysicalOp kRecursive[]{PhysicalOp::RecursiveFixpoint};
     static constexpr PhysicalOp kWorkingTable[]{PhysicalOp::WorkingTableScan};
     static constexpr PhysicalOp kCreateTableAs[]{PhysicalOp::CreateTableAs};
+    static constexpr PhysicalOp kInsert[]{PhysicalOp::Insert};
+    static constexpr PhysicalOp kUpdate[]{PhysicalOp::Update};
+    static constexpr PhysicalOp kDelete[]{PhysicalOp::Delete};
+    // RETURNING is a PROJECTION over the rows the modification affected - which is
+    // precisely what Project is, so it gets no operator of its own. Nothing is
+    // lost by the name: a Project above an Insert can only be a RETURNING clause,
+    // there being no other reason for one to sit there. A separate operator would
+    // add a second way to say projection and a mapping between them.
+    static constexpr PhysicalOp kReturning[]{PhysicalOp::Project};
     switch (op) {
         case plan::LogicalOp::Scan:    return kScan;
         case plan::LogicalOp::Filter:  return kFilter;
@@ -100,6 +113,10 @@ std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
         case plan::LogicalOp::RecursiveCTE: return kRecursive;
         case plan::LogicalOp::WorkingTableScan: return kWorkingTable;
         case plan::LogicalOp::CreateTableAs: return kCreateTableAs;
+        case plan::LogicalOp::Insert:  return kInsert;
+        case plan::LogicalOp::Update:  return kUpdate;
+        case plan::LogicalOp::Delete:  return kDelete;
+        case plan::LogicalOp::Returning: return kReturning;
         default:                       return {};
     }
 }
@@ -667,6 +684,33 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
             // from the logical node like every other payload here.
             payload.table_name = &n.table_name;
             break;
+        case plan::LogicalOp::Insert:
+            payload.table_name = &n.table_name;      // the target relation
+            payload.target_columns = &n.target_columns;
+            // ON CONFLICT. A plain INSERT and an upsert are different statements,
+            // and an operator that did not say which would run the wrong one -
+            // the whole clause was parsed and then silently discarded at bind
+            // until an earlier pass caught it, which is why it is carried all the
+            // way here rather than only as far as it is convenient.
+            payload.conflict_action = n.conflict_action;
+            payload.conflict_columns = &n.conflict_columns;
+            // DO UPDATE reuses the assignment list.
+            payload.assignments = &n.assignments;
+            break;
+        case plan::LogicalOp::Update:
+            payload.table_name = &n.table_name;
+            // WHAT to set. Without it the operator says "modify these rows" and
+            // not what to modify them to.
+            payload.assignments = &n.assignments;
+            break;
+        case plan::LogicalOp::Delete:
+            payload.table_name = &n.table_name;
+            break;
+        case plan::LogicalOp::Returning:
+            // Lowered to a Project, so its payload is a Project's: one borrowed
+            // expression per output column.
+            for (const auto& e : n.exprs) payload.op_exprs.push_back(e.get());
+            break;
         case plan::LogicalOp::Values: {
             // Flattened row-major, `op_split` columns wide. A FROM-less SELECT is
             // one row of zero columns, which is why the width is carried
@@ -723,6 +767,10 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         key.grouping_sets = payload.grouping_sets;
         key.set_op = payload.set_op;
         key.hash_keys = hash_keys;
+        key.assignments = payload.assignments;
+        key.target_columns = payload.target_columns;
+        key.conflict_columns = payload.conflict_columns;
+        key.conflict_action = payload.conflict_action;
         key.join_kind = payload.join_kind;
         key.sort_keys = payload.sort_keys;
         key.limits = payload.limits;
@@ -742,6 +790,10 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
         grp.op_split = payload.op_split;
         grp.grouping_sets = std::move(payload.grouping_sets);
         grp.set_op = payload.set_op;
+        grp.assignments = payload.assignments;
+        grp.target_columns = payload.target_columns;
+        grp.conflict_columns = payload.conflict_columns;
+        grp.conflict_action = payload.conflict_action;
         grp.join_kind = payload.join_kind;
         grp.sort_keys = payload.sort_keys;
         grp.limits = payload.limits;
