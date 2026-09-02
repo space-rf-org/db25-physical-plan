@@ -13,7 +13,14 @@
   (hash-build-row 1.2)
   (hash-probe-row 0.8)
   (merge-join-row 0.4)
-  (nested-loop-pair 0.05)
+  ; 0.30, not the 0.05 this carried through Increment 3.6. A nested loop
+  ; evaluates the join condition once per PAIR; a hash probe (0.80) computes a
+  ; hash, finds a bucket and then compares - two to three times the work of a bare
+  ; comparison, not sixteen. At 0.05 the model priced one million pair comparisons
+  ; below a hundred thousand hash probes, so a 100000 x 10 equi-join chose the
+  ; NESTED LOOP, which no real engine would do. Only the RATIO to hash-probe-row
+  ; matters, and 0.8 / 0.3 is defensible where 0.8 / 0.05 was not.
+  (nested-loop-pair 0.30)
   (sort-row 1.0)
   (convert-row 0.6)
   (simd-width 8)

@@ -36,7 +36,13 @@ struct CalibrationProfile {
     // join condition once per PAIR, so this is multiplied by the PRODUCT of the
     // input cardinalities. The name records that difference deliberately - the
     // quadratic term is the cost model telling the truth about the algorithm.
-    double nested_loop_pair = 0.05;
+    //
+    // Its value is set by its RATIO to hash_probe_row, and that ratio was wrong.
+    // At 0.05 a hash probe cost sixteen pair comparisons, which priced one million
+    // pairs below a hundred thousand probes and made a 100000 x 10 equi-join
+    // choose the nested loop. A probe computes a hash, finds a bucket and
+    // compares: two to three times a bare comparison. 0.8 / 0.3 says that.
+    double nested_loop_pair = 0.30;
     double sort_row = 1.0;        // per-row coefficient of an n*log2(n) sort
     double convert_row = 0.6;     // convert one row between storage formats
     // A limit copies through the rows it keeps and discards the rest without

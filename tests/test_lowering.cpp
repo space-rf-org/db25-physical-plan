@@ -2074,15 +2074,13 @@ static void test_the_hash_join_builds_the_smaller_side() {
     // `a` is the left input. When `b` is the smaller it builds; when `a` is, the
     // choice flips. A plan that says "build=right" in both cases has not chosen.
     //
-    // The cardinalities are 2:1, not 10000:1, and that is deliberate. At extreme
-    // ratios the NESTED LOOP wins this join outright and there is no hash join to
-    // observe: `nested_loop_pair` (0.05) prices 100000x10 = one million pair
-    // comparisons at 50000, below a hash join's 100000 probes at 0.8 = 80000. A
-    // real engine would not agree, so that ratio is a cost-model calibration
-    // question - recorded as its own item, not silently fixed here by moving a
-    // coefficient that would shift every golden.
-    const std::string big_left = render(2000.0, 1000.0);
-    const std::string big_right = render(1000.0, 2000.0);
+    // These were 2000/1000 when this test was written, because at 100000/10 the
+    // NESTED LOOP won the join outright and there was no hash join to observe -
+    // nested_loop_pair was 0.05, pricing a million pair comparisons below a
+    // hundred thousand hash probes. Recalibrating that coefficient to 0.30 fixed
+    // it, and the ratio this test always wanted now works.
+    const std::string big_left = render(100000.0, 10.0);
+    const std::string big_right = render(10.0, 100000.0);
     CHECK(contains(big_left, "build=right"));
     CHECK(contains(big_right, "build=left"));
     CHECK(big_left != big_right);
@@ -2094,12 +2092,69 @@ static void test_the_hash_join_builds_the_smaller_side() {
     CHECK(contains(big_right, "keys=[(L#0 R#0)]"));
     // And so is the output schema - the group's schema fixes it, not the build
     // side. This is the property that makes the choice sound at all.
-    const auto out_of = [](const std::string& s) {
+    // Guarded against a missing HashJoin rather than assuming one. An earlier
+    // version indexed straight into the string, so when a mutation made the plan a
+    // nested loop the test ABORTED on substr(npos) instead of failing - hiding
+    // which assertion broke behind a crash.
+    const auto out_of = [](const std::string& s) -> std::string {
         const std::size_t i = s.find("HashJoin");
+        if (i == std::string::npos) return "<no hash join>";
         const std::size_t j = s.find("out=[", i);
-        return s.substr(j, s.find(']', j) - j);
+        if (j == std::string::npos) return "<no output schema>";
+        const std::size_t end = s.find(']', j);
+        return end == std::string::npos ? "<unterminated>" : s.substr(j, end - j);
     };
     CHECK(out_of(big_left) == out_of(big_right));
+}
+
+// A hash join must beat a nested loop on a LOPSIDED equi-join, not merely on a
+// balanced one. This is the case the cost model got wrong: at 100000 x 10 it chose
+// the nested loop, because nested_loop_pair (0.05) priced one million pair
+// comparisons at 50000, below the hash join's hundred thousand probes at 80000.
+// No real engine would agree.
+//
+// The existing test_nested_loop_never_wins_an_equi_join passed throughout, because
+// it uses balanced 1000x1000 inputs where the hash join wins by 25x. A ratio test
+// needs ratios.
+static void test_a_hash_join_beats_a_nested_loop_on_lopsided_inputs() {
+    std::printf("test_a_hash_join_beats_a_nested_loop_on_lopsided_inputs\n");
+    const db25::physical::CalibrationProfile cal = db25::physical::default_calibration();
+    using db25::physical::PhysicalOp;
+    // Every shape, not just the one that broke - but note the inner sides are all
+    // at least ten. At an inner side of TWO the nested loop legitimately wins, and
+    // the assertion below pins why: probing a two-row hash table costs more than
+    // two bare comparisons, so the crossover sits at an inner size of about
+    // hash_probe_row / nested_loop_pair. That is a real property of the model, not
+    // a residue of the bug - a first draft of this test asserted the hash join wins
+    // at 1000000 x 2 and was wrong to.
+    const double shapes[][2] = {{1000, 1000}, {100000, 10}, {10, 100000},
+                                {1000000, 20}, {50, 50}};
+    for (const auto& sh : shapes) {
+        const double in[2] = {sh[0], sh[1]};
+        const std::span<const double> inputs{in, 2};
+        const double out = in[0] * in[1] * 0.1;
+        const double hash_r = operator_cost(PhysicalOp::HashJoin, inputs, out, cal,
+                                            db25::physical::StorageFormat::Row, true);
+        const double hash_l = operator_cost(PhysicalOp::HashJoin, inputs, out, cal,
+                                            db25::physical::StorageFormat::Row, false);
+        const double nl = operator_cost(PhysicalOp::NestedLoopJoin, inputs, out, cal);
+        const double best_hash = hash_r < hash_l ? hash_r : hash_l;
+        if (best_hash >= nl) {
+            std::printf("  nested loop wins %0.f x %0.f: hash=%.1f nl=%.1f\n",
+                        sh[0], sh[1], best_hash, nl);
+        }
+        CHECK(best_hash < nl);
+    }
+    // The ratio the fix rests on, pinned so a later calibration cannot quietly
+    // undo it: a hash probe is a hash, a bucket lookup and a comparison - a few
+    // times a bare comparison, not an order of magnitude. At 0.05 this was 16, and
+    // 16 is what made a lopsided equi-join choose the nested loop.
+    const double crossover = cal.hash_probe_row / cal.nested_loop_pair;
+    CHECK(crossover < 5.0);
+    // Stated the other way round, because this is the number with meaning: below
+    // an inner side of `crossover` rows the nested loop is genuinely cheaper, and
+    // that boundary must stay in single digits. At 16 it swallowed real joins.
+    CHECK(crossover > 1.0);
 }
 
 // The choice is offered ONLY where swapping computes the same relation. An outer
@@ -2190,6 +2245,7 @@ int main() {
     test_a_keyless_semi_join_is_a_nested_loop();
     test_semi_and_anti_cardinality_are_complements_bounded_by_the_left();
     test_the_hash_join_builds_the_smaller_side();
+    test_a_hash_join_beats_a_nested_loop_on_lopsided_inputs();
     test_the_build_side_is_only_chosen_where_it_is_sound();
 
     if (g_failures == 0) {
