@@ -53,73 +53,6 @@ const char* logical_op_name(plan::LogicalOp op) {
 // The built-in mapping used when no spec is supplied. A join offers BOTH keyed
 // and keyless candidates: with no spec, a cross product still has to have a legal
 // implementation, and only the nested loop is one.
-std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
-    // Static tables: the built-in mapping is fixed, so answering with a span
-    // costs nothing per node.
-    static constexpr PhysicalOp kScan[]{PhysicalOp::SeqScan};
-    static constexpr PhysicalOp kFilter[]{PhysicalOp::Filter};
-    static constexpr PhysicalOp kProject[]{PhysicalOp::Project};
-    static constexpr PhysicalOp kJoin[]{PhysicalOp::HashJoin, PhysicalOp::NestedLoopJoin};
-    static constexpr PhysicalOp kSort[]{PhysicalOp::Sort};
-    static constexpr PhysicalOp kLimit[]{PhysicalOp::Limit};
-    // Two candidates, like a join: hashing works on any input, streaming needs a
-    // sorted one and is cheaper when it gets it. The search costs both.
-    static constexpr PhysicalOp kAggregate[]{PhysicalOp::HashAggregate,
-                                             PhysicalOp::StreamingAggregate,
-                                             PhysicalOp::HashGroupingSets};
-    static constexpr PhysicalOp kWindow[]{PhysicalOp::Window};
-    static constexpr PhysicalOp kDistinct[]{PhysicalOp::HashDistinct,
-                                            PhysicalOp::StreamingDistinct};
-    // UnionAll and HashSetOp are not alternatives for one another - they compute
-    // different things - so BOTH are offered and applicability, not cost, picks:
-    // UNION ALL admits only the concatenation, everything else only the hash.
-    static constexpr PhysicalOp kSetOp[]{PhysicalOp::UnionAll, PhysicalOp::HashSetOp};
-    static constexpr PhysicalOp kValues[]{PhysicalOp::ValuesScan};
-    static constexpr PhysicalOp kSemi[]{PhysicalOp::HashSemiJoin,
-                                        PhysicalOp::NestedLoopSemiJoin};
-    static constexpr PhysicalOp kAnti[]{PhysicalOp::HashAntiJoin,
-                                        PhysicalOp::NestedLoopAntiJoin};
-    // One implementation each, and not for want of looking. A fixpoint is
-    // evaluated one way - anchor, then the term until it adds nothing - and the
-    // semi-naive refinement is a detail INSIDE that operator, not a different
-    // operator to cost against it. The working-table scan and the CTAS write are
-    // likewise single-valued: there is nothing to choose.
-    static constexpr PhysicalOp kRecursive[]{PhysicalOp::RecursiveFixpoint};
-    static constexpr PhysicalOp kWorkingTable[]{PhysicalOp::WorkingTableScan};
-    static constexpr PhysicalOp kCreateTableAs[]{PhysicalOp::CreateTableAs};
-    static constexpr PhysicalOp kInsert[]{PhysicalOp::Insert};
-    static constexpr PhysicalOp kUpdate[]{PhysicalOp::Update};
-    static constexpr PhysicalOp kDelete[]{PhysicalOp::Delete};
-    // RETURNING is a PROJECTION over the rows the modification affected - which is
-    // precisely what Project is, so it gets no operator of its own. Nothing is
-    // lost by the name: a Project above an Insert can only be a RETURNING clause,
-    // there being no other reason for one to sit there. A separate operator would
-    // add a second way to say projection and a mapping between them.
-    static constexpr PhysicalOp kReturning[]{PhysicalOp::Project};
-    switch (op) {
-        case plan::LogicalOp::Scan:    return kScan;
-        case plan::LogicalOp::Filter:  return kFilter;
-        case plan::LogicalOp::Project: return kProject;
-        case plan::LogicalOp::Join:    return kJoin;
-        case plan::LogicalOp::Sort:    return kSort;
-        case plan::LogicalOp::Limit:   return kLimit;
-        case plan::LogicalOp::Aggregate: return kAggregate;
-        case plan::LogicalOp::Window:  return kWindow;
-        case plan::LogicalOp::Distinct: return kDistinct;
-        case plan::LogicalOp::SetOp:   return kSetOp;
-        case plan::LogicalOp::Values:  return kValues;
-        case plan::LogicalOp::SemiJoin: return kSemi;
-        case plan::LogicalOp::AntiJoin: return kAnti;
-        case plan::LogicalOp::RecursiveCTE: return kRecursive;
-        case plan::LogicalOp::WorkingTableScan: return kWorkingTable;
-        case plan::LogicalOp::CreateTableAs: return kCreateTableAs;
-        case plan::LogicalOp::Insert:  return kInsert;
-        case plan::LogicalOp::Update:  return kUpdate;
-        case plan::LogicalOp::Delete:  return kDelete;
-        case plan::LogicalOp::Returning: return kReturning;
-        default:                       return {};
-    }
-}
 
 // Every physical operator a logical operator may lower to: the spec's
 // implementation rules when a spec is supplied, else the built-in mapping. More
@@ -1074,6 +1007,80 @@ struct Optimizer {
 };
 
 }  // namespace
+
+// Exported (declared in lowering.hpp) rather than kept internal: a test asks it
+// how many candidates a logical operator has, because an operator with ONE
+// candidate has no cost ranking that a parallelism term could invert. The test
+// must read THIS table, not a copy - a copy would keep saying what was true on
+// the day it was written.
+
+std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op) {
+    // Static tables: the built-in mapping is fixed, so answering with a span
+    // costs nothing per node.
+    static constexpr PhysicalOp kScan[]{PhysicalOp::SeqScan};
+    static constexpr PhysicalOp kFilter[]{PhysicalOp::Filter};
+    static constexpr PhysicalOp kProject[]{PhysicalOp::Project};
+    static constexpr PhysicalOp kJoin[]{PhysicalOp::HashJoin, PhysicalOp::NestedLoopJoin};
+    static constexpr PhysicalOp kSort[]{PhysicalOp::Sort};
+    static constexpr PhysicalOp kLimit[]{PhysicalOp::Limit};
+    // Two candidates, like a join: hashing works on any input, streaming needs a
+    // sorted one and is cheaper when it gets it. The search costs both.
+    static constexpr PhysicalOp kAggregate[]{PhysicalOp::HashAggregate,
+                                             PhysicalOp::StreamingAggregate,
+                                             PhysicalOp::HashGroupingSets};
+    static constexpr PhysicalOp kWindow[]{PhysicalOp::Window};
+    static constexpr PhysicalOp kDistinct[]{PhysicalOp::HashDistinct,
+                                            PhysicalOp::StreamingDistinct};
+    // UnionAll and HashSetOp are not alternatives for one another - they compute
+    // different things - so BOTH are offered and applicability, not cost, picks:
+    // UNION ALL admits only the concatenation, everything else only the hash.
+    static constexpr PhysicalOp kSetOp[]{PhysicalOp::UnionAll, PhysicalOp::HashSetOp};
+    static constexpr PhysicalOp kValues[]{PhysicalOp::ValuesScan};
+    static constexpr PhysicalOp kSemi[]{PhysicalOp::HashSemiJoin,
+                                        PhysicalOp::NestedLoopSemiJoin};
+    static constexpr PhysicalOp kAnti[]{PhysicalOp::HashAntiJoin,
+                                        PhysicalOp::NestedLoopAntiJoin};
+    // One implementation each, and not for want of looking. A fixpoint is
+    // evaluated one way - anchor, then the term until it adds nothing - and the
+    // semi-naive refinement is a detail INSIDE that operator, not a different
+    // operator to cost against it. The working-table scan and the CTAS write are
+    // likewise single-valued: there is nothing to choose.
+    static constexpr PhysicalOp kRecursive[]{PhysicalOp::RecursiveFixpoint};
+    static constexpr PhysicalOp kWorkingTable[]{PhysicalOp::WorkingTableScan};
+    static constexpr PhysicalOp kCreateTableAs[]{PhysicalOp::CreateTableAs};
+    static constexpr PhysicalOp kInsert[]{PhysicalOp::Insert};
+    static constexpr PhysicalOp kUpdate[]{PhysicalOp::Update};
+    static constexpr PhysicalOp kDelete[]{PhysicalOp::Delete};
+    // RETURNING is a PROJECTION over the rows the modification affected - which is
+    // precisely what Project is, so it gets no operator of its own. Nothing is
+    // lost by the name: a Project above an Insert can only be a RETURNING clause,
+    // there being no other reason for one to sit there. A separate operator would
+    // add a second way to say projection and a mapping between them.
+    static constexpr PhysicalOp kReturning[]{PhysicalOp::Project};
+    switch (op) {
+        case plan::LogicalOp::Scan:    return kScan;
+        case plan::LogicalOp::Filter:  return kFilter;
+        case plan::LogicalOp::Project: return kProject;
+        case plan::LogicalOp::Join:    return kJoin;
+        case plan::LogicalOp::Sort:    return kSort;
+        case plan::LogicalOp::Limit:   return kLimit;
+        case plan::LogicalOp::Aggregate: return kAggregate;
+        case plan::LogicalOp::Window:  return kWindow;
+        case plan::LogicalOp::Distinct: return kDistinct;
+        case plan::LogicalOp::SetOp:   return kSetOp;
+        case plan::LogicalOp::Values:  return kValues;
+        case plan::LogicalOp::SemiJoin: return kSemi;
+        case plan::LogicalOp::AntiJoin: return kAnti;
+        case plan::LogicalOp::RecursiveCTE: return kRecursive;
+        case plan::LogicalOp::WorkingTableScan: return kWorkingTable;
+        case plan::LogicalOp::CreateTableAs: return kCreateTableAs;
+        case plan::LogicalOp::Insert:  return kInsert;
+        case plan::LogicalOp::Update:  return kUpdate;
+        case plan::LogicalOp::Delete:  return kDelete;
+        case plan::LogicalOp::Returning: return kReturning;
+        default:                       return {};
+    }
+}
 
 LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) {
     LoweringResult result;

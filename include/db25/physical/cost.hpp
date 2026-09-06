@@ -97,6 +97,11 @@ struct CalibrationProfile {
     // today - and at one node a broadcast costs exactly what a gather does,
     // which is correct rather than a degenerate case to apologize for.
     std::uint32_t cluster_nodes = 1;
+    // How many hardware threads the HOST has. A machine fact, on the same
+    // footing as `simd_width` - and, like it, DECLARED BUT NOT COSTED. See
+    // "parallelism is declared, not costed" in spec.hpp for why the search does
+    // not read it, and for the measurements behind that decision.
+    std::uint32_t cores = 1;
 };
 
 // Where a CalibrationProfile comes from (design D10). Live measures the host;
