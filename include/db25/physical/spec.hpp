@@ -31,6 +31,21 @@ struct OperatorSpec {
     // other - and conformance asserts `edge_kind()` in the code agrees with it,
     // and that `kind` is the summary these imply.
     std::vector<std::string> edges;
+    // How this operator can be spread across workers - one of:
+    //   full        embarrassingly parallel over its input (a scan, a filter)
+    //   partitioned parallel once its input is partitioned by a key (hash join,
+    //               hash aggregate): the partitioning is the price of the scaling
+    //   ordered     parallel only ACROSS independent ordered groups, serial
+    //               within one (a window over partitions, a streaming aggregate
+    //               walking group boundaries)
+    //   serial      not parallelizable (a limit must count; a fixpoint's
+    //               iteration k+1 depends on iteration k)
+    //
+    // DECLARED, NOT COSTED. Nothing in the cost model reads this - see
+    // "parallelism is declared, not costed" below. It exists because the
+    // execution simulator needs it and because an operator whose parallel
+    // behaviour nobody has stated is an operator nobody has thought about.
+    std::string parallelism;
 };
 
 // The reference execution-capability profile: which operators the (future)
@@ -39,9 +54,48 @@ struct OperatorSpec {
 struct CapabilityProfile {
     std::string name;
     std::vector<std::string> executes;  // operator names the engine can run
+    // The most workers this engine will put on one pipeline. A CAPABILITY, not a
+    // hardware fact: the host's core count lives in CalibrationProfile. "This
+    // machine has 64 cores" and "this engine uses at most 8 workers" are
+    // different statements from different sources, and one number would lose the
+    // distinction the two profiles exist to keep. Declared, not costed.
+    std::uint32_t max_dop = 1;
 
     [[nodiscard]] bool can_execute(const std::string& op) const;
 };
+
+// PARALLELISM IS DECLARED, NOT COSTED.
+//
+// The planner records a degree of parallelism and each operator's parallel
+// behaviour, and its cost model reads NEITHER. Every plan is costed as though it
+// will execute serially. That is a decision, not an oversight, and it was made
+// against measurements rather than taste:
+//
+//   - Where a Sort has to be paid for, the hash-based alternative wins by 12x to
+//     14x. For a work-span model to reverse one of those, the loser would have to
+//     be more than twelve times as parallel as the winner.
+//   - That gap is n*log(n) against n - the complexity class, not a coefficient.
+//     It holds from ten rows to a billion, and WIDENS as data grows, so no
+//     recalibration of the coefficients can close it.
+//   - Window, RecursiveFixpoint, grouping sets and the DML operators have ONE
+//     implementation each, so they have no ranking that a span term could invert.
+//     UnionAll and HashSetOp are two candidates chosen by applicability, not cost.
+//   - Exactly one decision is close enough to be at risk: an aggregate over an
+//     already-sorted input, where StreamingAggregate wins by 1.40x. If that ever
+//     matters, the fix is a parallelism-aware coefficient on that one operator -
+//     not a span term threaded through the whole search.
+//
+// The decision is cheap to reverse and expensive to pre-empt: adopting a
+// work-span cost model later costs exactly what it costs now, while adopting it
+// speculatively puts a second cost dimension permanently into the memo and
+// branch-and-bound in exchange for nothing measurable.
+//
+// WHAT WOULD REOPEN IT. The analysis covers the candidates that exist. A
+// PARALLEL-AWARE candidate - a partitioned hash join, an intra-node repartition,
+// a split-aware scan - is a plan that deliberately does more work to scale
+// better, which is precisely the trade a scalar cost cannot express. Adding one
+// voids the analysis. tests/test_parallelism.cpp fails when that happens, so the
+// question is reopened by the change itself rather than by somebody remembering.
 
 // One implementation rule: the physical operator a logical operator lowers to.
 // Increment 0 is single-candidate (one rule per logical op); alternatives are

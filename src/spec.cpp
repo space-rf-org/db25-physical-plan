@@ -77,6 +77,7 @@ std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& err
                     if (!e->list[i].is_list) os.edges.push_back(e->list[i].atom);
                 }
             }
+            if (const SNode* par = op.child("parallelism")) os.parallelism = value_of(*par);
             if (os.name.empty()) { error = "an operator has no name"; return std::nullopt; }
             spec.operators.push_back(std::move(os));
         }
@@ -102,6 +103,13 @@ std::optional<PhysicalSpec> parse_spec(const std::string& text, std::string& err
             // (executes A B C ...) - every atom after the head is an operator name.
             for (std::size_t i = 1; i < ex->list.size(); ++i) {
                 if (!ex->list[i].is_list) spec.profile.executes.push_back(ex->list[i].atom);
+            }
+        }
+        if (const SNode* d = prof->child("max-dop")) {
+            const std::string v = value_of(*d);
+            unsigned long parsed = spec.profile.max_dop;
+            if (std::from_chars(v.data(), v.data() + v.size(), parsed).ec == std::errc{}) {
+                spec.profile.max_dop = static_cast<std::uint32_t>(parsed);
             }
         }
     }
@@ -185,6 +193,19 @@ std::vector<std::string> check_conformance(const PhysicalSpec& spec) {
                     problems.push_back("operator '" + name + "' kind '" + os->kind +
                                        "' contradicts its edges, which imply '" + implied + "'");
                 }
+            }
+            // Every operator must state how it spreads across workers. Nothing
+            // COSTS this today (see "parallelism is declared, not costed" in
+            // spec.hpp) - it is checked so that an operator cannot be added
+            // without somebody deciding, the same reason `edges` is checked.
+            static constexpr const char* kParallelism[] = {"full", "partitioned",
+                                                           "ordered", "serial"};
+            bool known = false;
+            for (const char* k : kParallelism) known = known || os->parallelism == k;
+            if (!known) {
+                problems.push_back("operator '" + name + "' declares parallelism '" +
+                                   os->parallelism +
+                                   "', which is not one of full/partitioned/ordered/serial");
             }
         }
         if (!spec.profile.can_execute(name)) {

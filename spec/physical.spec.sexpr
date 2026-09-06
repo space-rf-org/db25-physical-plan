@@ -29,6 +29,21 @@
   ; So each operator also declares `edges`: one word per INPUT, saying what
   ; happens to rows arriving on it.
   ;
+  ; Each also declares `parallelism`: how it spreads across workers.
+  ;   full        embarrassingly parallel over its input
+  ;   partitioned parallel once its input is partitioned by a key - the
+  ;               partitioning is the price paid for the scaling
+  ;   ordered     parallel only ACROSS independent ordered groups, serial within
+  ;               one (a window over partitions; a streaming aggregate walking
+  ;               group boundaries)
+  ;   serial      not parallelizable (a limit must count; a fixpoint's iteration
+  ;               k+1 depends on iteration k)
+  ;
+  ; DECLARED, NOT COSTED. Nothing in the cost model reads this - see "parallelism
+  ; is declared, not costed" in spec.hpp for the measurements behind that. It is
+  ; declared, and conformance requires it, so that an operator cannot be added
+  ; without somebody deciding how it parallelizes.
+  ;
   ;   streaming    - they flow into this operator's output within one loop
   ;   materialized - this whole input is buffered before anything is emitted
   ;   rescanned    - this input is RE-EXECUTED, once per row of another input
@@ -47,83 +62,83 @@
   ; thing and is what `edges` now says; they do not BREAK them in the sense that
   ; costs memory.
   (operators
-    (operator (name SeqScan)       (arity 0) (kind access-path))
-    (operator (name Filter)        (arity 1) (kind pipeline) (edges streaming))
-    (operator (name Project)       (arity 1) (kind pipeline) (edges streaming))
-    (operator (name HashJoin)      (arity 2) (kind pipeline-breaker) (edges streaming materialized))
+    (operator (name SeqScan)       (arity 0) (kind access-path) (parallelism full))
+    (operator (name Filter)        (arity 1) (kind pipeline) (edges streaming) (parallelism full))
+    (operator (name Project)       (arity 1) (kind pipeline) (edges streaming) (parallelism full))
+    (operator (name HashJoin)      (arity 2) (kind pipeline-breaker) (edges streaming materialized) (parallelism partitioned))
     ; MergeJoin requires both inputs sorted on the join keys and preserves that
     ; order on its output - so it is cheaper per row than HashJoin when the order
     ; is already there, and dearer once a Sort must be enforced to get it.
-    (operator (name MergeJoin)     (arity 2) (kind pipeline) (edges streaming separate))
+    (operator (name MergeJoin)     (arity 2) (kind pipeline) (edges streaming separate) (parallelism partitioned))
     ; NestedLoopJoin needs no equi-key, which makes it the ONLY legal
     ; implementation of a cross product or a purely non-equi join - and its cost
     ; is quadratic in the inputs, so it never wins where a keyed join applies.
-    (operator (name NestedLoopJoin) (arity 2) (kind pipeline) (edges streaming rescanned))
+    (operator (name NestedLoopJoin) (arity 2) (kind pipeline) (edges streaming rescanned) (parallelism full))
     ; Limit passes at most `limit` rows through after discarding `offset` of
     ; them. Order-SENSITIVE: which rows survive depends entirely on the order its
     ; input arrives in, which is why the planner may not push an order
     ; requirement through it.
-    (operator (name Limit)         (arity 1) (kind pipeline) (edges streaming))
+    (operator (name Limit)         (arity 1) (kind pipeline) (edges streaming) (parallelism serial))
     ; Two implementations of GROUP BY. HashAggregate works on any input and
     ; produces no order; StreamingAggregate needs its input already sorted on the
     ; grouping keys, is cheaper per row, and keeps that order on its output.
-    (operator (name HashAggregate)      (arity 1) (kind pipeline-breaker) (edges materialized))
-    (operator (name StreamingAggregate) (arity 1) (kind pipeline) (edges streaming))
+    (operator (name HashAggregate)      (arity 1) (kind pipeline-breaker) (edges materialized) (parallelism partitioned))
+    (operator (name StreamingAggregate) (arity 1) (kind pipeline) (edges streaming) (parallelism ordered))
     ; Window consumes its input sorted by (PARTITION BY ++ ORDER BY) and appends
     ; one column per window function, emitting in that same order.
-    (operator (name Window)             (arity 1) (kind pipeline) (edges streaming))
+    (operator (name Window)             (arity 1) (kind pipeline) (edges streaming) (parallelism ordered))
     ; GROUPING SETS / ROLLUP / CUBE in one pass, hashing each row into every set's
     ; table. No streaming counterpart: different sets want different orderings.
-    (operator (name HashGroupingSets)   (arity 1) (kind pipeline-breaker) (edges materialized))
+    (operator (name HashGroupingSets)   (arity 1) (kind pipeline-breaker) (edges materialized) (parallelism partitioned))
     ; Two implementations of SELECT DISTINCT, the same trade as the aggregates.
-    (operator (name HashDistinct)       (arity 1) (kind pipeline-breaker) (edges materialized))
-    (operator (name StreamingDistinct)  (arity 1) (kind pipeline) (edges streaming))
+    (operator (name HashDistinct)       (arity 1) (kind pipeline-breaker) (edges materialized) (parallelism partitioned))
+    (operator (name StreamingDistinct)  (arity 1) (kind pipeline) (edges streaming) (parallelism ordered))
     ; Set operations. UnionAll compares nothing; HashSetOp builds from the right
     ; and probes with the left. They are NOT alternatives for one another -
     ; applicability, not cost, selects between them.
-    (operator (name UnionAll)           (arity 2) (kind pipeline) (edges separate separate))
-    (operator (name HashSetOp)          (arity 2) (kind pipeline-breaker) (edges streaming materialized))
+    (operator (name UnionAll)           (arity 2) (kind pipeline) (edges separate separate) (parallelism full))
+    (operator (name HashSetOp)          (arity 2) (kind pipeline-breaker) (edges streaming materialized) (parallelism partitioned))
     ; A literal row set, and the synthetic single row of a FROM-less SELECT.
-    (operator (name ValuesScan)         (arity 0) (kind access-path))
+    (operator (name ValuesScan)         (arity 0) (kind access-path) (parallelism full))
     ; Semi and anti joins (EXISTS / IN, NOT EXISTS). Both emit the LEFT schema
     ; only and emit each qualifying left row ONCE however many right rows match,
     ; which is why they are their own operators rather than a join plus a distinct.
     ; Four rather than two with a mode flag: they are exact complements, and an
     ; operator that does not say which it is reads the same as the other.
-    (operator (name HashSemiJoin)       (arity 2) (kind pipeline-breaker) (edges streaming materialized))
-    (operator (name HashAntiJoin)       (arity 2) (kind pipeline-breaker) (edges streaming materialized))
-    (operator (name NestedLoopSemiJoin) (arity 2) (kind pipeline) (edges streaming rescanned))
-    (operator (name NestedLoopAntiJoin) (arity 2) (kind pipeline) (edges streaming rescanned))
+    (operator (name HashSemiJoin)       (arity 2) (kind pipeline-breaker) (edges streaming materialized) (parallelism partitioned))
+    (operator (name HashAntiJoin)       (arity 2) (kind pipeline-breaker) (edges streaming materialized) (parallelism partitioned))
+    (operator (name NestedLoopSemiJoin) (arity 2) (kind pipeline) (edges streaming rescanned) (parallelism full))
+    (operator (name NestedLoopAntiJoin) (arity 2) (kind pipeline) (edges streaming rescanned) (parallelism full))
     ; Sort is BOTH the implementation of a logical Sort (ORDER BY) and the
     ; enforcer inserted to establish a required order - one operator, because they
     ; are one operation; only who asked for it differs.
-    (operator (name Sort)          (arity 1) (kind pipeline-breaker) (edges materialized))
+    (operator (name Sort)          (arity 1) (kind pipeline-breaker) (edges materialized) (parallelism partitioned))
     ; A pure enforcer: inserted to establish a required storage format.
-    (operator (name FormatConvert) (arity 1) (kind pipeline) (edges streaming))
+    (operator (name FormatConvert) (arity 1) (kind pipeline) (edges streaming) (parallelism full))
     ; The third enforcer: moves rows between nodes to establish a required
     ; DISTRIBUTION - repartition by hash, broadcast, or gather to one place. Its
     ; edge is `separate` rather than `materialized`: the sending and receiving
     ; sides are two loops, but nothing is buffered between them.
-    (operator (name Exchange)      (arity 1) (kind pipeline) (edges separate))
+    (operator (name Exchange)      (arity 1) (kind pipeline) (edges separate) (parallelism full))
     ; WITH RECURSIVE. RecursiveFixpoint takes the anchor and the recursive term as
     ; its two children - the anchor is evaluated once, the term once per iteration,
     ; which is why they are separate children rather than one hidden input.
     ; WorkingTableScan is the recursive self-reference: a leaf whose rows come from
     ; the previous iteration, and the only operator in this catalog fed from
     ; elsewhere in its own plan.
-    (operator (name RecursiveFixpoint)  (arity 2) (kind pipeline) (edges streaming rescanned))
-    (operator (name WorkingTableScan)   (arity 0) (kind access-path))
+    (operator (name RecursiveFixpoint)  (arity 2) (kind pipeline) (edges streaming rescanned) (parallelism serial))
+    (operator (name WorkingTableScan)   (arity 0) (kind access-path) (parallelism full))
     ; CREATE TABLE AS: materialize the input stream into a new table.
-    (operator (name CreateTableAs)      (arity 1) (kind pipeline) (edges streaming))
+    (operator (name CreateTableAs)      (arity 1) (kind pipeline) (edges streaming) (parallelism partitioned))
     ; The write path. One input each - the source query for an Insert, the
     ; scanned and filtered target rows for an Update or a Delete - and each emits
     ; the AFFECTED rows, which a RETURNING clause then projects. The target
     ; relation is a NAME on the operator, not a child: it is written, not read.
     ; Three operators rather than one with a mode, because an operator that does
     ; not say which modification it performs reads the same as the other two.
-    (operator (name Insert)             (arity 1) (kind pipeline) (edges streaming))
-    (operator (name Update)             (arity 1) (kind pipeline) (edges streaming))
-    (operator (name Delete)             (arity 1) (kind pipeline) (edges streaming)))
+    (operator (name Insert)             (arity 1) (kind pipeline) (edges streaming) (parallelism partitioned))
+    (operator (name Update)             (arity 1) (kind pipeline) (edges streaming) (parallelism partitioned))
+    (operator (name Delete)             (arity 1) (kind pipeline) (edges streaming) (parallelism partitioned)))
 
   ; Implementation rules: the physical operator each logical operator lowers to.
   ; Increment 0 is single-candidate (one physical op per logical op); a rule set
@@ -193,6 +208,11 @@
   ; its own profile in this same shape.
   (capability-profile
     (name reference)
+    ; The most workers this engine puts on one pipeline. ONE, which is DB25
+    ; today: there is no executor, and declaring more would be describing an
+    ; engine that does not exist. A real engine publishes its own profile with
+    ; its own number. Declared, not costed - nothing in the cost model reads it.
+    (max-dop 1)
     (executes SeqScan Filter Project HashJoin MergeJoin NestedLoopJoin
               Sort FormatConvert Limit HashAggregate StreamingAggregate Window
               HashDistinct StreamingDistinct UnionAll HashSetOp ValuesScan

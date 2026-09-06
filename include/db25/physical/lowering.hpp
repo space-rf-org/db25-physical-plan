@@ -23,6 +23,7 @@
 #include "db25/plan/logical_plan.hpp"
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace db25::physical {
@@ -31,6 +32,14 @@ namespace db25::physical {
 // a prior or live run enter here; the lowering treats it as an input, never a
 // hidden channel. Empty until the execution engine produces one.
 struct RuntimeProfile {};
+
+// The built-in logical -> physical candidate mapping, used when no spec supplies
+// implementation rules. Exposed because a test asks it how many candidates an
+// operator has: an operator with ONE candidate has no ranking a cost model could
+// invert, which is part of why the search is parallelism-blind (see spec.hpp).
+// The test must read the real table, not a copy of it, or the two would drift and
+// the copy would keep saying what was true when it was written.
+[[nodiscard]] std::span<const PhysicalOp> builtin_physical(plan::LogicalOp op);
 
 // Inputs to the lowering besides the logical plan. `spec` supplies the
 // implementation rules (if null, a built-in single-candidate mapping is used);

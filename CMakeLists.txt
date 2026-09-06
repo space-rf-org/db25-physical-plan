@@ -148,6 +148,19 @@ if(DB25_PHYSICAL_BUILD_TESTS)
                             "sweeps need them to check their own coverage")
     endif()
 
+    # Not a test: it regenerates the measurements behind "parallelism is
+    # declared, not costed". Built so it cannot rot; run by hand.
+    add_executable(parallelism_evidence tools/parallelism_evidence.cpp)
+    target_link_libraries(parallelism_evidence PRIVATE db25physicalplan)
+    target_compile_options(parallelism_evidence PRIVATE -fno-exceptions -Wall -Wextra)
+
+    add_executable(parallelism_tests tests/test_parallelism.cpp)
+    target_link_libraries(parallelism_tests PRIVATE db25physicalplan)
+    target_compile_options(parallelism_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    target_compile_definitions(parallelism_tests PRIVATE
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME parallelism_tests COMMAND parallelism_tests)
+
     add_executable(plan_cache_tests tests/test_plan_cache.cpp)
     target_link_libraries(plan_cache_tests PRIVATE db25physicalplan)
     target_compile_options(plan_cache_tests PRIVATE -Wall -Wextra)
