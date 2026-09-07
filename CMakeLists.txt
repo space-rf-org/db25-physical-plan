@@ -150,6 +150,11 @@ if(DB25_PHYSICAL_BUILD_TESTS)
 
     # Not a test: it regenerates the measurements behind "parallelism is
     # declared, not costed". Built so it cannot rot; run by hand.
+    add_executable(search_budget_tests tests/test_search_budget.cpp)
+    target_link_libraries(search_budget_tests PRIVATE db25physicalplan)
+    target_compile_options(search_budget_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    add_test(NAME search_budget_tests COMMAND search_budget_tests)
+
     add_executable(parallelism_evidence tools/parallelism_evidence.cpp)
     target_link_libraries(parallelism_evidence PRIVATE db25physicalplan)
     target_compile_options(parallelism_evidence PRIVATE -fno-exceptions -Wall -Wextra)
