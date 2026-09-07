@@ -133,6 +133,15 @@ struct LoweringResult {
     // not guaranteed to be the cheapest plan the full search would have found.
     // Reported rather than silent, because a caller that cares about plan quality
     // needs to know which of the two it got.
+    // What the budget guard actually did. It skips the SECOND route through each
+    // goal - pushing a requirement into an input rather than enforcing it on the
+    // output - and that is its entire effect: it changes neither
+    // `candidates_considered` nor `optimization_goals`, so those two cannot show
+    // it working. Without these an engaged guard and a disengaged one are
+    // indistinguishable from the outside, which makes the search budget
+    // impossible to tune and impossible to observe in production.
+    std::size_t pushdown_explorations = 0;         // route-2 explorations run
+    std::size_t pushdown_explorations_skipped = 0; // route-2 explorations skipped
     std::size_t join_count = 0;
     bool budget_guard_engaged = false;
     // Join regions the interval DP enumerated - maximal INNER / CROSS subtrees of

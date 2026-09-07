@@ -821,6 +821,13 @@ struct Optimizer {
     bool greedy = false;
     std::size_t goals = 0;
     std::size_t pruned = 0;
+    // How many push-down explorations the guard SKIPPED, and how many ran. The
+    // guard's whole effect is here and nowhere else: it changes no candidate
+    // count and no goal count, so without these two numbers an operator cannot
+    // see whether it engaged, by how much, or whether tightening it would do
+    // anything at all.
+    std::size_t pushdown_skipped = 0;
+    std::size_t pushdown_explored = 0;
 
     static constexpr double kNoBound = std::numeric_limits<double>::infinity();
     // Every operator in the IR is a leaf, unary, or binary. expected_arity() is
@@ -945,7 +952,8 @@ struct Optimizer {
             // Skipped under the budget guard: this is the half of the search that
             // explores an ALTERNATIVE placement, and it is what the guard trades
             // away first because route 1 alone still yields a valid, costed plan.
-            if (greedy) continue;
+            if (greedy) { ++pushdown_skipped; continue; }
+            ++pushdown_explored;
             if (const std::optional<PhysicalProperties> down =
                     pushdown_requirement(ge.op, required)) {
                 ArityVec<PhysicalProperties> pushed = op_reqs;
@@ -1118,6 +1126,8 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     }
     result.optimization_goals = opt.goals;
     result.candidates_pruned = opt.pruned;
+    result.pushdown_explorations_skipped = opt.pushdown_skipped;
+    result.pushdown_explorations = opt.pushdown_explored;
 
     result.plan = memo.extract_winner_for(root_group, ctx.required_output);
     if (!result.plan) {

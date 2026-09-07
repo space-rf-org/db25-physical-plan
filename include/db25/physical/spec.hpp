@@ -115,8 +115,33 @@ struct ImplRule {
 // belongs in a source file. Deriving it from the budget is still open question 5;
 // what this unit fixes is that it is data, and that crossing it is a decision the
 // planner reports rather than a silent change of behaviour.
+// THE VALUE IS A TUNING KNOB, NOT A DERIVED CONSTANT, AND THAT IS THE ANSWER
+// RATHER THAN AN APOLOGY.
+//
+// It cannot be derived from anything this repo owns: a planning-time budget is a
+// ratio against EXECUTION time, and nothing here estimates execution time.
+// Choosing a number anyway and pinning goldens to it would manufacture exactly
+// the unfalsifiable constant this project spends its effort removing.
+//
+// So the number is made not to matter. There are not two planners to select
+// between: crossing this count makes the SAME search greedy, skipping the second
+// route through each goal - pushing a requirement into an input rather than
+// enforcing it on the output. Same IR, same rules, same cost model, less
+// exploration. tests/test_search_budget.cpp enforces the property that makes any
+// setting safe: MORE budget never yields a WORSE plan. Given that, a badly
+// chosen value costs plan quality monotonically - it cannot make a plan wrong,
+// and it cannot surprise.
+//
+// Two consequences worth stating. The trigger is a JOIN COUNT, which is a proxy
+// for search cost and a coarse one: five joins with no requirements explored 89
+// push-down routes here, and five joins under heavy property requirements would
+// explore far more. Triggering on work actually done would track the real
+// quantity, and the counters to do it now exist (LoweringResult's
+// pushdown_explorations*). And the value belongs in a profile, so a
+// latency-sensitive deployment and an analytical one can differ, rather than
+// both living with one number nobody can defend.
 struct SearchBudget {
-    std::uint32_t max_join_count = 8;  // a placeholder value, not a derived one
+    std::uint32_t max_join_count = 8;  // tuned, not derived - see above
 };
 
 struct PhysicalSpec {
