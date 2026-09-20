@@ -17,6 +17,7 @@
 #include "db25/plan/expr_ir.hpp"
 #include "db25/plan/logical_plan.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <span>
@@ -33,6 +34,7 @@ using db25::physical::PhysicalOp;
 using db25::physical::SortKey;
 using db25::physical::StorageFormat;
 using db25::physical::Freshness;
+using db25::physical::CardinalityModel;
 using db25::physical::StorageCatalog;
 using db25::physical::FormatAvailability;
 using db25::physical::PhysicalProperties;
@@ -122,6 +124,70 @@ static plan::LogicalNodePtr build_logical(plan::ExprPtr join_pred = nullptr,
     project->exprs.push_back(col(3, DataType::VarChar));
     project->add_child(std::move(filter));
     return project;
+}
+
+// A cardinality model under which a MERGE join is genuinely the cheaper way to
+// produce an ORDERED join output - which, since a key join's output is the larger
+// input rather than the product of the two, is no longer true at any pair of
+// sizes. Both routes sort the large side exactly once: the merge below the join,
+// the hash-plus-Sort above it. What separates them is everything else - the merge
+// sorts two more rows and then streams both inputs at merge_join_row, while the
+// hash pays a build and a probe per row. So the merge wins precisely when sorting
+// the SMALL side costs less than the hashing it avoids, and a skew is what makes
+// that so.
+//
+// Seeded rather than left at default_base, where a and b are the same size and
+// hashing wins. That is the model telling the truth. Under the multiplicative
+// join estimate this fixture needed no skew, because the join's output looked a
+// hundred times larger than either input - which made the Sort above the join
+// ruinous and handed the merge join a win that the arithmetic, not the algorithm,
+// had produced (gap register G13).
+static CardinalityModel skewed_card() {
+    CardinalityModel c;
+    c.base_rows["a"] = 100000.0;
+    c.base_rows["b"] = 10.0;
+    // The Filter above the join is held NEUTRAL so that this fixture asks one
+    // question. A selective filter makes the cheapest ordered plan a Sort placed
+    // ABOVE it, on the few rows that survive - which is correct, and is the
+    // enforce-versus-push-down choice, not the join choice. Letting it shrink
+    // here would mean the test passed or failed on where the Sort went rather
+    // than on which join was picked.
+    c.filter_selectivity = 1.0;
+    return c;
+}
+
+static bool approx(double a, double b) { return std::fabs(a - b) < 1e-6; }
+
+// What the MEMO estimated, which is the number every cost comparison in this
+// search was made against. Its own test, because re-running the cardinality model
+// over the RETURNED PLAN would not catch a memo that estimated something else:
+// that is a second traversal of a second representation, and it would answer
+// correctly while the search that chose the plan had not.
+static void test_the_memo_estimates_a_join_by_its_predicate() {
+    std::printf("test_the_memo_estimates_a_join_by_its_predicate\n");
+    CardinalityModel c;
+    c.base_rows["a"] = 1000.0;
+    c.base_rows["b"] = 500.0;
+    c.filter_selectivity = 1.0;  // so the number below is the JOIN's, not the filter's
+    LoweringContext ctx;
+    ctx.cardinality = &c;
+
+    // `a.id = b.id`: one equi-key, so the larger side. The product - which is
+    // what this used to answer - would be 500000, discounted to 50000.
+    auto equi = build_logical();
+    const LoweringResult re = lower(*equi, ctx);
+    CHECK(re.ok);
+    CHECK(approx(re.estimated_rows, 1000.0));
+
+    // `a.id > b.id`: no equi-key at all, so nothing contains the join and the
+    // product IS the estimate, narrowed once by the one condition. Same two
+    // tables, same sizes, an estimate fifty times larger - which is the point.
+    // A model that read only the input cardinalities could not tell these apart.
+    auto theta = build_logical(binop(BinaryOp::GreaterThan, col(0, DataType::Integer),
+                                     col(2, DataType::Integer)));
+    const LoweringResult rt = lower(*theta, ctx);
+    CHECK(rt.ok);
+    CHECK(approx(rt.estimated_rows, 1000.0 * 500.0 * c.join_selectivity));
 }
 
 static void test_lowers_the_increment0_query() {
@@ -241,9 +307,11 @@ static void test_required_order_selects_the_merge_join() {
     if (!spec) return;
 
     auto logical = build_logical();  // a.id = b.id, with a Filter and Project above
+    const CardinalityModel card = skewed_card();
 
     LoweringContext any;
     any.spec = &*spec;
+    any.cardinality = &card;
     const LoweringResult ra = lower(*logical, any);
     CHECK(ra.ok);
     if (!ra.plan) return;
@@ -253,6 +321,7 @@ static void test_required_order_selects_the_merge_join() {
 
     LoweringContext ordered;
     ordered.spec = &*spec;
+    ordered.cardinality = &card;
     ordered.required_output.sort = {SortKey{0, false}};
     const LoweringResult rb = lower(*logical, ordered);
     CHECK(rb.ok);
@@ -573,10 +642,12 @@ static void test_guard_changes_what_the_search_finds() {
 
     PhysicalProperties ordered;
     ordered.sort = {SortKey{0, false}};
+    const CardinalityModel card = skewed_card();
 
     auto full_q = build_logical();
     LoweringContext full;
     full.spec = &*spec;
+    full.cardinality = &card;
     full.required_output = ordered;
     const LoweringResult rf = lower(*full_q, full);
     CHECK(rf.ok);
@@ -587,6 +658,7 @@ static void test_guard_changes_what_the_search_finds() {
     tight.budget.max_join_count = 0;   // any join trips it
     LoweringContext guarded;
     guarded.spec = &tight;
+    guarded.cardinality = &card;
     guarded.required_output = ordered;
     const LoweringResult rg = lower(*guarded_q, guarded);
     CHECK(rg.ok);
@@ -2744,6 +2816,7 @@ static void test_the_write_is_priced() {
 
 int main() {
     test_lowers_the_increment0_query();
+    test_the_memo_estimates_a_join_by_its_predicate();
     test_keyless_join_never_merges();
     test_non_equi_join_is_a_nested_loop();
     test_nested_loop_never_wins_an_equi_join();

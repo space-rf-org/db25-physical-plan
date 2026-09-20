@@ -11,7 +11,9 @@
 #include "db25/physical/physical_plan.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <span>
 #include <string>
 
 using namespace db25::physical;
@@ -88,9 +90,96 @@ static void test_cardinality_estimates() {
     auto unknown = make_seq_scan("nope", {});
     CHECK(approx(card.rows(*unknown), card.default_base));
 
-    // Filter shrinks; join multiplies (1000 * 500 * 0.1); project passes through.
+    // Filter shrinks; project passes through; the join on one key emits the
+    // LARGER side, not the product - and takes its key count off the node, which
+    // is the wiring a JoinSpec{} here would silently drop.
     auto plan = build_plan();  // Project<-Filter<-HashJoin<-(a,b)
-    CHECK(approx(card.rows(*plan), 1000.0 * 500.0 * 0.1 * 0.1));  // *join_sel *filter_sel
+    CHECK(approx(card.rows(*plan), 1000.0 * 0.1));  // max(1000, 500) * filter_sel
+}
+
+// ---- G13: a join reads its predicate, not its inputs' product -------------
+// The rule was |L||R|s, and its error compounded with every further join: the
+// six-way key join below returns 98000 rows and was estimated at 2000000000
+// times that. What these pin is the SHAPE of the replacement - the larger side,
+// narrowed once per conjunct beyond the one that contains the join - because a
+// mistuned constant was never what was wrong.
+static double join_rows(double l, double r, std::uint32_t keys, std::uint32_t residual,
+                        const CardinalityModel& card,
+                        PhysicalOp op = PhysicalOp::HashJoin) {
+    const double in[2] = {l, r};
+    return operator_rows(op, std::span<const double>{in, 2}, "", card, LimitSpec{},
+                         GroupingSpec{}, db25::ast::SetOp::Union, 0.0, JoinSpec{keys, residual});
+}
+
+static void test_join_cardinality() {
+    std::printf("test_join_cardinality\n");
+    const CardinalityModel card;
+
+    // One equi-key: the larger side. 20000 customers to 50000 orders is 50000
+    // rows, which is what a foreign key MEANS - not 100 million.
+    CHECK(approx(join_rows(20000, 50000, 1, 0, card), 50000.0));
+    CHECK(join_rows(20000, 50000, 1, 0, card) < 20000.0 * 50000.0);
+    // And it does not matter which side is written first.
+    CHECK(approx(join_rows(50000, 20000, 1, 0, card), 50000.0));
+
+    // No equi-key and no condition at all is a CROSS JOIN, and a cross join
+    // really does return the product - undiscounted, because there is no
+    // predicate for a selectivity to stand for.
+    CHECK(approx(join_rows(1000, 500, 0, 0, card), 500000.0));
+    // A theta join is that, narrowed once per condition.
+    CHECK(approx(join_rows(1000, 500, 0, 2, card),
+                 500000.0 * card.join_selectivity * card.join_selectivity));
+
+    // Conjuncts beyond the first narrow, whether they are keys or residuals.
+    CHECK(approx(join_rows(20000, 50000, 2, 0, card), 50000.0 * card.join_selectivity));
+    CHECK(approx(join_rows(20000, 50000, 1, 1, card), 50000.0 * card.join_selectivity));
+    CHECK(approx(join_rows(20000, 50000, 3, 0, card),
+                 50000.0 * card.join_selectivity * card.join_selectivity));
+
+    // Never more than the cartesian product. An empty input means no rows out -
+    // max() alone would answer 50000, a join against nothing producing rows.
+    CHECK(approx(join_rows(0, 50000, 1, 0, card), 0.0));
+    CHECK(approx(join_rows(3, 2, 1, 0, card), 3.0));
+    CHECK(approx(join_rows(1, 1, 1, 0, card), 1.0));
+
+    // The ALGORITHM does not change the count. If it did, the search would be
+    // choosing between the three on the strength of an estimate rather than a
+    // cost - and the cheapest estimate is not the cheapest plan.
+    for (const std::uint32_t keys : {0u, 1u, 2u}) {
+        const double h = join_rows(20000, 50000, keys, 1, card, PhysicalOp::HashJoin);
+        CHECK(approx(join_rows(20000, 50000, keys, 1, card, PhysicalOp::MergeJoin), h));
+        CHECK(approx(join_rows(20000, 50000, keys, 1, card, PhysicalOp::NestedLoopJoin), h));
+    }
+
+    // Growing either input can never LOWER the estimate. A property rather than
+    // a number, and the one that stops a future statistics source turning the
+    // estimate non-monotone without anything noticing.
+    double prev = join_rows(10, 50000, 1, 0, card);
+    for (double l = 100; l <= 1000000; l *= 10) {
+        const double now = join_rows(l, 50000, 1, 0, card);
+        CHECK(now >= prev);
+        prev = now;
+    }
+}
+
+static void test_join_chain_does_not_explode() {
+    std::printf("test_join_chain_does_not_explode\n");
+    const CardinalityModel card;
+    // The benchmark's six-way join, every predicate a foreign key onto a primary
+    // key: cust-orders-items-prod, plus emp and dept hanging off cust.
+    //   actual 98000   PostgreSQL's estimate 99491   DB25 before this: 2e18
+    const double sides[] = {50000.0, 100000.0, 2000.0, 20000.0, 50.0};
+    double rows = 20000.0;  // cust
+    for (const double r : sides) rows = join_rows(rows, r, 1, 0, card);
+    CHECK(approx(rows, 100000.0));
+
+    // The error this replaces was not a constant, it was a RATE: each further
+    // join multiplied the estimate by another table's cardinality. So the test
+    // that matters is that adding joins does not grow the estimate at all when
+    // the tables they add are smaller than what is already there.
+    double narrow = 100000.0;
+    for (int i = 0; i < 20; ++i) narrow = join_rows(narrow, 50.0, 1, 0, card);
+    CHECK(approx(narrow, 100000.0));
 }
 
 static void test_cost_is_deterministic_and_concrete() {
@@ -108,9 +197,9 @@ static void test_cost_is_deterministic_and_concrete() {
     // Hand-computed against the lab coefficients:
     //   scans: 1000*1.0 + 500*1.0                    = 1500
     //   join:  build 500*1.2 + probe 1000*0.8        = 1400
-    //   filter: input rows (join out 50000) * 0.5    = 25000
-    //   project: input rows (filter out 5000) * 0.3  = 1500
-    CHECK(approx(c1, 1500.0 + 1400.0 + 25000.0 + 1500.0));  // 29400
+    //   filter: input rows (join out 1000) * 0.5     = 500
+    //   project: input rows (filter out 100) * 0.3   = 30
+    CHECK(approx(c1, 1500.0 + 1400.0 + 500.0 + 30.0));  // 3430
 }
 
 static void test_monotonic_in_cardinality_and_coefficients() {
@@ -137,6 +226,8 @@ int main() {
     test_lab_profile_loads();
     test_source_seam();
     test_cardinality_estimates();
+    test_join_cardinality();
+    test_join_chain_does_not_explode();
     test_cost_is_deterministic_and_concrete();
     test_monotonic_in_cardinality_and_coefficients();
 

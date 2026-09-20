@@ -97,7 +97,7 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
 double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                      const std::string& table_name, const CardinalityModel& card,
                      LimitSpec limits, GroupingSpec grouping, ast::SetOp set_op,
-                     double values_rows) {
+                     double values_rows, JoinSpec join) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan: {
@@ -110,9 +110,59 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             return in(0);
         case PhysicalOp::HashJoin:
         case PhysicalOp::MergeJoin:
-        case PhysicalOp::NestedLoopJoin:
-            // The join ALGORITHM does not change how many rows come out.
-            return in(0) * in(1) * card.join_selectivity;
+        case PhysicalOp::NestedLoopJoin: {
+            // The join ALGORITHM does not change how many rows come out - which is
+            // exactly why this reads the PREDICATE and never the op.
+            //
+            // An equi-join does not multiply. Under the containment assumption the
+            // textbook estimate is |L||R| / max(ndv_L, ndv_R), and there are no
+            // per-column distinct counts to put in it - the catalog's histograms
+            // are still to come. But a BOUND on that denominator needs no
+            // statistics: a column has at most as many distinct values as its
+            // table has rows, and on an equi-join the values that actually match
+            // are contained in the narrower side, so
+            //
+            //     max(ndv_L, ndv_R) >= min(|L|, |R|)   and therefore
+            //     |L||R| / min(|L|, |R|) = max(|L|, |R|)
+            //
+            // is what that bound yields for a single key. It is also the shape a
+            // foreign-key join actually has: joining 100000 line items to 2000
+            // products returns 100000 rows, not 200 million. An over-estimate only
+            // where the key is NOT unique on either side - which is the direction
+            // an estimate should err in.
+            //
+            // The rule here was |L||R|s, and it was wrong structurally rather than
+            // by a mistuned s: each further join multiplied by another table's
+            // cardinality, so a six-way key join returning 98000 rows was estimated
+            // at 2e18 (gap register G13). No value of s repairs a rule whose error
+            // grows with the number of joins - and the estimate is not decoration,
+            // it is what made the search buy three Sorts for that query.
+            //
+            // With NO equi-key there is nothing to contain the product, and the
+            // product is then the right answer: a CROSS JOIN really does return
+            // |L||R|, and a theta join is that narrowed by its conditions.
+            const double product = in(0) * in(1);
+            double rows = join.equi_keys == 0 ? product : std::max(in(0), in(1));
+            // One narrowing per conjunct BEYOND the one that contains the join;
+            // for a predicate-less cross join that is none, and the product stands
+            // un-discounted rather than being scaled by a selectivity it has no
+            // predicate to justify.
+            //
+            // Multiplied in a loop rather than through std::pow: goldens compare
+            // plans chosen from these numbers, and repeated multiplication is
+            // bit-identical everywhere while pow is only nearly so.
+            const std::uint32_t contained = join.equi_keys == 0 ? 0u : 1u;
+            for (std::uint32_t i = contained; i < join.equi_keys; ++i) {
+                rows *= card.join_selectivity;
+            }
+            for (std::uint32_t i = 0; i < join.residual_conjuncts; ++i) {
+                rows *= card.join_selectivity;
+            }
+            // Never more than the cartesian product. With an empty input that is
+            // no rows out, where max() alone would answer with the other side's
+            // cardinality - a join against nothing producing rows.
+            return std::min(rows, product);
+        }
         case PhysicalOp::Sort:
         case PhysicalOp::FormatConvert:
             return in(0);  // both pass every input row through unchanged
@@ -362,7 +412,9 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
                          node.set_op,
                          node.values_columns != 0
                              ? static_cast<double>(node.values.size() / node.values_columns)
-                             : (node.op == PhysicalOp::ValuesScan ? 1.0 : 0.0));
+                             : (node.op == PhysicalOp::ValuesScan ? 1.0 : 0.0),
+                         JoinSpec{static_cast<std::uint32_t>(node.hash_keys.size()),
+                                  static_cast<std::uint32_t>(node.residual.size())});
 }
 
 double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,

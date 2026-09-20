@@ -374,9 +374,12 @@ GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region
                 candidates += add_candidates(memo, g, cands, kRowOnly, inputs, keys, residual);
                 if (!rows_set) {
                     // Cardinality is a property of the GROUP, and every split of a
-                    // range yields the same one: rows multiply and the model
-                    // charges one selectivity per join, so |A||B|s . |C|s and
-                    // |A|s . |B||C|s are the same product. Taken from the first
+                    // range yields the same one. An equi-join's estimate is the
+                    // larger side narrowed once per conjunct beyond the first
+                    // (see operator_rows), and both parts of that are invariant
+                    // under association: max is associative, and the narrowings
+                    // summed over a tree are (total conjuncts - number of joins),
+                    // neither of which a split can change. Taken from the first
                     // split rather than averaged, so the estimate is a number the
                     // model actually produced.
                     const double in_rows[2] = {memo.group(inputs[0]).rows,
@@ -384,7 +387,10 @@ GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region
                     memo.set_rows(g, operator_rows(PhysicalOp::HashJoin,
                                                    std::span<const double>{in_rows, 2}, "", card,
                                                    LimitSpec{}, GroupingSpec{}, ast::SetOp::Union,
-                                                   0.0));
+                                                   0.0,
+                                                   JoinSpec{static_cast<std::uint32_t>(keys.size()),
+                                                            static_cast<std::uint32_t>(
+                                                                residual.size())}));
                     rows_set = true;
                 }
             }
@@ -754,7 +760,9 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
     memo.set_rows(g, operator_rows(cands.front(), std::span<const double>{in_rows_buf, n_in},
                                    table_name_of(memo.group(g)), card, memo.group(g).limits,
                                    grouping_of(memo.group(g)), memo.group(g).set_op,
-                                   values_rows_of(memo.group(g))));
+                                   values_rows_of(memo.group(g)),
+                                   JoinSpec{static_cast<std::uint32_t>(hash_keys.size()),
+                                            static_cast<std::uint32_t>(residual.size())}));
 
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot.
@@ -1112,6 +1120,7 @@ LoweringResult lower(const plan::LogicalNode& root, const LoweringContext& ctx) 
     }
     memo.set_root(root_group);
     result.memo_groups = memo.size();
+    result.estimated_rows = memo.group(root_group).rows;
 
     const std::uint32_t budget = ctx.max_join_count_override != 0
                                      ? ctx.max_join_count_override
