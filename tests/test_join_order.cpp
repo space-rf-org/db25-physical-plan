@@ -23,6 +23,7 @@
 #include "db25/plan/expr_ir.hpp"
 #include "db25/plan/logical_plan.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -144,6 +145,54 @@ static double plan_cost(const plan::LogicalNode& q, const CardinalityModel& card
 }
 
 // ---- tests ----------------------------------------------------------------
+
+static bool approx(double a, double b) { return std::fabs(a - b) < 1e-6; }
+
+// A reordered region estimates its own cardinality, on a code path the ordinary
+// lowering never reaches - the interval DP builds these groups itself. So the
+// estimate has to be checked HERE as well, and checked against the same query
+// lowered WITHOUT reordering: the two paths must agree, or the planner's opinion
+// of how many rows a query returns would depend on whether it was allowed to
+// re-associate it.
+//
+// That agreement is not a coincidence to be grateful for. An equi-join emits the
+// larger side narrowed once per conjunct beyond the first, and both halves of
+// that are invariant under association: max is associative, and the narrowings
+// summed over a tree are (total conjuncts - number of joins), neither of which a
+// split can change.
+static void test_a_region_is_estimated_by_its_keys_however_it_associates() {
+    std::printf("test_a_region_is_estimated_by_its_keys_however_it_associates\n");
+    CardinalityModel card;
+    card.base_rows["a"] = 1000.0;
+    card.base_rows["b"] = 500.0;
+    card.base_rows["c"] = 200.0;
+
+    const auto q = chain_abc();  // two joins, one equi-key each
+
+    LoweringContext reordered;
+    reordered.cardinality = &card;
+    reordered.reorder_joins = true;
+    const LoweringResult rr = lower(*q, reordered);
+    CHECK(rr.ok);
+    CHECK(rr.join_regions_enumerated == 1);  // the DP really did build these groups
+
+    LoweringContext written;
+    written.cardinality = &card;
+    written.reorder_joins = false;
+    const LoweringResult rw = lower(*q, written);
+    CHECK(rw.ok);
+    CHECK(rw.join_regions_enumerated == 0);  // and this one did not
+
+    // Chained foreign keys: the largest table, not the product of the three.
+    // 1000 * 500 * 200 * 0.1 * 0.1 = 1000000, which is what this answered before
+    // and is five thousand times too many - on a three-way join. The error was a
+    // rate, not a constant, and by six joins it was thirteen orders of magnitude.
+    CHECK(approx(rr.estimated_rows, 1000.0));
+    CHECK(approx(rw.estimated_rows, 1000.0));
+    CHECK(approx(rr.estimated_rows, rw.estimated_rows));
+}
+
+
 
 // The headline. ONE query text, two cardinality models, two different join trees.
 // If the planner produced the same shape both times it has not reordered - it has
@@ -556,6 +605,7 @@ static void test_a_join_whose_output_is_not_its_inputs_concatenated_is_not_a_reg
 }
 
 int main() {
+    test_a_region_is_estimated_by_its_keys_however_it_associates();
     test_a_three_way_join_is_re_associated_by_cost();
     test_search_options_never_change_a_reordered_plan();
     test_reordering_never_costs_more_than_the_written_order();

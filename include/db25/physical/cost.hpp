@@ -135,7 +135,12 @@ struct CardinalityModel {
     std::unordered_map<std::string, double> base_rows;  // table name -> row count
     double default_base = 1000.0;      // an unseeded base table
     double filter_selectivity = 0.1;   // default WHERE selectivity
-    double join_selectivity = 0.1;     // default equi-join selectivity, per key
+    // How much ONE conjunct beyond the first narrows a join. Not "the join's
+    // selectivity": the first equi-key does not narrow by a fraction at all, it
+    // CONTAINS the join - see the derivation over operator_rows' join case. This
+    // is what the model has to say about the second key, and about a residual
+    // condition, neither of which it can measure without column statistics.
+    double join_selectivity = 0.1;
     // Fraction of input rows that survive a GROUP BY - i.e. how many distinct
     // groups there are. Without per-column distinct counts this is a flat guess,
     // and it is a guess this model states rather than hides: a real estimate
@@ -179,11 +184,15 @@ struct CardinalityModel {
 // operator above it and skew their choices.
 // `grouping` is the Aggregate's, for the same reason: an aggregate's output is
 // one row per GROUP, which is not a function of its input's cardinality alone.
+// `join` is the join's PREDICATE, and is the same reason a third time over: how
+// many rows a join emits is decided by what it joins ON, and a model that read
+// only the two input cardinalities had no way to tell a key join from a cross
+// product - so it estimated both as the product (gap register G13).
 [[nodiscard]] double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                                    const std::string& table_name, const CardinalityModel& card,
                                    LimitSpec limits = {}, GroupingSpec grouping = {},
                                    ast::SetOp set_op = ast::SetOp::Union,
-                                   double values_rows = 0.0);
+                                   double values_rows = 0.0, JoinSpec join = {});
 // `build_right` says which input a hash join materializes - the difference
 // between hashing a thousand rows and probing ten, and hashing ten and probing a
 // thousand.

@@ -282,6 +282,25 @@ struct GroupingSpec {
     std::uint32_t set_count = 0;
 };
 
+// What the cardinality model needs to know about a JOIN - its predicate, not the
+// algorithm chosen to evaluate it. Separate from `hash_keys` and `residual`
+// because all three join algorithms must answer the same cardinality for the same
+// predicate: a nested loop that estimated differently from a hash join would let
+// the search choose between them on the strength of an estimate rather than a
+// cost, and the two are not the same thing.
+//
+// Both are COUNTS rather than flags, and that is what makes the estimate
+// independent of how a reordered join is associated. Each join in a region is
+// charged one narrowing per conjunct beyond the first, so the exponent summed
+// over a tree is (total conjuncts - number of joins) - and both of those are
+// fixed by the region, not by the split. A boolean "has a residual" would not be:
+// two residual conjuncts landing on one join would narrow once, and on two joins
+// twice, so the same region would get different estimates from different splits.
+struct JoinSpec {
+    std::uint32_t equi_keys = 0;           // `l.a = r.b` conjuncts - these CONTAIN the join
+    std::uint32_t residual_conjuncts = 0;  // every other conjunct; each narrows further
+};
+
 // One key of a sort order: a positional column index and its direction, plus
 // where NULLs go.
 //

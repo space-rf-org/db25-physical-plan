@@ -152,6 +152,18 @@ struct LoweringResult {
     // query with no such region, which is most of them - two tables have only one
     // association, and a region containing a cross product is left alone.
     std::size_t join_regions_enumerated = 0;
+    // What the MEMO estimated the query's output cardinality to be - the root
+    // group's row count, the number every cost comparison in this search was
+    // made against.
+    //
+    // Reported for the reason the budget counters are: it is otherwise
+    // unobservable from outside. The tree form of the cardinality model can be
+    // re-run on the returned plan, but that is a different traversal over a
+    // different representation, and an error in what the memo estimated would
+    // not show up there at all - it would show up only as a plan someone
+    // eventually notices is the wrong shape. That is how a six-way key join came
+    // to be estimated at 2e18 rows and buy itself three Sorts (gap register G13).
+    double estimated_rows = 0.0;
 };
 
 // Lower a logical plan to a physical plan. The physical plan borrows expression
