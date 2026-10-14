@@ -301,6 +301,23 @@ struct JoinSpec {
     std::uint32_t residual_conjuncts = 0;  // every other conjunct; each narrows further
 };
 
+// What the caller estimated from statistics, for the operators whose output is a
+// property of the DATA rather than of the plan shape.
+//
+// Both fields use a sentinel rather than a flag because both have a natural
+// impossible value: a selectivity is never negative, and an aggregate never
+// produces zero groups from a non-empty input. That keeps the struct two
+// doubles, which matters because it is passed by value on every candidate of
+// every goal the search evaluates.
+struct FilterSpec {
+    // What the Filter's predicate keeps, in [0, 1]. NEGATIVE means the caller did
+    // not estimate it, and the flat `filter_selectivity` applies.
+    double selectivity = -1.0;
+    // How many groups an Aggregate's keys produce. ZERO means not estimated, and
+    // the flat `group_selectivity` applies.
+    double groups = 0.0;
+};
+
 // One key of a sort order: a positional column index and its direction, plus
 // where NULLs go.
 //

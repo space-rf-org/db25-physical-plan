@@ -53,6 +53,8 @@ add_library(db25physicalplan STATIC
     src/sexpr_read.cpp
     src/spec.cpp
     src/cost.cpp
+    src/selectivity.cpp
+    src/statistics.cpp
     src/properties.cpp
     src/lowering.cpp
     src/join_order.cpp
@@ -91,6 +93,15 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_compile_definitions(cost_tests PRIVATE
         DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
     add_test(NAME cost_tests COMMAND cost_tests)
+
+    add_executable(statistics_tests tests/test_statistics.cpp)
+    target_link_libraries(statistics_tests PRIVATE db25physicalplan)
+    target_compile_options(statistics_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    # Loads the pinned-lab statistics from the source tree, and writes its
+    # malformed-input fixtures beside them.
+    target_compile_definitions(statistics_tests PRIVATE
+        DB25_PHYSICAL_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/spec")
+    add_test(NAME statistics_tests COMMAND statistics_tests)
 
     add_executable(property_tests tests/test_properties.cpp)
     target_link_libraries(property_tests PRIVATE db25physicalplan)

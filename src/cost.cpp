@@ -88,6 +88,27 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
     return default_calibration();
 }
 
+// Declared in cost.hpp so the memo form (lowering.cpp) reaches the same one.
+// What the caller would have estimated, derived from a node (the tree form) or
+// from a group (the memo form) - the ONE place either representation turns a
+// predicate and a key list into the two numbers operator_rows wants. Both paths
+// go through it, which is the "one cost model" invariant (D3) extended to the
+// statistics: a plan must not be estimated differently depending on which
+// representation it is currently in.
+FilterSpec filter_spec_from(PhysicalOp op, const Expr* predicate,
+                            std::span<const Expr* const> group_keys,
+                            const CardinalityModel& card, double input_rows) {
+    FilterSpec fs;
+    if (card.stats == nullptr || card.stats->empty()) return fs;  // sentinels: fall back
+    if (op == PhysicalOp::Filter) {
+        fs.selectivity = selectivity_of(predicate, *card.stats, card.selectivity_defaults);
+    } else if (op == PhysicalOp::HashAggregate || op == PhysicalOp::StreamingAggregate ||
+               op == PhysicalOp::HashGroupingSets) {
+        fs.groups = distinct_groups(group_keys, input_rows, *card.stats);
+    }
+    return fs;
+}
+
 // ---- representation-independent per-operator formulas ---------------------
 // Both the tree cost (cost_of, over a PhysicalNode) and the memo cost (over a
 // group-expression, whose inputs are GROUPS not nodes) go through these, so a
@@ -97,7 +118,7 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
 double operator_rows(PhysicalOp op, std::span<const double> input_rows,
                      const std::string& table_name, const CardinalityModel& card,
                      LimitSpec limits, GroupingSpec grouping, ast::SetOp set_op,
-                     double values_rows, JoinSpec join) {
+                     double values_rows, JoinSpec join, FilterSpec filter) {
     const auto in = [&](std::size_t i) { return i < input_rows.size() ? input_rows[i] : 0.0; };
     switch (op) {
         case PhysicalOp::SeqScan: {
@@ -105,7 +126,12 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             return it != card.base_rows.end() ? it->second : card.default_base;
         }
         case PhysicalOp::Filter:
-            return in(0) * card.filter_selectivity;
+            // The estimate when the caller had statistics; the flat constant when
+            // it did not. A negative selectivity is the "not estimated" sentinel,
+            // not a number to clamp - clamping it would silently turn every
+            // un-estimated filter into one that keeps no rows.
+            return in(0) * (filter.selectivity >= 0.0 ? filter.selectivity
+                                                      : card.filter_selectivity);
         case PhysicalOp::Project:
             return in(0);
         case PhysicalOp::HashJoin:
@@ -182,7 +208,14 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             // and estimating it as a fraction of the input would be wrong rather
             // than merely imprecise. The ALGORITHM does not change the count, so
             // both aggregates answer identically, as both joins do.
-            return grouping.key_count == 0 ? 1.0 : in(0) * card.group_selectivity;
+            if (grouping.key_count == 0) return 1.0;
+            // With distinct counts, the group count is a COUNT and not a
+            // fraction. `GROUP BY dept_id` over 20000 employees in 50 departments
+            // produces 50 rows whether the input is 20000 or 20 million, and the
+            // flat fraction below says 2000 - the single largest estimate error
+            // this model had.
+            if (filter.groups > 0.0) return std::min(filter.groups, in(0));
+            return in(0) * card.group_selectivity;
         case PhysicalOp::Window:
             return in(0);  // appends columns; never adds or drops a row
         case PhysicalOp::HashSemiJoin:
@@ -400,6 +433,13 @@ double enforcement_cost(const PhysicalProperties& provided, const PhysicalProper
 
 // ---- tree form ------------------------------------------------------------
 
+namespace {
+FilterSpec filter_spec_for(const PhysicalNode& node, const CardinalityModel& card,
+                           double input_rows) {
+    return filter_spec_from(node.op, node.predicate, node.group_keys, card, input_rows);
+}
+}  // namespace
+
 double CardinalityModel::rows(const PhysicalNode& node) const {
     std::vector<double> input_rows;
     input_rows.reserve(node.children.size());
@@ -414,7 +454,8 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
                              ? static_cast<double>(node.values.size() / node.values_columns)
                              : (node.op == PhysicalOp::ValuesScan ? 1.0 : 0.0),
                          JoinSpec{static_cast<std::uint32_t>(node.hash_keys.size()),
-                                  static_cast<std::uint32_t>(node.residual.size())});
+                                  static_cast<std::uint32_t>(node.residual.size())},
+                         filter_spec_for(node, *this, input_rows.empty() ? 0.0 : input_rows[0]));
 }
 
 double cost_of(const PhysicalNode& node, const CalibrationProfile& cal,
