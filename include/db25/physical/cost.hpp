@@ -8,6 +8,8 @@
 // production resolves a live- or cache-sourced profile through the same seam.
 #include "db25/physical/physical_plan.hpp"
 #include "db25/physical/properties.hpp"
+#include "db25/physical/selectivity.hpp"
+#include "db25/physical/statistics.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -141,6 +143,16 @@ struct CardinalityModel {
     // is what the model has to say about the second key, and about a residual
     // condition, neither of which it can measure without column statistics.
     double join_selectivity = 0.1;
+    // Per-column statistics, when the caller has them. NULL (and empty) is the
+    // supported state, not a degraded one: every estimate below falls back to
+    // the flat constants, which is exactly the model as it was before statistics
+    // existed. That is what lets this arrive without moving a single plan until
+    // somebody seeds it.
+    const StatisticsCatalog* stats = nullptr;
+    // What a predicate keeps when statistics cannot say. Split by predicate
+    // class - see SelectivityDefaults.
+    SelectivityDefaults selectivity_defaults;
+
     // Fraction of input rows that survive a GROUP BY - i.e. how many distinct
     // groups there are. Without per-column distinct counts this is a flat guess,
     // and it is a guess this model states rather than hides: a real estimate
@@ -184,6 +196,12 @@ struct CardinalityModel {
 // operator above it and skew their choices.
 // `grouping` is the Aggregate's, for the same reason: an aggregate's output is
 // one row per GROUP, which is not a function of its input's cardinality alone.
+// `filter` is what the Filter's own predicate keeps, and the Aggregate's group
+// count - both ESTIMATED by the caller from statistics it has and this function
+// does not. Passed in rather than derived here for the reason `join` is: this
+// function is arithmetic, and walking an expression tree against a catalog is
+// not. Default-constructed means "not estimated", and every operator falls back
+// to the flat constants - which is the model exactly as it was.
 // `join` is the join's PREDICATE, and is the same reason a third time over: how
 // many rows a join emits is decided by what it joins ON, and a model that read
 // only the two input cardinalities had no way to tell a key join from a cross
@@ -192,7 +210,8 @@ struct CardinalityModel {
                                    const std::string& table_name, const CardinalityModel& card,
                                    LimitSpec limits = {}, GroupingSpec grouping = {},
                                    ast::SetOp set_op = ast::SetOp::Union,
-                                   double values_rows = 0.0, JoinSpec join = {});
+                                   double values_rows = 0.0, JoinSpec join = {},
+                                   FilterSpec filter = {});
 // `build_right` says which input a hash join materializes - the difference
 // between hashing a thousand rows and probing ten, and hashing ten and probing a
 // thousand.
@@ -206,6 +225,16 @@ struct CardinalityModel {
 // prices that re-scanning, and multiplying the child's cost on top would charge
 // it twice. The difference is that the fixpoint has NO term standing in for its
 // repetition - which is why this exists.
+// Turn a predicate and a grouping-key list into the two numbers operator_rows
+// wants, using whatever statistics the model carries. The ONE place either plan
+// representation does that: the tree form calls it with a node's payload, the
+// memo form with a group's, so a plan cannot be estimated differently depending
+// on which representation it is currently in. With no statistics it returns the
+// sentinels and every operator falls back to the flat constants.
+[[nodiscard]] FilterSpec filter_spec_from(PhysicalOp op, const Expr* predicate,
+                                          std::span<const Expr* const> group_keys,
+                                          const CardinalityModel& card, double input_rows);
+
 [[nodiscard]] double input_evaluations(PhysicalOp op, std::size_t index,
                                        const CardinalityModel& card) noexcept;
 

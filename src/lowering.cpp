@@ -154,6 +154,23 @@ const std::string& table_name_of(const Group& g) {
     return g.table_name != nullptr ? *g.table_name : empty;
 }
 
+// The memo form's half of the statistics estimate; the tree form's half is in
+// cost.cpp. Both call filter_spec_from, which is the only place either turns a
+// predicate into a number - the "one cost model" invariant applied to the
+// statistics rather than only to the arithmetic.
+//
+// An Aggregate's op_exprs is [keys..., aggregates...] split at op_split, so the
+// grouping keys are a PREFIX and reach the estimator as a span rather than a
+// copied vector: this runs once per group, and the search already counts its
+// allocations.
+FilterSpec filter_spec_of(const Group& g, PhysicalOp op, const CardinalityModel& card,
+                          double input_rows) {
+    const std::size_t n = std::min<std::size_t>(g.op_split, g.op_exprs.size());
+    return filter_spec_from(op, g.predicate,
+                            std::span<const Expr* const>{g.op_exprs.data(), n},
+                            card, input_rows);
+}
+
 GroupingSpec grouping_of(const Group& g) {
     return GroupingSpec{g.op_split, g.op_split == g.sort_keys.size(),
                         !g.grouping_sets.empty(),
@@ -762,7 +779,9 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                                    grouping_of(memo.group(g)), memo.group(g).set_op,
                                    values_rows_of(memo.group(g)),
                                    JoinSpec{static_cast<std::uint32_t>(hash_keys.size()),
-                                            static_cast<std::uint32_t>(residual.size())}));
+                                            static_cast<std::uint32_t>(residual.size())},
+                                   filter_spec_of(memo.group(g), cands.front(), card,
+                                                  n_in > 0 ? in_rows_buf[0] : 0.0)));
 
     // A scan is available once per storage format the table actually has; every
     // other operator has a single (irrelevant) format slot.

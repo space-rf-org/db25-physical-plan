@@ -12,6 +12,7 @@
 #include "db25/physical/memo.hpp"
 #include "db25/physical/properties.hpp"
 #include "db25/physical/storage_catalog.hpp"
+#include "db25/physical/statistics.hpp"
 
 #include "db25/ast/node_types.hpp"
 #include "db25/plan/expr_ir.hpp"
@@ -35,6 +36,9 @@ using db25::physical::SortKey;
 using db25::physical::StorageFormat;
 using db25::physical::Freshness;
 using db25::physical::CardinalityModel;
+using db25::physical::StatisticsCatalog;
+using db25::physical::TableStats;
+using db25::physical::ColumnStats;
 using db25::physical::StorageCatalog;
 using db25::physical::FormatAvailability;
 using db25::physical::PhysicalProperties;
@@ -188,6 +192,77 @@ static void test_the_memo_estimates_a_join_by_its_predicate() {
     const LoweringResult rt = lower(*theta, ctx);
     CHECK(rt.ok);
     CHECK(approx(rt.estimated_rows, 1000.0 * 500.0 * c.join_selectivity));
+}
+
+// The MEMO's statistics estimate, which is a different code path from the tree
+// form's and has to be checked separately. A mutation that made this call site
+// pass FilterSpec{} survived the whole suite until this test existed: the memo
+// would fall back to the flat constants while the tree form used statistics, so
+// the search would choose a plan on one set of numbers and report another.
+//
+// `estimated_rows` is what makes it observable at all - the same reason it was
+// added for the join-cardinality work.
+static void test_the_memo_reaches_the_statistics() {
+    std::printf("test_the_memo_reaches_the_statistics\n");
+    // `a` has 20000 rows; its column 4 runs 0..19999 with every value distinct.
+    StatisticsCatalog stats;
+    TableStats ts;
+    ts.rows = 20000;
+    ColumnStats sal;
+    sal.ndv = 20000;
+    sal.has_range = true;
+    sal.min_value = 0;
+    sal.max_value = 19999;
+    ts.columns[4] = sal;
+    stats.add_table(7, std::move(ts));
+
+    CardinalityModel card;
+    card.base_rows["a"] = 20000.0;
+    card.base_rows["b"] = 20000.0;
+
+    // Scan(a) -> Filter(a.col4 > 1000). A ColumnRef carries its catalog ids, so
+    // the estimator needs no schema walk - but it DOES need them set, which is
+    // what distinguishes a base column from a computed one.
+    auto make_query = [](std::uint32_t table_id, std::uint32_t column_id) {
+        auto scan = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+        scan->table_name = "a";
+        scan->output = a_schema();
+        auto ref = col(0, DataType::Integer);
+        ref->ref_table_id = table_id;
+        ref->ref_column_id = column_id;
+        auto filter = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Filter);
+        filter->output = a_schema();
+        filter->predicate = binop(BinaryOp::GreaterThan, std::move(ref), int_lit(1000));
+        filter->add_child(std::move(scan));
+        return filter;
+    };
+
+    // No statistics: the flat constant, 20000 * 0.1.
+    auto q1 = make_query(7, 4);
+    LoweringContext plain;
+    plain.cardinality = &card;
+    const LoweringResult r1 = lower(*q1, plain);
+    CHECK(r1.ok);
+    CHECK(approx(r1.estimated_rows, 20000.0 * card.filter_selectivity));
+
+    // With them: about 19000, from the column's range.
+    card.stats = &stats;
+    auto q2 = make_query(7, 4);
+    LoweringContext statted;
+    statted.cardinality = &card;
+    const LoweringResult r2 = lower(*q2, statted);
+    CHECK(r2.ok);
+    CHECK(r2.estimated_rows > 18000.0 && r2.estimated_rows < 19100.0);
+    CHECK(!approx(r2.estimated_rows, r1.estimated_rows));
+
+    // A column the catalog does not cover falls back, even though the TABLE is
+    // covered - a statistics lookup that answered for the wrong column would be
+    // worse than one that declined.
+    auto q3 = make_query(7, 99);
+    const LoweringResult r3 = lower(*q3, statted);
+    CHECK(r3.ok);
+    CHECK(approx(r3.estimated_rows, 20000.0 * card.selectivity_defaults.inequality));
+    card.stats = nullptr;
 }
 
 static void test_lowers_the_increment0_query() {
@@ -2817,6 +2892,7 @@ static void test_the_write_is_priced() {
 int main() {
     test_lowers_the_increment0_query();
     test_the_memo_estimates_a_join_by_its_predicate();
+    test_the_memo_reaches_the_statistics();
     test_keyless_join_never_merges();
     test_non_equi_join_is_a_nested_loop();
     test_nested_loop_never_wins_an_equi_join();
