@@ -260,4 +260,34 @@ double distinct_groups(std::span<const plan::Expr* const> keys, double input_row
     return input_rows > 0.0 ? std::min(product, input_rows) : product;
 }
 
+
+void join_key_ndv(const HashKeyVec& keys, const Schema& left, const Schema& right,
+                  const StatisticsCatalog& stats, double& left_ndv, double& right_ndv) {
+    left_ndv = 0.0;
+    right_ndv = 0.0;
+    if (keys.empty()) return;
+    const HashKey& k = keys[0];
+    const auto look = [&](const Schema& schema, std::uint32_t index) -> double {
+        if (index >= schema.size()) return 0.0;
+        const plan::ColumnSchema& c = schema[index];
+        // (0, 0) is the binder's mark for a column that is not a base-table
+        // column, on the same rule the predicate estimator follows.
+        if (c.table_id == 0 || c.column_id == 0) return 0.0;
+        const ColumnStats* cs = stats.column(c.table_id, c.column_id);
+        if (cs == nullptr) return 0.0;
+        // A UNIQUE column has exactly as many distinct values as the table has
+        // rows, which is a guarantee rather than a sample - but the row count is
+        // the statistics catalog's, not the cardinality model's, so prefer the
+        // measured ndv and fall back to the table's rows only when it is absent.
+        if (cs->ndv > 0.0) return cs->ndv;
+        if (cs->unique) {
+            const TableStats* t = stats.table(c.table_id);
+            return t != nullptr ? t->rows : 0.0;
+        }
+        return 0.0;
+    };
+    left_ndv = look(left, k.left_index);
+    right_ndv = look(right, k.right_index);
+}
+
 }  // namespace db25::physical

@@ -299,6 +299,18 @@ struct GroupingSpec {
 struct JoinSpec {
     std::uint32_t equi_keys = 0;           // `l.a = r.b` conjuncts - these CONTAIN the join
     std::uint32_t residual_conjuncts = 0;  // every other conjunct; each narrows further
+    // Distinct values in the join KEYS, when statistics say. Zero is unknown,
+    // and unknown is a supported state: without them the containment BOUND
+    // applies, which is what this model used before statistics existed.
+    //
+    // With them the bound becomes the estimate it was standing in for. The bound
+    // substitutes min(|L|, |R|) for max(ndv_L, ndv_R) because a column has at
+    // most as many distinct values as rows; the real distinct count is never
+    // larger and usually smaller, so the bound never UNDER-estimates and often
+    // over-estimates - a many-to-many join on a low-cardinality key is where the
+    // two part company, and where the bound is worst.
+    double left_key_ndv = 0.0;
+    double right_key_ndv = 0.0;
 };
 
 // What the caller estimated from statistics, for the operators whose output is a

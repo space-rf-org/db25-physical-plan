@@ -265,6 +265,69 @@ static void test_the_memo_reaches_the_statistics() {
     card.stats = nullptr;
 }
 
+// The memo's join-key lookup, which is a different code path from the tree
+// form's. Checked with a MANY-TO-MANY key, because on a clean foreign key the
+// containment bound and the statistics estimate agree - and a test that cannot
+// tell them apart proves neither.
+static void test_the_memo_reaches_the_join_keys() {
+    std::printf("test_the_memo_reaches_the_join_keys\n");
+    StatisticsCatalog stats;
+    TableStats t;
+    t.rows = 1000;
+    ColumnStats k;
+    k.ndv = 10;                       // ten distinct values over a thousand rows
+    t.columns[1] = k;
+    stats.add_table(3, std::move(t));
+
+    CardinalityModel card;
+    card.base_rows["a"] = 1000.0;
+    card.base_rows["b"] = 1000.0;
+
+    // Both sides' join column carries the catalog ids the statistics are under.
+    auto schema_with_ids = []() {
+        plan::Schema s2 = a_schema();
+        for (auto& c : s2) { c.table_id = 3; c.column_id = 1; }
+        return s2;
+    };
+    auto build = [&]() {
+        auto sa = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+        sa->table_name = "a";
+        sa->output = schema_with_ids();
+        auto sb = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Scan);
+        sb->table_name = "b";
+        sb->output = schema_with_ids();
+        const std::uint32_t left_width = static_cast<std::uint32_t>(sa->output.size());
+        auto j = std::make_unique<plan::LogicalNode>(plan::LogicalOp::Join);
+        j->join_type = db25::ast::JoinType::Inner;
+        j->output = sa->output;
+        for (const auto& c : sb->output) j->output.push_back(c);
+        j->predicate = binop(BinaryOp::Equal, col(0, DataType::Integer),
+                             col(left_width, DataType::Integer));
+        j->add_child(std::move(sa));
+        j->add_child(std::move(sb));
+        return j;
+    };
+
+    auto q1 = build();
+    LoweringContext plain;
+    plain.cardinality = &card;
+    const LoweringResult r1 = lower(*q1, plain);
+    CHECK(r1.ok);
+    // The containment bound: the larger side.
+    CHECK(approx(r1.estimated_rows, 1000.0));
+
+    card.stats = &stats;
+    auto q2 = build();
+    LoweringContext statted;
+    statted.cardinality = &card;
+    const LoweringResult r2 = lower(*q2, statted);
+    CHECK(r2.ok);
+    // |L||R| / max(ndv) with ndv 10: a hundred thousand, not a thousand. The
+    // bound under-estimated this join a hundredfold.
+    CHECK(approx(r2.estimated_rows, 1000.0 * 1000.0 / 10.0));
+    card.stats = nullptr;
+}
+
 static void test_lowers_the_increment0_query() {
     std::printf("test_lowers_the_increment0_query\n");
     auto logical = build_logical();
@@ -2893,6 +2956,7 @@ int main() {
     test_lowers_the_increment0_query();
     test_the_memo_estimates_a_join_by_its_predicate();
     test_the_memo_reaches_the_statistics();
+    test_the_memo_reaches_the_join_keys();
     test_keyless_join_never_merges();
     test_non_equi_join_is_a_nested_loop();
     test_nested_loop_never_wins_an_equi_join();

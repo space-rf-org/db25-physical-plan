@@ -154,6 +154,25 @@ const std::string& table_name_of(const Group& g) {
     return g.table_name != nullptr ? *g.table_name : empty;
 }
 
+// The memo form's key lookup. A group's output schema carries the catalog ids
+// the statistics are keyed by, exactly as a node's does.
+JoinSpec join_spec_of(const HashKeyVec& keys, const std::vector<const Expr*>& residual,
+                      const std::vector<GroupId>& inputs, const Memo& memo,
+                      const CardinalityModel& card) {
+    JoinSpec js{static_cast<std::uint32_t>(keys.size()),
+                static_cast<std::uint32_t>(residual.size()), 0.0, 0.0};
+    if (card.stats == nullptr || card.stats->empty() || inputs.size() < 2) return js;
+    // A group BORROWS its output schema from the logical node, so the pointer is
+    // the thing to check - a group whose schema is absent cannot be looked up,
+    // and dereferencing it would be the sort of crash a statistics lookup has no
+    // business causing.
+    const Schema* l = memo.group(inputs[0]).output;
+    const Schema* r = memo.group(inputs[1]).output;
+    if (l == nullptr || r == nullptr) return js;
+    join_key_ndv(keys, *l, *r, *card.stats, js.left_key_ndv, js.right_key_ndv);
+    return js;
+}
+
 // The memo form's half of the statistics estimate; the tree form's half is in
 // cost.cpp. Both call filter_spec_from, which is the only place either turns a
 // predicate into a number - the "one cost model" invariant applied to the
@@ -405,9 +424,8 @@ GroupId explore_join_region(const plan::LogicalNode& n, const JoinRegion& region
                                                    std::span<const double>{in_rows, 2}, "", card,
                                                    LimitSpec{}, GroupingSpec{}, ast::SetOp::Union,
                                                    0.0,
-                                                   JoinSpec{static_cast<std::uint32_t>(keys.size()),
-                                                            static_cast<std::uint32_t>(
-                                                                residual.size())}));
+                                                   join_spec_of(keys, residual, inputs,
+                                                                memo, card)));
                     rows_set = true;
                 }
             }
@@ -778,8 +796,7 @@ GroupId explore(const plan::LogicalNode& n, Memo& memo, const LoweringContext& c
                                    table_name_of(memo.group(g)), card, memo.group(g).limits,
                                    grouping_of(memo.group(g)), memo.group(g).set_op,
                                    values_rows_of(memo.group(g)),
-                                   JoinSpec{static_cast<std::uint32_t>(hash_keys.size()),
-                                            static_cast<std::uint32_t>(residual.size())},
+                                   join_spec_of(hash_keys, residual, inputs, memo, card),
                                    filter_spec_of(memo.group(g), cands.front(), card,
                                                   n_in > 0 ? in_rows_buf[0] : 0.0)));
 

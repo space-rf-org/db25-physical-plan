@@ -9,6 +9,7 @@
 // on predicates with no plan in sight, and lets the arithmetic be tested with no
 // predicate in sight.
 #include "db25/physical/statistics.hpp"
+#include "db25/physical/physical_plan.hpp"
 
 #include "db25/plan/expr_ir.hpp"
 
@@ -61,5 +62,19 @@ struct SelectivityDefaults {
 // uncapped product of independent NDVs will happily claim.
 [[nodiscard]] double distinct_groups(std::span<const plan::Expr* const> keys,
                                      double input_rows, const StatisticsCatalog& stats);
+
+// The distinct counts of a join's KEY columns, looked up through the input
+// schemas. A HashKey is a positional index into `left` / `right`, and a
+// ColumnSchema carries the catalog ids - so this is the one place the physical
+// plan's positional key addressing is turned back into a statistics key.
+//
+// Writes 0 for a side it cannot resolve, which is the caller's signal to fall
+// back to the containment bound. A MULTI-key join resolves only its first key:
+// the others narrow through `join_selectivity` as before, because combining
+// several keys' distinct counts correctly needs their joint distribution and
+// multiplying them as though independent is how a planner convinces itself a
+// two-column join returns nothing.
+void join_key_ndv(const HashKeyVec& keys, const Schema& left, const Schema& right,
+                  const StatisticsCatalog& stats, double& left_ndv, double& right_ndv);
 
 }  // namespace db25::physical

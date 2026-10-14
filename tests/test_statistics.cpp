@@ -398,6 +398,148 @@ static void test_a_computed_column_is_never_looked_up() {
     }
 }
 
+// ---- joins and semi joins read the KEYS ----------------------------------
+static double join_rows(double l, double r, std::uint32_t keys, std::uint32_t resid,
+                        double lndv, double rndv, const CardinalityModel& card,
+                        PhysicalOp op = PhysicalOp::HashJoin) {
+    const double in[2] = {l, r};
+    return operator_rows(op, std::span<const double>{in, 2}, "", card, LimitSpec{},
+                         GroupingSpec{}, db25::ast::SetOp::Union, 0.0,
+                         JoinSpec{keys, resid, lndv, rndv});
+}
+
+static void test_a_join_divides_by_the_keys_distinct_count() {
+    std::printf("test_a_join_divides_by_the_keys_distinct_count\n");
+    CardinalityModel card;
+    // 20000 customers joined to 50000 orders on a key with 20000 distinct values:
+    // the textbook |L||R| / max(ndv) is 50000, and so is the containment bound,
+    // because on a clean foreign key the two agree.
+    CHECK(approx(join_rows(20000, 50000, 1, 0, 20000, 20000, card), 50000.0));
+    CHECK(approx(join_rows(20000, 50000, 1, 0, 0, 0, card), 50000.0));
+
+    // They part company on a MANY-TO-MANY key. 1000 x 1000 rows joined on a key
+    // with ten distinct values is 100000 rows; the bound says 1000, which is a
+    // hundredfold UNDER-estimate - the direction that makes a planner put a huge
+    // relation on a hash join's build side.
+    CHECK(approx(join_rows(1000, 1000, 1, 0, 10, 10, card), 100000.0));
+    CHECK(approx(join_rows(1000, 1000, 1, 0, 0, 0, card), 1000.0));
+
+    // The larger distinct count wins the denominator: containment says the
+    // matching values live in the narrower domain.
+    CHECK(approx(join_rows(1000, 1000, 1, 0, 10, 500, card), 1000.0 * 1000.0 / 500.0));
+    CHECK(approx(join_rows(1000, 1000, 1, 0, 500, 10, card), 1000.0 * 1000.0 / 500.0));
+
+    // Still never more than the cartesian product.
+    CHECK(approx(join_rows(10, 10, 1, 0, 1, 1, card), 100.0));
+    CHECK(approx(join_rows(0, 50000, 1, 0, 20000, 20000, card), 0.0));
+
+    // And the ALGORITHM still does not change the count.
+    const double h = join_rows(1000, 1000, 1, 0, 10, 10, card, PhysicalOp::HashJoin);
+    CHECK(approx(join_rows(1000, 1000, 1, 0, 10, 10, card, PhysicalOp::MergeJoin), h));
+    CHECK(approx(join_rows(1000, 1000, 1, 0, 10, 10, card, PhysicalOp::NestedLoopJoin), h));
+}
+
+static void test_a_semi_join_is_the_matching_fraction() {
+    std::printf("test_a_semi_join_is_the_matching_fraction\n");
+    CardinalityModel card;
+    // EXISTS over a foreign key: every left distinct value appears on the right,
+    // so nearly every row matches. The flat tenth said 2000 of 20000.
+    CHECK(approx(join_rows(20000, 50000, 1, 0, 20000, 20000, card, PhysicalOp::HashSemiJoin),
+                 20000.0));
+    // Half the left key's values present on the right: half the rows.
+    CHECK(approx(join_rows(20000, 50000, 1, 0, 20000, 10000, card, PhysicalOp::HashSemiJoin),
+                 10000.0));
+    // More distinct values on the right than the left cannot match more than all
+    // of the left - a semi join is a SUBSET, and the clamp is the only thing
+    // saying so, so it is checked at several ratios rather than one.
+    for (const double rndv : {20001.0, 90000.0, 1e9}) {
+        CHECK(approx(join_rows(20000, 50000, 1, 0, 100, rndv, card, PhysicalOp::HashSemiJoin),
+                     20000.0));
+    }
+    // Without statistics, the flat constant, exactly as before.
+    CHECK(approx(join_rows(20000, 50000, 1, 0, 0, 0, card, PhysicalOp::HashSemiJoin),
+                 20000.0 * card.join_selectivity));
+    // The anti join is the EXACT complement, derived from the same number: the
+    // two must sum to the left input, or filtering would appear to create rows.
+    for (const double rndv : {0.0, 5000.0, 10000.0, 20000.0, 90000.0}) {
+        const double semi =
+            join_rows(20000, 50000, 1, 0, 20000, rndv, card, PhysicalOp::HashSemiJoin);
+        const double anti =
+            join_rows(20000, 50000, 1, 0, 20000, rndv, card, PhysicalOp::HashAntiJoin);
+        CHECK(approx(semi + anti, 20000.0));
+    }
+    // The nested-loop variants answer identically to the hash ones.
+    CHECK(approx(join_rows(20000, 50000, 1, 0, 20000, 10000, card,
+                           PhysicalOp::NestedLoopSemiJoin),
+                 join_rows(20000, 50000, 1, 0, 20000, 10000, card, PhysicalOp::HashSemiJoin)));
+}
+
+static void test_join_keys_resolve_through_the_schema() {
+    std::printf("test_join_keys_resolve_through_the_schema\n");
+    const StatisticsCatalog s = emp_stats();
+    // Two schemas whose columns carry catalog ids: a HashKey is a positional
+    // index into them, and this is where that positional addressing is turned
+    // back into a statistics key.
+    db25::plan::Schema left{{"dept_id", DataType::Integer, true, 1, 3, "emp", false}};
+    db25::plan::Schema right{{"id", DataType::Integer, false, 1, 1, "x", false}};
+    HashKeyVec keys;
+    keys.push_back(HashKey{0, 0});
+    double l = 0;
+    double r = 0;
+    join_key_ndv(keys, left, right, s, l, r);
+    CHECK(approx(l, 50.0));      // emp.dept_id
+    CHECK(approx(r, 20000.0));   // emp.id
+
+    // A column with no catalog provenance resolves to unknown, not to whatever
+    // sits at (0, 0).
+    db25::plan::Schema computed{{"c", DataType::Integer, true, 0, 0, "", false}};
+    join_key_ndv(keys, computed, right, s, l, r);
+    CHECK(approx(l, 0.0));
+    CHECK(approx(r, 20000.0));
+
+    // An index past the end of the schema is unknown rather than a read past it.
+    HashKeyVec oob;
+    oob.push_back(HashKey{99, 99});
+    join_key_ndv(oob, left, right, s, l, r);
+    CHECK(approx(l, 0.0) && approx(r, 0.0));
+
+    // No keys at all: a cross product has none to resolve.
+    join_key_ndv(HashKeyVec{}, left, right, s, l, r);
+    CHECK(approx(l, 0.0) && approx(r, 0.0));
+
+    // (0, 0) must never pick up statistics here either - a join key that is a
+    // computed column would otherwise be given a real column's distinct count
+    // and divide the whole join by it.
+    StatisticsCatalog poisoned;
+    TableStats pt;
+    pt.rows = 7;
+    ColumnStats pc;
+    pc.ndv = 7;
+    pt.columns[0] = pc;
+    poisoned.add_table(0, std::move(pt));
+    join_key_ndv(keys, computed, computed, poisoned, l, r);
+    CHECK(approx(l, 0.0) && approx(r, 0.0));
+}
+
+static void test_the_tree_form_reaches_the_join_keys() {
+    std::printf("test_the_tree_form_reaches_the_join_keys\n");
+    const StatisticsCatalog s = emp_stats();
+    CardinalityModel card;
+    card.base_rows["l"] = 1000.0;
+    card.base_rows["r"] = 1000.0;
+    // Both sides keyed on emp.dept_id, which has 10x fewer distinct values than
+    // either input has rows - the many-to-many case where the bound and the
+    // estimate differ, so the wiring is observable.
+    db25::plan::Schema sch{{"dept_id", DataType::Integer, true, 1, 3, "emp", false}};
+    HashKeyVec keys;
+    keys.push_back(HashKey{0, 0});
+    auto j = make_hash_join(make_seq_scan("l", sch), make_seq_scan("r", sch), keys, sch);
+
+    CHECK(approx(card.rows(*j), 1000.0));            // the bound, with no statistics
+    card.stats = &s;
+    CHECK(approx(card.rows(*j), 1000.0 * 1000.0 / 50.0));  // dept_id has ndv 50
+}
+
 // ---- the wiring, through a real plan --------------------------------------
 // The tests above call the estimator directly, which proves the estimator and
 // nothing about whether a PLAN reaches it. Both representations have to be
@@ -445,6 +587,10 @@ int main() {
     test_statistics_reach_the_row_estimate();
     test_selectivity_is_always_a_fraction();
     test_a_computed_column_is_never_looked_up();
+    test_a_join_divides_by_the_keys_distinct_count();
+    test_a_semi_join_is_the_matching_fraction();
+    test_join_keys_resolve_through_the_schema();
+    test_the_tree_form_reaches_the_join_keys();
     test_the_tree_form_reaches_the_estimator();
     if (g_failures == 0) { std::printf("statistics tests: all passed\n"); return 0; }
     std::printf("statistics tests: %d failure(s)\n", g_failures);
