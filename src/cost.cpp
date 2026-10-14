@@ -88,6 +88,28 @@ CalibrationProfile calibration_from(CalibrationSource source, const std::string&
     return default_calibration();
 }
 
+// What fraction of the LEFT input a semi join keeps. Factored out because the
+// anti join is its exact complement and the two must be derived from one number:
+// estimated separately they could sum to something other than the input, and a
+// plan that split a relation into two pieces adding up to more than it started
+// with would be costed as though filtering created rows.
+double semi_join_fraction(JoinSpec join, const CardinalityModel& card) {
+    if (join.equi_keys == 0 || join.left_key_ndv <= 0.0 || join.right_key_ndv <= 0.0) {
+        return card.join_selectivity;
+    }
+    // The fraction of the left key's distinct values that appear on the right.
+    // Conjuncts beyond the one that contains the join narrow further, on the same
+    // rule the inner join follows.
+    double f = join.right_key_ndv / join.left_key_ndv;
+    for (std::uint32_t i = 1; i < join.equi_keys; ++i) f *= card.join_selectivity;
+    for (std::uint32_t i = 0; i < join.residual_conjuncts; ++i) f *= card.join_selectivity;
+    // A semi join is a SUBSET. More distinct values on the right than the left
+    // cannot match more than all of the left, and the clamp is what says so -
+    // there is deliberately not a second cap above, because two guards for one
+    // invariant means removing either one changes nothing and neither is tested.
+    return std::clamp(f, 0.0, 1.0);
+}
+
 // Declared in cost.hpp so the memo form (lowering.cpp) reaches the same one.
 // What the caller would have estimated, derived from a node (the tree form) or
 // from a group (the memo form) - the ONE place either representation turns a
@@ -168,7 +190,20 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             // product is then the right answer: a CROSS JOIN really does return
             // |L||R|, and a theta join is that narrowed by its conditions.
             const double product = in(0) * in(1);
-            double rows = join.equi_keys == 0 ? product : std::max(in(0), in(1));
+            // With the keys' distinct counts the containment BOUND becomes the
+            // estimate it was standing in for: |L||R| / max(ndv_L, ndv_R), which
+            // is the textbook formula and not an approximation of it. The bound
+            // substituted min(|L|, |R|) for that denominator because a column has
+            // at most as many distinct values as rows; where the real count is
+            // smaller - a many-to-many join on a low-cardinality key - the bound
+            // under-estimates and this does not.
+            double rows = 0.0;
+            if (join.equi_keys == 0) {
+                rows = product;
+            } else {
+                const double denom = std::max(join.left_key_ndv, join.right_key_ndv);
+                rows = denom > 0.0 ? product / denom : std::max(in(0), in(1));
+            }
             // One narrowing per conjunct BEYOND the one that contains the join;
             // for a predicate-less cross join that is none, and the product stands
             // un-discounted rather than being scaled by a selectivity it has no
@@ -224,11 +259,18 @@ double operator_rows(PhysicalOp op, std::span<const double> input_rows,
             // once however many right rows match - so unlike a join this can never
             // exceed in(0), and multiplying the two cardinalities would be wrong
             // rather than merely pessimistic.
-            return in(0) * card.join_selectivity;
+            //
+            // WHICH subset is a question about the keys, not about the sizes. The
+            // fraction of left rows with a match is the fraction of the left
+            // key's distinct values that appear on the right, and under
+            // containment that is ndv_right / ndv_left, capped at one. An EXISTS
+            // over a foreign key matches nearly every row - 19999 of 20000 on the
+            // benchmark fixture - where the flat tenth said 2000.
+            return in(0) * semi_join_fraction(join, card);
         case PhysicalOp::HashAntiJoin:
         case PhysicalOp::NestedLoopAntiJoin:
             // The exact complement of the semi join over the same inputs.
-            return in(0) * (1.0 - card.join_selectivity);
+            return in(0) * (1.0 - semi_join_fraction(join, card));
         case PhysicalOp::HashDistinct:
         case PhysicalOp::StreamingDistinct:
             return in(0) * card.distinct_selectivity;
@@ -434,6 +476,18 @@ double enforcement_cost(const PhysicalProperties& provided, const PhysicalProper
 // ---- tree form ------------------------------------------------------------
 
 namespace {
+// The tree form's key lookup. The memo form's is in lowering.cpp and both go
+// through join_key_ndv, so a join cannot be estimated differently depending on
+// which representation it is currently in.
+JoinSpec join_spec_for(const PhysicalNode& node, const CardinalityModel& card) {
+    JoinSpec js{static_cast<std::uint32_t>(node.hash_keys.size()),
+                static_cast<std::uint32_t>(node.residual.size()), 0.0, 0.0};
+    if (card.stats == nullptr || card.stats->empty() || node.children.size() < 2) return js;
+    join_key_ndv(node.hash_keys, node.children[0]->output, node.children[1]->output,
+                 *card.stats, js.left_key_ndv, js.right_key_ndv);
+    return js;
+}
+
 FilterSpec filter_spec_for(const PhysicalNode& node, const CardinalityModel& card,
                            double input_rows) {
     return filter_spec_from(node.op, node.predicate, node.group_keys, card, input_rows);
@@ -453,8 +507,7 @@ double CardinalityModel::rows(const PhysicalNode& node) const {
                          node.values_columns != 0
                              ? static_cast<double>(node.values.size() / node.values_columns)
                              : (node.op == PhysicalOp::ValuesScan ? 1.0 : 0.0),
-                         JoinSpec{static_cast<std::uint32_t>(node.hash_keys.size()),
-                                  static_cast<std::uint32_t>(node.residual.size())},
+                         join_spec_for(node, *this),
                          filter_spec_for(node, *this, input_rows.empty() ? 0.0 : input_rows[0]));
 }
 
