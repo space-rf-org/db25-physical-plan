@@ -119,6 +119,34 @@ MUTANTS = [
                 return equality ? defaults.equality : defaults.inequality;""",
          repl="""                // constant for both is the thing this replaces.
                 return defaults.unknown;  // MUTANT M18"""),
+    # The price of ENFORCEMENT, as opposed to the price of work. A plan that needs
+    # its input sorted pays for the Sort; if that charge is wrong the planner
+    # prefers a plan whose cost it has understated, which is a wrong plan chosen
+    # for a right-looking reason. Both of these survived the suite until the
+    # assertions in test_properties.cpp were pinned to a value.
+    dict(id="M19", name="an unmet sort requirement is enforced for free",
+         file="src/cost.cpp",
+         find="""    if (!satisfies(after, required)) {  // order still unmet
+        const double one[1] = {rows};
+        c += operator_cost(PhysicalOp::Sort, one, rows, cal);
+    }""",
+         repl="""    if (!satisfies(after, required)) {  // MUTANT M19
+        (void)rows;
+    }"""),
+    dict(id="M21", name="the exchange does not clear the pre-exchange order (under-prices the sort)",
+         file="src/cost.cpp",
+         find="        after.sort.clear();",
+         repl="        // MUTANT M21: after.sort.clear();"),
+    dict(id="M22", name="an unmet format requirement is converted for free",
+         file="src/cost.cpp",
+         find="""        c += operator_cost(PhysicalOp::FormatConvert, one, rows, cal);
+        after.format = required.format;""",
+         repl="""        (void)one;  // MUTANT M22
+        after.format = required.format;"""),
+    dict(id="M20", name="Sort is priced linearly instead of n*log2(n)",
+         file="src/cost.cpp",
+         find="            return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)",
+         repl="            return in(0) * cal.sort_row;  // MUTANT M20"),
 ]
 
 

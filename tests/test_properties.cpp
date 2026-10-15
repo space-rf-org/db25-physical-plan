@@ -12,6 +12,7 @@
 #include "db25/physical/properties.hpp"
 #include "db25/physical/sexpr.hpp"
 
+#include <cmath>
 #include <limits>
 
 #include <cstdio>
@@ -141,6 +142,44 @@ static void test_enforcement_adds_cost() {
     req.sort = {{0, false}};
     auto enforced = enforce(make_seq_scan("t", {}), req);
     CHECK(cost_of(*enforced, cal, card) > base);  // the Sort adds cost
+}
+
+// An exchange DESTROYS the order it ships, so an input that was already sorted
+// must still pay for the sort on the far side - and the plan that actually gets
+// built does pay it. If enforcement_cost charges the sort against the
+// PRE-exchange order it hands back a price the built plan will not honour, and
+// the planner then prefers a candidate on the strength of a cost that is a
+// fiction. Deleting the one line that clears the order (`after.sort.clear()`)
+// used to leave the whole suite green.
+static void test_exchange_destroys_the_order_so_the_sort_is_repriced() {
+    std::printf("test_exchange_destroys_the_order_so_the_sort_is_repriced\n");
+    const CalibrationProfile cal = default_calibration();
+    const double kRows = 1000.0;
+
+    PhysicalProperties provided;            // already sorted, and sitting on one node
+    provided.format = StorageFormat::Row;
+    provided.freshness = Freshness::Fresh;
+    provided.sort = {{0, false}};
+    // NOT Single: everything-on-one-node trivially satisfies any partitioning,
+    // so a Single input is charged no exchange and this test would price nothing.
+    provided.distribution = Distribution{DistributionKind::Hashed, {0, 1}};
+
+    PhysicalProperties needs_order;         // same order, somewhere else
+    needs_order.freshness = Freshness::Fresh;
+    needs_order.sort = {{0, false}};
+    needs_order.distribution = Distribution{DistributionKind::Hashed, {0}};  // a coarser split: needs a real exchange
+
+    PhysicalProperties no_order = needs_order;   // identical, minus the order
+    no_order.sort.clear();
+
+    const double with_order = enforcement_cost(provided, needs_order, kRows, cal);
+    const double without_order = enforcement_cost(provided, no_order, kRows, cal);
+
+    // Both pay the same exchange. The difference between them is a whole sort,
+    // not a discount for having arrived sorted.
+    const double sort_price = kRows * std::log2(kRows) * cal.sort_row;
+    CHECK(with_order > without_order);
+    CHECK(std::abs((with_order - without_order) - sort_price) < 1e-6);
 }
 
 // enforce() used to promise "a plan whose output satisfies `required`" and then
@@ -273,6 +312,7 @@ int main() {
     test_enforce_inserts_minimal_enforcers();
     test_enforce_is_noop_when_satisfied();
     test_enforcement_adds_cost();
+    test_exchange_destroys_the_order_so_the_sort_is_repriced();
     test_enforce_reports_an_unenforceable_requirement();
     test_enforcers_render();
 
