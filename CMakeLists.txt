@@ -108,6 +108,14 @@ if(DB25_PHYSICAL_BUILD_TESTS)
     target_compile_options(property_tests PRIVATE -fno-exceptions -Wall -Wextra)
     add_test(NAME property_tests COMMAND property_tests)
 
+    # The s-expression writer's expression renderer: six operators that carry
+    # their meaning in a flag or an enum rendered identically to the operator
+    # they would be confused with, so a golden could not tell them apart.
+    add_executable(sexpr_expr_tests tests/test_sexpr_expr.cpp)
+    target_link_libraries(sexpr_expr_tests PRIVATE db25physicalplan)
+    target_compile_options(sexpr_expr_tests PRIVATE -fno-exceptions -Wall -Wextra)
+    add_test(NAME sexpr_expr_tests COMMAND sexpr_expr_tests)
+
     add_executable(lowering_tests tests/test_lowering.cpp)
     target_link_libraries(lowering_tests PRIVATE db25physicalplan)
     target_compile_options(lowering_tests PRIVATE -fno-exceptions -Wall -Wextra)

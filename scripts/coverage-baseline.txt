@@ -1,11 +1,19 @@
-91.9
+92.3
 # Total line coverage of db25-physical-plan, as measured by scripts/coverage.sh over
-# THIS repository's own ctest targets (2710 lines).
+# THIS repository's own ctest targets (about 2760 lines; the exact count is compiler-dependent).
 #
 # SCOPE MATTERS. The same files measured against the umbrella's suite read very
 # differently, because that suite exercises the query path and builds this repo
 # for its own purposes. A number without its scope is not a weak number, it is
 # a wrong one.
+#
+# MOVED from 91.9 by the sexpr expression-discriminator change, which added
+# tests/test_sexpr_expr.cpp and took src/sexpr.cpp from the generic-branch
+# fall-through to explicit cases: the repo total read 92.4% of 2762 lines under
+# g++-13. The floor is set a tenth below that reading rather than at it, because
+# CI measures with g++-14 and the two count slightly different line sets - a
+# discrepancy that has already turned a sibling repo's job red over one tenth of
+# a percent.
 #
 # A RECORD, not a target. Move it in the same commit that changes coverage, and
 # say why. A baseline edited afterwards to turn a red job green is a baseline
