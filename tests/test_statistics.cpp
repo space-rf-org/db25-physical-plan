@@ -57,6 +57,28 @@ static plan::ExprPtr lit(std::int64_t v) {
     e->value.value = v;
     return e;
 }
+
+static plan::ExprPtr lit_text(const char* v) {
+    auto e = std::make_unique<plan::Expr>(plan::ExprKind::Literal);
+    e->type = DataType::Text;
+    e->value.value = std::string{v};
+    return e;
+}
+
+static plan::ExprPtr lit_null() {
+    auto e = std::make_unique<plan::Expr>(plan::ExprKind::Literal);
+    e->type = DataType::Text;
+    return e;  // monostate: SQL NULL
+}
+
+// A column reference the binder marks as COMPUTED, so no statistics exist for
+// it - the stand-in for "the other side is not a constant".
+static plan::ExprPtr computed_col() {
+    auto e = std::make_unique<plan::Expr>(plan::ExprKind::ColumnRef);
+    e->ref_table_id = 0;
+    e->ref_column_id = 0;
+    return e;
+}
 static plan::ExprPtr bin(BinaryOp op, plan::ExprPtr l, plan::ExprPtr r) {
     auto e = std::make_unique<plan::Expr>(plan::ExprKind::BinaryOp);
     e->bin_op = op;
@@ -163,6 +185,55 @@ static void test_equality_uses_ndv() {
     // Either spelling of the same predicate.
     auto mirrored = bin(BinaryOp::Equal, lit(7), col(1, 3));
     CHECK(approx(selectivity_of(mirrored.get(), s, d), 1.0 / 50.0));
+}
+
+// Equality against a STRING constant must use ndv too.
+//
+// The estimator used to require a NUMERIC literal before it would look at the
+// statistics at all - one guard covering both branches - so `note = 'x'` was
+// priced at the flat 0.005 default even with ndv known. The range arithmetic
+// does need a number, because it interpolates against a numeric min/max. The
+// equality arithmetic does not: one of ndv distinct values is one of ndv
+// distinct values whatever they are made of.
+//
+// `note` is the text-shaped column in this fixture: ndv 4, a quarter of its
+// rows NULL, and no numeric range.
+static void test_equality_uses_ndv_for_text_too() {
+    std::printf("test_equality_uses_ndv_for_text_too\n");
+    const StatisticsCatalog s = emp_stats();
+    const SelectivityDefaults d;
+
+    // One of four values, over the three quarters of rows that are not NULL.
+    auto p = bin(BinaryOp::Equal, col(1, 5), lit_text("urgent"));
+    CHECK(approx(selectivity_of(p.get(), s, d), 0.75 / 4.0));
+
+    // Not the flat default - the point of the fix.
+    CHECK(selectivity_of(p.get(), s, d) > d.equality * 10.0);
+
+    // The complement, over the same non-null fraction.
+    auto ne = bin(BinaryOp::NotEqual, col(1, 5), lit_text("urgent"));
+    CHECK(approx(selectivity_of(ne.get(), s, d), 0.75 - 0.75 / 4.0));
+
+    // Either spelling.
+    auto mirrored = bin(BinaryOp::Equal, lit_text("urgent"), col(1, 5));
+    CHECK(approx(selectivity_of(mirrored.get(), s, d), 0.75 / 4.0));
+
+    // `x = NULL` is UNKNOWN for every row - never "one of ndv values". This
+    // case only became reachable when non-numeric literals started getting
+    // past the guard, so it is part of the same change.
+    auto isnull = bin(BinaryOp::Equal, col(1, 5), lit_null());
+    CHECK(selectivity_of(isnull.get(), s, d) < 1e-5);
+
+    // And the case the guard was really written for: the other side is NOT a
+    // constant, so no constant-selectivity answer applies and the default
+    // stands. Narrowing the guard must not have broken this.
+    auto col_vs_col = bin(BinaryOp::Equal, col(1, 5), computed_col());
+    CHECK(approx(selectivity_of(col_vs_col.get(), s, d), d.equality));
+
+    // A RANGE against a text constant still falls back: range_selectivity
+    // interpolates against min/max, which a string has no place in.
+    auto range_text = bin(BinaryOp::LessThan, col(1, 5), lit_text("m"));
+    CHECK(approx(selectivity_of(range_text.get(), s, d), d.inequality * 0.75));
 }
 
 static void test_range_uses_min_max() {
@@ -578,6 +649,7 @@ int main() {
     test_lab_statistics_load();
     test_loader_rejects_rather_than_shrugs();
     test_equality_uses_ndv();
+    test_equality_uses_ndv_for_text_too();
     test_range_uses_min_max();
     test_nulls();
     test_conjunction_and_disjunction();

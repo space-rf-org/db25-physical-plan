@@ -124,6 +124,23 @@ MUTANTS = [
     # prefers a plan whose cost it has understated, which is a wrong plan chosen
     # for a right-looking reason. Both of these survived the suite until the
     # assertions in test_properties.cpp were pinned to a value.
+    # The guard that decides whether statistics are consulted at all. Widening
+    # it back to "a numeric literal or nothing" silently reprices every text
+    # equality at the flat default, which no result-asserting test can see -
+    # estimates do not change answers. Only the statistics tests and the
+    # umbrella's q-error measurement notice.
+    dict(id="M23", name="equality against a non-numeric constant ignores ndv (the old broad guard)",
+         file="src/selectivity.cpp",
+         find="""            if (other->kind != ExprKind::Literal) {
+                return equality ? defaults.equality : defaults.inequality;
+            }
+            double v = 0.0;
+            const bool other_is_number = literal_number(*other, v);""",
+         repl="""            double v = 0.0;
+            const bool other_is_number = literal_number(*other, v);
+            if (!other_is_number) {  // MUTANT M23
+                return equality ? defaults.equality : defaults.inequality;
+            }"""),
     dict(id="M19", name="an unmet sort requirement is enforced for free",
          file="src/cost.cpp",
          find="""    if (!satisfies(after, required)) {  // order still unmet

@@ -155,20 +155,41 @@ double selectivity_of(const Expr* pred, const StatisticsCatalog& stats,
                 return equality ? defaults.equality : defaults.inequality;
             }
             // A comparison between two COLUMNS is not a constant-selectivity
-            // question and the range arithmetic below does not apply to it.
-            double v = 0.0;
-            if (!literal_number(*other, v)) {
+            // question, and neither branch below applies to it.
+            //
+            // This used to be spelled `if (!literal_number(...))`, which also
+            // caught a comparison against a STRING constant and sent it to the
+            // flat default. That conflated two different requirements: the
+            // RANGE arithmetic needs a number, because it interpolates against
+            // a numeric min/max - but ndv-based EQUALITY does not. `city =
+            // 'NYC'` is exactly as estimable as `age = 30`: one of ndv distinct
+            // values, whatever those values are made of. The old spelling threw
+            // away a known distinct count and priced every text equality at
+            // 0.005, which on a five-row table is 0.025 rows against an actual
+            // two - and the q-error measurement in the umbrella reports that as
+            // an 80x error.
+            if (other->kind != ExprKind::Literal) {
                 return equality ? defaults.equality : defaults.inequality;
             }
+            double v = 0.0;
+            const bool other_is_number = literal_number(*other, v);
+
             // NULL satisfies no comparison, so the non-null fraction bounds
             // every answer below.
             const double non_null = 1.0 - std::clamp(cs->null_fraction, 0.0, 1.0);
 
             if (equality) {
+                // `x = NULL` is UNKNOWN for every row, never true - it is not
+                // "one of ndv values". Reachable now that a non-numeric literal
+                // gets this far; under the old guard it fell to the default.
+                if (other->value.is_null()) return kMinSel;
                 if (cs->ndv <= 0.0) return clamp_sel(defaults.equality * non_null);
                 const double eq = non_null / cs->ndv;
                 return clamp_sel(pred->bin_op == BinaryOp::Equal ? eq : non_null - eq);
             }
+            // Only here is a NUMBER actually required: range_selectivity
+            // interpolates the constant against the column's numeric domain.
+            if (!other_is_number) return clamp_sel(defaults.inequality * non_null);
             if (!cs->has_range) return clamp_sel(defaults.inequality * non_null);
             return clamp_sel(range_selectivity(op, *cs, v) * non_null);
         }
