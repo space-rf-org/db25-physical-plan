@@ -164,6 +164,27 @@ MUTANTS = [
          file="src/cost.cpp",
          find="            return in(0) * std::log2(std::max(in(0), 2.0)) * cal.sort_row;  // n*log2(n)",
          repl="            return in(0) * cal.sort_row;  // MUTANT M20"),
+
+    # M24-M26 guard the WRITER rather than the planner. Every other mutant here
+    # breaks a plan; these break the rendering of a plan, which is the thing the
+    # staged goldens compare. A renderer that prints a predicate and its negation
+    # identically makes those goldens unfalsifiable for that predicate - the same
+    # hole that once let an INNER and a LEFT join share a golden.
+    dict(id="M24", name="the renderer drops the IS NOT NULL / NOT LIKE / NOT IN negation",
+         file="src/sexpr.cpp",
+         find='''            return std::string(e->negated() ? "(IsNotNull " : "(IsNull ") +
+                   render_expr(o) + ")";''',
+         repl='''            return std::string("(IsNull ") +  // MUTANT M24
+                   render_expr(o) + ")";'''),
+    dict(id="M25", name="the renderer collapses ILIKE into LIKE",
+         file="src/sexpr.cpp",
+         find='            s += e->case_insensitive() ? "ILike" : "Like";',
+         repl='            s += "Like";  // MUTANT M25'),
+    dict(id="M26", name="the renderer drops a cast's target type",
+         file="src/sexpr.cpp",
+         find='''            std::string s = std::string("(Cast :to ") +
+                            ast::data_type_to_string(e->target_type);''',
+         repl='            std::string s = std::string("(Cast");  // MUTANT M26'),
 ]
 
 

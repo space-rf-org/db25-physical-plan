@@ -111,8 +111,99 @@ std::string render_expr(const Expr* e) {
             for (const auto& c : e->children) s += " " + render_expr(c.get());
             return s + ")";
         }
+        // The kinds below carry their meaning in a FLAG or an ENUM rather than in
+        // their children, so the generic `(<kind> <child>...)` form rendered a
+        // predicate and its negation identically:
+        //
+        //   age IS NULL      and  age IS NOT NULL   ->  (IsNull (col #1))
+        //   city LIKE 'a%'   and  city NOT LIKE 'a%' ->  (Like (col #1) (lit 'a%'))
+        //   age IN (1,2)     and  age NOT IN (1,2)  ->  (InList (col #1) ...)
+        //   x IS TRUE / IS FALSE / IS NOT UNKNOWN   ->  (BooleanTest (col #1))
+        //   CAST(x AS TEXT)  and  CAST(x AS BIGINT) ->  (Cast (col #0))
+        //
+        // The plans were never wrong - a physical node borrows the whole logical
+        // Expr, flags included, so an executor sees the negation. But this writer
+        // is what the staged goldens are made of, and a golden that renders both
+        // senses the same cannot fail when one silently becomes the other. That
+        // is the hole this file's Aggregate and WindowFunction cases were written
+        // to close; these kinds were left in the generic branch and kept it open.
+        case plan::ExprKind::IsNull: {
+            const Expr* o = e->children.empty() ? nullptr : e->children[0].get();
+            return std::string(e->negated() ? "(IsNotNull " : "(IsNull ") +
+                   render_expr(o) + ")";
+        }
+        case plan::ExprKind::Like: {
+            // Four distinct operators share this kind: LIKE / NOT LIKE / ILIKE /
+            // NOT ILIKE. The optional ESCAPE operand is a child and renders as one.
+            std::string s = "(";
+            if (e->negated()) s += "Not";
+            s += e->case_insensitive() ? "ILike" : "Like";
+            for (const auto& c : e->children) s += " " + render_expr(c.get());
+            return s + ")";
+        }
+        case plan::ExprKind::InList: {
+            std::string s = e->negated() ? "(NotInList" : "(InList";
+            for (const auto& c : e->children) s += " " + render_expr(c.get());
+            return s + ")";
+        }
+        case plan::ExprKind::BooleanTest: {
+            // IS [NOT] TRUE / FALSE / UNKNOWN: six operators, one kind. The
+            // target is an enum and the NOT is a flag, so neither is in the
+            // children.
+            const char* target = e->bool_test == plan::BoolTest::True      ? "true"
+                                 : e->bool_test == plan::BoolTest::False   ? "false"
+                                                                           : "unknown";
+            std::string s = "(BooleanTest :is";
+            if (e->negated()) s += "-not";
+            s += " ";
+            s += target;
+            for (const auto& c : e->children) s += " " + render_expr(c.get());
+            return s + ")";
+        }
+        case plan::ExprKind::Cast: {
+            // The result type appears in the enclosing node's out= schema only
+            // when the cast is the whole output expression. Nested in a
+            // predicate - `(> (Cast (col #1)) (lit 1))` - nothing else records
+            // it, and a cast to TEXT compares differently from a cast to BIGINT.
+            std::string s = std::string("(Cast :to ") +
+                            ast::data_type_to_string(e->target_type);
+            for (const auto& c : e->children) s += " " + render_expr(c.get());
+            return s + ")";
+        }
+        case plan::ExprKind::Parameter:
+            return "(param $" + std::to_string(e->param_index) + ")";
+        case plan::ExprKind::Subquery: {
+            // Today's optimizer decorrelates EXISTS / IN / scalar subqueries into
+            // semi, anti and apply joins, so a Subquery expression does not reach
+            // a lowered plan. Rendered anyway, and rendered with its
+            // discriminators, because "unreachable" is a property of the current
+            // optimizer and not of this writer - the day one survives lowering,
+            // the render should not quietly lose which kind it was. The inner
+            // plan is NOT rendered: it is a whole LogicalNode tree and this
+            // function renders expressions. :sub marks that something is there.
+            const char* kind = e->subquery_kind == plan::SubqueryKind::Scalar ? "scalar"
+                               : e->subquery_kind == plan::SubqueryKind::In   ? "in"
+                               : e->subquery_kind == plan::SubqueryKind::Exists ? "exists"
+                                                                               : "quantified";
+            std::string s = std::string("(Subquery :kind ") + kind;
+            if (e->negated()) s += " :not";
+            if (e->correlated) s += " :correlated";
+            if (e->subquery_kind == plan::SubqueryKind::Quantified) {
+                s += std::string(" :sense ") + (e->quant_all() ? "all" : "any");
+                s += std::string(" :op ") + ast::binary_op_to_string(e->bin_op);
+            }
+            if (e->sub_plan != nullptr) s += " :sub";
+            for (const auto& c : e->children) s += " " + render_expr(c.get());
+            return s + ")";
+        }
         default: {
+            // Still reached by Case, Between, Row and ScalarFunction-like kinds
+            // whose meaning IS their children. The negation flag is rendered here
+            // too: if a future kind starts carrying one, it shows up as `:not`
+            // rather than disappearing, which is the failure this block of cases
+            // exists to prevent.
             std::string s = std::string("(") + plan::expr_kind_to_string(e->kind);
+            if (e->negated()) s += " :not";
             for (const auto& c : e->children) s += " " + render_expr(c.get());
             return s + ")";
         }
